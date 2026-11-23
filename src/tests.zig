@@ -328,6 +328,7 @@ test "subprocesses return bounded output and time out" {
     var env = std.process.EnvMap.init(a);
     const command: io.Command = .{ .a = a, .env = &env, .cwd = path, .dir = dir };
     try t.expectEqualStrings("prompt", try command.run(&.{"/bin/cat"}, "prompt", 2));
+    _ = try command.run(&.{ "/bin/sh", "-c", "test \"$$\" -eq \"$(/bin/ps -o pgid= -p \"$$\")\"" }, "", 2);
     try t.expectError(error.SubprocessTimeout, command.run(&.{ "/bin/sleep", "5" }, "", 1));
 }
 

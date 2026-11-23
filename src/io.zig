@@ -151,7 +151,9 @@ pub const Command = struct {
         const pid = c.fork();
         if (pid < 0) return error.SpawnFailed;
         if (pid == 0) {
-            if (c.setpgid(0, 0) != 0 or c.chdir(self.cwd) != 0 or
+            // The parent can establish this group first. On macOS the
+            // child's redundant setpgid can then return EPERM.
+            if ((c.setpgid(0, 0) != 0 and c.getpgrp() != c.getpid()) or c.chdir(self.cwd) != 0 or
                 c.dup2(stdin.handle, 0) < 0 or c.dup2(stdout.handle, 1) < 0 or
                 c.dup2(stderr.handle, 2) < 0) c._exit(126);
             _ = c.execve(argv[0].?, @ptrCast(argv.ptr), @ptrCast(envp.ptr));
