@@ -100,7 +100,7 @@ Adaptive routing uses four levels.
 | Focused | The regular reviewers receive the relevant performance, reliability, or defensive security prompts. |
 | Multi | At least two independent providers, using the relevant focused prompts. Talos waits if the provider pool cannot supply both. |
 
-Talos routes obvious high-impact changes directly to focused or multi-provider review. A configured lightweight model can recommend a stronger route for ambiguous changes. Manual modes and prompts take precedence. GitHub approvals require a full review.
+Talos routes contract changes, ownership and signing changes, deployment permissions, and changes to access policy directly to multi-provider review. Other clear risks go to the relevant focused review. A configured lightweight model can recommend a stronger route for ambiguous changes. Manual modes and prompts take precedence. GitHub approvals require a full review.
 
 ### Configure provider fallback
 
