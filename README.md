@@ -18,7 +18,7 @@ export PATH="$HOME/.local/bin:$PATH"
 Sign in with `gh auth login` and sign in to your reviewer CLI. Replace `OWNER/REPO` and `123` with your repo and an open, ready PR.
 
 ```sh
-talos add OWNER/REPO                   # Start tracking this repo with Codex
+talos add OWNER/REPO                   # Track this repo with your default reviewer
 talos run-once OWNER/REPO 123          # Preview this PR, including a baselined PR
 talos install                         # Start the macOS scheduler
 talos status                          # See scans, queue, errors, and cache sizes
@@ -28,6 +28,7 @@ talos status                          # See scans, queue, errors, and cache size
 | --- | --- |
 | Preview the next eligible reviews | `talos run-once` |
 | Preview the next review in one repo | `talos run-once OWNER/REPO` |
+| Show or set the reviewer default for new repos | `talos defaults` or `talos defaults --engine claude` |
 | Queue a specific PR under the repo's publication policy | `talos queue OWNER/REPO 123` |
 | Inspect one repo or read JSON | `talos status OWNER/REPO` or `talos status --json` |
 | Pause or resume reviews for a repo | `talos pause OWNER/REPO` or `talos resume OWNER/REPO` |
@@ -39,12 +40,16 @@ talos status                          # See scans, queue, errors, and cache size
 
 ### Configure each repo
 
-Run `add` again to update settings and carry forward the baseline and queue. Include every setting you want to keep. Leaving out both publication flags returns the repo to dry-run.
+Talos starts with Codex as the default. To use Claude Code on a Claude-only machine, run `talos defaults --engine claude` once. New repos use that setting unless you pass `--engine`. Existing repos keep their reviewer settings.
+
+Run `add` again to update settings and carry forward the baseline and queue. Talos keeps the repo's reviewers, model, and executable paths when you omit their flags. Repeat any other settings you want to keep. Leaving out both publication flags returns the repo to dry-run.
 
 ```sh
 talos add OWNER/REPO --engine codex --interval 180
 talos add OWNER/REPO --engine claude --model sonnet
 talos add OWNER/REPO --engine kimi --model kimi-code/kimi-for-coding
+talos add OWNER/REPO --engine claude,codex --model sonnet
+talos add OWNER/REPO --engine claude,codex,kimi --reviewer-model claude=sonnet --reviewer-model kimi=kimi-code/kimi-for-coding
 talos add OWNER/REPO --comments
 talos add OWNER/REPO --approvals
 talos add OWNER/REPO --comments --approvals
@@ -52,9 +57,13 @@ talos add OWNER/REPO --cache-mib 256 --cache-idle-days 14
 talos add OWNER/REPO --cache-mib 0
 ```
 
-Talos discovers executables on PATH at registration. Set paths explicitly with `--git`, `--gh`, `--codex`, `--claude`, or `--kimi`. For example, `talos add OWNER/REPO --codex /absolute/path/to/codex`.
+At registration, Talos resolves Git, GitHub CLI, and each selected reviewer on PATH. Set paths explicitly with `--git`, `--gh`, `--codex`, `--claude`, or `--kimi`.
 
-`--comments` allows consolidated comment reviews. `--approvals` allows approval for a complete, clean review with passing checks, no merge conflicts, and no unresolved threads. The author must differ from the configured GitHub identity. A clean candidate can become a comment when only comments are enabled.
+Use `--model MODEL` for the first reviewer, or repeat `--reviewer-model ENGINE=MODEL` for any selected reviewers. A named override takes precedence for that reviewer. When you set `--engine` again, repeat any model overrides you want to keep.
+
+Each reviewer in a list gets the same pinned source and discussion. Talos runs them in order, groups findings at the same diff line, and sends one review with reviewer attribution. A failed reviewer retries the job. Choose providers that can receive the repo's source and discussion.
+
+`--comments` allows publishing a comment review. `--approvals` requires complete coverage and no findings from every configured reviewer, passing checks, no merge conflicts, and no unresolved threads. The author must differ from the configured GitHub identity. A clean candidate can become a comment when only comments are enabled.
 
 ### macOS build fallback
 
@@ -81,7 +90,7 @@ flowchart TD
         Scheduler[launchd or Linux scheduler] -->|tick| Talos[Talos]
         Talos --> State[State and Git cache]
         Talos --> Tools[Git and GitHub CLI]
-        Talos <-->|context and findings| Reviewer[Reviewer CLI]
+        Talos <-->|context and findings| Reviewer[Selected reviewer CLIs]
     end
     Tools <-->|source and PRs| GitHub
     Reviewer <--> Provider[Model provider]
@@ -100,7 +109,7 @@ launchctl print "gui/$(id -u)/dev.talos.watcher"
 talos status --json
 ```
 
-The state directory is `~/.local/state/talos`. One process holds its lock at a time. `state.json` holds the baseline, queue, publication receipts, and recent errors. `repos/OWNER/REPO/results/` holds candidate reviews. Check `launchd.log` for scheduler errors.
+The state directory is `~/.local/state/talos`. One process holds its lock at a time. Each tick takes at most one due PR per repo and runs the work serially. `state.json` holds reviewer defaults, the baseline, queue, publication receipts, and recent errors. `repos/OWNER/REPO/results/` holds candidate reviews. Check `launchd.log` for scheduler errors.
 
 Job retries back off from 30 seconds, with six attempts per head. Use `queue` to retry. If a POST may have reached GitHub, Talos retries the receipt lookup and leaves the head `uncertain` until it can confirm the result. Run one publisher per repo because GitHub has no cross-machine idempotency key for reviews.
 

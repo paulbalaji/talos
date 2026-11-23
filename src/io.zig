@@ -69,8 +69,12 @@ pub fn parse(a: A, comptime T: type, input: []const u8) !T {
 }
 
 pub fn out(comptime pattern: []const u8, args: anytype) !void {
+    return print(std.fs.File.stdout(), pattern, args);
+}
+
+pub fn print(file: std.fs.File, comptime pattern: []const u8, args: anytype) !void {
     var buffer: [4096]u8 = undefined;
-    var writer = std.fs.File.stdout().writer(&buffer);
+    var writer = file.writerStreaming(&buffer);
     try writer.interface.print(pattern, args);
     try writer.interface.flush();
 }

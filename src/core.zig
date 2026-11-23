@@ -5,6 +5,18 @@ const eq = io.eq;
 pub const schema = @embedFile("review-schema.json");
 
 pub const Engine = enum { codex, claude, kimi };
+pub const engine_count = std.meta.fields(Engine).len;
+pub const ReviewerModel = struct { engine: Engine, model: []const u8 };
+
+pub fn validateEngines(engines: []const Engine) !void {
+    if (engines.len == 0) return error.UnknownReviewer;
+    var seen = std.EnumSet(Engine).initEmpty();
+    for (engines) |engine| {
+        if (seen.contains(engine)) return error.DuplicateReviewer;
+        seen.insert(engine);
+    }
+}
+
 pub const Repo = struct {
     name: []const u8,
     login: []const u8,
@@ -12,7 +24,9 @@ pub const Repo = struct {
     cache_mib: u32 = 128,
     cache_idle_days: u16 = 7,
     engine: Engine = .codex,
+    additional_engines: []const Engine = &.{},
     model: ?[]const u8 = null,
+    additional_models: []const ReviewerModel = &.{},
     comments: bool = false,
     approvals: bool = false,
     git: []const u8 = "git",
@@ -20,6 +34,18 @@ pub const Repo = struct {
     codex: []const u8 = "codex",
     claude: []const u8 = "claude",
     kimi: []const u8 = "kimi",
+
+    pub fn engines(self: Repo, a: A) ![]const Engine {
+        return std.mem.concat(a, Engine, &.{ &.{self.engine}, self.additional_engines });
+    }
+
+    pub fn modelFor(self: Repo, engine: Engine) ?[]const u8 {
+        if (engine == self.engine) return self.model;
+        for (self.additional_models) |model| {
+            if (model.engine == engine) return model.model;
+        }
+        return null;
+    }
 };
 
 pub const Pull = struct {
@@ -66,13 +92,15 @@ pub const Prior = struct {
 };
 
 pub const Snapshot = struct { merge_base: []const u8, evidence: []const u8, limited: bool = false };
-const Finding = struct { severity: enum { P0, P1, P2, P3 }, path: []const u8, line: u32, body: []const u8 };
+const Severity = enum { P0, P1, P2, P3 };
+const Finding = struct { severity: Severity, path: []const u8, line: u32, body: []const u8 };
 pub const Review = struct {
     complete: bool,
     summary: []const u8,
     findings: []const Finding,
     existing_open_findings: []const []const u8,
 };
+const ReviewerResult = struct { engine: Engine, review: Review };
 pub const Event = enum { COMMENT, APPROVE };
 
 pub const Inline = struct { path: []const u8, line: u32, side: []const u8 = "RIGHT", body: []const u8 };
@@ -275,14 +303,16 @@ pub fn validPath(path: []const u8) bool {
     return true;
 }
 
-pub fn openFindings(a: A, review: Review, threads: []const Thread) ![]const Thread {
+fn openFindings(a: A, results: []const ReviewerResult, threads: []const Thread) ![]const Thread {
     var result: std.ArrayList(Thread) = .empty;
-    for (threads) |thread| {
+    threads_loop: for (threads) |thread| {
         if (thread.isResolved) continue;
-        for (review.existing_open_findings) |id| {
-            if (eq(u8, id, thread.id)) {
-                try result.append(a, thread);
-                break;
+        for (results) |item| {
+            for (item.review.existing_open_findings) |id| {
+                if (eq(u8, id, thread.id)) {
+                    try result.append(a, thread);
+                    continue :threads_loop;
+                }
             }
         }
     }
@@ -320,41 +350,120 @@ fn marker(a: A, repo: Repo, number: u32, head: []const u8) ![]const u8 {
     return io.fmt(a, "<!-- talos:review:v1:{s}:{d}:{s} -->", .{ repo.name, number, head });
 }
 
-pub fn payload(a: A, adapter: anytype, repo: Repo, pr: Pull, snap: Snapshot, review: Review, threads: []const Thread) !Payload {
+const Note = struct {
+    severity: Severity,
+    body: []const u8,
+    engines: std.EnumSet(Engine),
+};
+
+const FindingGroup = struct {
+    path: []const u8,
+    line: u32,
+    notes: std.ArrayList(Note) = .empty,
+
+    fn add(self: *FindingGroup, a: A, finding: Finding, engine: Engine) !void {
+        for (self.notes.items) |*note| {
+            if (!eq(u8, note.body, finding.body)) continue;
+            note.severity = @enumFromInt(@min(@intFromEnum(note.severity), @intFromEnum(finding.severity)));
+            note.engines.insert(engine);
+            return;
+        }
+        try self.notes.append(a, .{
+            .severity = finding.severity,
+            .body = finding.body,
+            .engines = std.EnumSet(Engine).initOne(engine),
+        });
+    }
+};
+
+fn groupFindings(a: A, results: []const ReviewerResult) ![]const FindingGroup {
+    var groups: std.ArrayList(FindingGroup) = .empty;
+    for (results) |result| {
+        for (result.review.findings) |finding| {
+            const group = for (groups.items) |*group| {
+                if (group.line == finding.line and eq(u8, group.path, finding.path)) break group;
+            } else next: {
+                const next = try groups.addOne(a);
+                next.* = .{ .path = finding.path, .line = finding.line };
+                break :next next;
+            };
+            try group.add(a, finding, result.engine);
+        }
+    }
+    return groups.items;
+}
+
+fn payload(a: A, adapter: anytype, repo: Repo, pr: Pull, snap: Snapshot, results: []const ReviewerResult, threads: []const Thread) !Payload {
     var body: std.ArrayList(u8) = .empty;
     var comments: std.ArrayList(Inline) = .empty;
     const fmt = body.writer(a);
-    try fmt.print("Talos reviewed `{s}` with {s}. ", .{ pr.headRefOid, @tagName(repo.engine) });
-    try escape(a, &body, review.summary);
-    for (review.findings) |finding| {
+    const multi = results.len > 1;
+    try fmt.print("Talos reviewed `{s}` with {s}", .{ pr.headRefOid, @tagName(results[0].engine) });
+    for (results[1..]) |result| try fmt.print(", {s}", .{@tagName(result.engine)});
+    try body.appendSlice(a, ". ");
+    var complete = !snap.limited;
+    for (results) |result| {
+        if (multi) try fmt.print("\n\n**{s}.** ", .{@tagName(result.engine)});
+        try escape(a, &body, result.review.summary);
+        complete = complete and result.review.complete;
+    }
+
+    // Keep space for coverage, approval checks, and the receipt marker.
+    const body_limit = 63 * 1024;
+    var omitted: usize = 0;
+    const groups = try groupFindings(a, results);
+    for (groups) |group| {
         var message: std.ArrayList(u8) = .empty;
-        try message.writer(a).print("**{s}.** ", .{@tagName(finding.severity)});
-        try escape(a, &message, finding.body);
-        if (try adapter.anchor(pr, snap, finding.path, finding.line)) {
-            try comments.append(a, .{ .path = finding.path, .line = finding.line, .body = message.items });
+        for (group.notes.items, 0..) |note, index| {
+            if (index != 0) try message.appendSlice(a, "\n\n");
+            try message.writer(a).print("**{s}.** ", .{@tagName(note.severity)});
+            if (multi) {
+                var first = true;
+                for (results) |result| {
+                    if (!note.engines.contains(result.engine)) continue;
+                    if (!first) try message.appendSlice(a, ", ");
+                    try message.appendSlice(a, @tagName(result.engine));
+                    first = false;
+                }
+                try message.appendSlice(a, " — ");
+            }
+            try escape(a, &message, note.body);
+        }
+        if (try adapter.anchor(pr, snap, group.path, group.line)) {
+            try comments.append(a, .{ .path = group.path, .line = group.line, .body = message.items });
         } else {
+            const before = body.items.len;
             try body.appendSlice(a, "\n\n- ");
-            try escape(a, &body, finding.path);
-            try fmt.print(":{d} — {s}", .{ finding.line, message.items });
+            try escape(a, &body, group.path);
+            try fmt.print(":{d} — {s}", .{ group.line, message.items });
+            if (body.items.len > body_limit) {
+                body.shrinkRetainingCapacity(before);
+                omitted += 1;
+            }
         }
     }
-    for (try openFindings(a, review, threads)) |thread| {
+    for (try openFindings(a, results, threads)) |thread| {
+        const before = body.items.len;
         try body.appendSlice(a, "\n\nExisting open finding ");
         try escape(a, &body, thread.id);
         if (thread.replies.len > 0 and std.mem.startsWith(u8, thread.replies[0].url, "https://github.com/")) {
             const url = thread.replies[0].url;
             if (std.mem.indexOfAny(u8, url, " \n\r\t<>()") == null) try fmt.print(" <{s}>", .{url});
         }
+        if (body.items.len > body_limit) {
+            body.shrinkRetainingCapacity(before);
+            omitted += 1;
+        }
     }
-    var truncated_thread = false;
-    for (threads) |thread| truncated_thread = truncated_thread or thread.truncated;
-    const complete = review.complete and !snap.limited and !truncated_thread;
+    if (omitted != 0) try fmt.print("\n\n{d} findings or thread references exceeded the review body limit.", .{omitted});
+    for (threads) |thread| complete = complete and !thread.truncated;
+    complete = complete and omitted == 0;
     if (!complete) try body.appendSlice(a, "\n\nReview coverage was limited.");
     const checks_passed = checksPassed(pr);
     if (!checks_passed) try body.appendSlice(a, "\n\nGitHub checks or mergeability did not meet the approval criteria.");
     var unresolved = false;
     for (threads) |thread| unresolved = unresolved or !thread.isResolved;
-    const clean = complete and checks_passed and !unresolved and review.findings.len == 0;
+    const clean = complete and checks_passed and !unresolved and groups.len == 0;
     try fmt.print("\n\n{s}", .{try marker(a, repo, pr.number, pr.headRefOid)});
     return .{
         .commit_id = pr.headRefOid,
@@ -431,13 +540,19 @@ pub fn run(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?Paylo
     const snap = try adapter.snapshot(pr);
     const threads = try adapter.threads(pr.number);
     const previous = previousCommit(earlier_reviews orelse try adapter.reviews(pr.number), repo.login);
-    const raw = try adapter.review(try prompt(a, repo, pr, snap, threads, previous));
-    const review = try parseReview(a, raw);
+    const engines = try repo.engines(a);
+    try validateEngines(engines);
+    const context = try prompt(a, repo, pr, snap, threads, previous);
+    var results: [engine_count]ReviewerResult = undefined;
+    for (engines, 0..) |engine, index| {
+        const raw = try adapter.review(engine, context);
+        results[index] = .{ .engine = engine, .review = try parseReview(a, raw) };
+    }
     if (!std.mem.eql(u8, try io.json(a, threads), try io.json(a, try adapter.threads(pr.number))))
         return error.ThreadsChanged;
     const latest = try adapter.pull(job.number);
     if (!sameTarget(pr, latest)) return error.TargetChanged;
-    var result = try payload(a, adapter, repo, latest, snap, review, threads);
+    var result = try payload(a, adapter, repo, latest, snap, results[0..engines.len], threads);
     if (dry) return result;
     try adapter.saveResult(job.number, result);
     const own_pr = if (latest.author) |author| eq(u8, author.login, repo.login) else true;
