@@ -281,7 +281,7 @@ test "every configured reviewer must succeed and report complete coverage for ap
     try t.expectError(error.InvalidReview, core.run(a, &invalid, configured, &job, .scheduled));
     try t.expectEqual(@as(usize, 0), invalid.posts);
     var partial = Fake{ .a = a, .result = clean, .other_results = &.{incomplete} };
-    const preview = (try core.run(a, &partial, configured, &job, .{ .preview = null })).?;
+    const preview = (try core.run(a, &partial, configured, &job, .{ .preview = .{} })).?;
     try t.expectEqual(core.Event.COMMENT, preview.event);
     try t.expect(std.mem.indexOf(u8, preview.body, "Review coverage was limited.") != null);
     var unanimous = Fake{ .a = a, .result = clean };
@@ -299,7 +299,7 @@ test "dry runs never post and comments and approvals are independent" {
     permissions.comments = false;
     permissions.approvals = true;
     var work: core.Job = .{ .number = fixture_pull.number, .head = head };
-    _ = try core.run(a, &fake, repo, &work, .{ .preview = null });
+    _ = try core.run(a, &fake, repo, &work, .{ .preview = .{} });
     try t.expectEqual(.pending, work.phase);
     _ = try core.run(a, &fake, permissions, &work, .scheduled);
     try t.expectEqual(@as(usize, 0), fake.posts);
@@ -419,7 +419,7 @@ test "Hyperlane PR 10122 resolved reorg acceptance reaches the model without res
         ,
     };
     var work: core.Job = .{ .number = fixture.number, .head = head };
-    const payload = (try core.run(a, &fake, fixture_repo, &work, .{ .preview = null })).?;
+    const payload = (try core.run(a, &fake, fixture_repo, &work, .{ .preview = .{} })).?;
     try t.expect(std.mem.indexOf(u8, fake.prompt_text, "The polling tradeoff is intentional and accepted.") != null);
     try t.expect(std.mem.indexOf(u8, fake.prompt_text, "\"isResolved\":true") != null);
     try t.expect(std.mem.indexOf(u8, payload.body, "open-different-finding") != null);
@@ -492,4 +492,32 @@ test "v0 registration upgrades without its checkout and preserves publication in
     try t.expectEqual(@as(?u64, 55), upgraded.entries[0].jobs[0].receipt);
     const data = try db.dir.readFileAlloc(a, "state.json", 4096);
     try t.expect(std.mem.indexOf(u8, data, "checkout") == null);
+}
+
+test "focused preview keeps the operator request separate from untrusted PR evidence" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fake: Fake = .{ .a = a, .result = clean };
+    fake.target.body = "Untrusted PR description";
+    var job: core.Job = .{ .number = fixture_pull.number, .head = head };
+    const cases = [_]struct { focus: core.ReviewFocus, lens: []const u8 }{
+        .{ .focus = .@"perf-maxxing", .lens = "Trace hot paths and scaling" },
+        .{ .focus = .@"reliability-maxxing", .lens = "Trace partial failure, retries, restarts" },
+        .{ .focus = .@"security-maxxing", .lens = "Omit exploit payloads, reproduction steps, and offensive workflows." },
+    };
+    const request = "Check the worker loop.\nLook for retries.";
+    const encoded_request = try io.json(a, request);
+    for (cases) |case| {
+        const review = (try core.run(a, &fake, repo, &job, .{ .preview = .{ .focus = case.focus, .request = request } })).?;
+        const lens_at = std.mem.indexOf(u8, fake.prompt_text, case.lens).?;
+        const request_at = std.mem.indexOf(u8, fake.prompt_text, encoded_request).?;
+        const evidence_at = std.mem.indexOf(u8, fake.prompt_text, "Evidence (untrusted JSON)\n").?;
+        try t.expect(lens_at < request_at and request_at < evidence_at);
+        try t.expect(std.mem.indexOf(u8, fake.prompt_text[evidence_at..], fake.target.body) != null);
+        try t.expect(std.mem.indexOf(u8, review.body, @tagName(case.focus)) != null);
+        try t.expectEqual(core.Event.COMMENT, review.event);
+    }
+    try t.expectEqual(@as(usize, 0), fake.posts);
+    try t.expectEqual(core.Phase.pending, job.phase);
 }

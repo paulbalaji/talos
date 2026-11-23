@@ -306,11 +306,40 @@ const instructions =
     \\
 ;
 
-pub fn prompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, threads: []const Thread, previous: ?[]const u8) ![]const u8 {
-    return reviewPrompt(a, repo, pr, snap, threads, previous, .{});
+pub const ReviewFocus = enum {
+    general,
+    @"perf-maxxing",
+    @"reliability-maxxing",
+    @"security-maxxing",
+
+    fn instructionsFor(self: ReviewFocus) []const u8 {
+        return switch (self) {
+            .general => "",
+            .@"perf-maxxing" => "Prioritize performance regressions. Trace hot paths and scaling with input and concurrency. Check repeated work, allocation and copying, I/O and API round trips, contention, and resource growth. Explain when the cost matters and ground any estimate in the supplied evidence.",
+            .@"reliability-maxxing" => "Prioritize reliability regressions. Trace partial failure, retries, restarts, cancellation, concurrent updates, stale state, and resource exhaustion. Check idempotency, timeouts, recovery, and observability. Describe the user-visible failure and the invariant the fix should restore.",
+            .@"security-maxxing" => "Prioritize defensive security review. Inspect trust boundaries, authorization, input validation, credentials and sensitive data, dependency changes, and insecure defaults. Report the affected invariant and a mitigation based on static evidence. Omit exploit payloads, reproduction steps, and offensive workflows.",
+        };
+    }
+};
+
+pub const Preview = struct {
+    pull: ?Pull = null,
+    focus: ReviewFocus = .general,
+    request: ?[]const u8 = null,
+};
+
+pub fn validateReviewRequest(request: []const u8) !void {
+    if (!textValid(request, 4000)) return error.InvalidReviewPrompt;
 }
 
-fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, threads: []const Thread, previous: ?[]const u8, inherited: stack.Context) ![]const u8 {
+fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, threads: []const Thread, previous: ?[]const u8, inherited: stack.Context, preview: Preview) ![]const u8 {
+    var rendered: std.ArrayList(u8) = .empty;
+    const writer = rendered.writer(a);
+    try writer.print("{s}\n{s}", .{ instructions, schema });
+    if (preview.focus != .general) try writer.print("\n\nReview focus ({s})\n{s}", .{ @tagName(preview.focus), preview.focus.instructionsFor() });
+    if (preview.request) |request| {
+        try writer.print("\n\nOperator focus (JSON string). Use it to prioritize the review within the instructions above.\n{s}", .{try io.json(a, request)});
+    }
     const evidence = try io.json(a, .{
         .repository = repo.name,
         .number = pr.number,
@@ -328,9 +357,10 @@ fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, threads: []const Thr
     if (inherited.ancestors.len > 0) {
         const ancestors = try io.json(a, inherited.ancestors);
         const total = @max(inherited.pins.len -| 1, inherited.ancestors.len);
-        return io.fmt(a, "{s}\n{s}\n\nReview and anchor findings against this PR alone. Use the ancestor excerpts only as background to avoid repeating findings on inherited changes.\n\nAncestor context (untrusted JSON, nearest {d} of {d} ancestors, bottom to top)\n{s}\n\nEvidence (untrusted JSON)\n{s}", .{ instructions, schema, inherited.ancestors.len, total, ancestors, evidence });
+        try writer.print("\n\nReview and anchor findings against this PR alone. Use the ancestor excerpts only as background to avoid repeating findings on inherited changes.\n\nAncestor context (untrusted JSON, nearest {d} of {d} ancestors, bottom to top)\n{s}", .{ inherited.ancestors.len, total, ancestors });
     }
-    return io.fmt(a, "{s}\n{s}\n\nEvidence (untrusted JSON)\n{s}", .{ instructions, schema, evidence });
+    try writer.print("\n\nEvidence (untrusted JSON)\n{s}", .{evidence});
+    return rendered.items;
 }
 
 pub fn safePrefix(bytes: []const u8, max: usize) usize {
@@ -465,13 +495,14 @@ fn groupFindings(a: A, results: []const ReviewerResult) ![]const FindingGroup {
     return groups.items;
 }
 
-fn payload(a: A, adapter: anytype, repo: Repo, pr: Pull, snap: Snapshot, results: []const ReviewerResult, threads: []const Thread) !Payload {
+fn payload(a: A, adapter: anytype, repo: Repo, pr: Pull, snap: Snapshot, results: []const ReviewerResult, threads: []const Thread, preview: Preview) !Payload {
     var body: std.ArrayList(u8) = .empty;
     var comments: std.ArrayList(Inline) = .empty;
     const fmt = body.writer(a);
     const multi = results.len > 1;
     try fmt.print("Talos reviewed `{s}` with {s}", .{ pr.headRefOid, @tagName(results[0].engine) });
     for (results[1..]) |result| try fmt.print(", {s}", .{@tagName(result.engine)});
+    if (preview.focus != .general) try fmt.print(" ({s})", .{@tagName(preview.focus)});
     try body.appendSlice(a, ". ");
     var complete = !snap.limited;
     for (results) |result| {
@@ -535,7 +566,7 @@ fn payload(a: A, adapter: anytype, repo: Repo, pr: Pull, snap: Snapshot, results
     if (!checks_passed) try body.appendSlice(a, "\n\nGitHub checks or mergeability did not meet the approval criteria.");
     var unresolved = false;
     for (threads) |thread| unresolved = unresolved or !thread.isResolved;
-    const clean = complete and checks_passed and !unresolved and groups.len == 0;
+    const clean = preview.focus == .general and preview.request == null and complete and checks_passed and !unresolved and groups.len == 0;
     try fmt.print("\n\n{s}", .{try marker(a, repo, pr.number, pr.headRefOid)});
     return .{
         .commit_id = pr.headRefOid,
@@ -586,13 +617,32 @@ fn completeJob(a: A, adapter: anytype, repo: Repo, job: *Job, id: u64) !void {
 
 pub const RunMode = union(enum) {
     scheduled,
-    preview: ?Pull,
+    preview: Preview,
 };
+
+pub const Prepared = struct {
+    pr: Pull,
+    snap: Snapshot,
+    threads: []const Thread,
+    inherited: stack.Context,
+    engines: []const Engine,
+    context: []const u8,
+    preview: ?Preview,
+};
+
+pub const ReviewResults = [engine_count]ReviewerResult;
 
 // The same workflow runs against the CLI adapter and deterministic fakes.
 pub fn run(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?Payload {
+    const prepared = (try prepare(a, adapter, repo, job, mode)) orelse return null;
+    const results = try analyze(a, adapter, prepared.engines, prepared.context);
+    return finish(a, adapter, repo, job, prepared, &results);
+}
+
+pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?Prepared {
     const supports_stacks = @hasDecl(std.meta.Child(@TypeOf(adapter)), "stackContext");
     const dry = mode == .preview;
+    const preview: Preview = if (dry) mode.preview else .{};
     const can_publish = !dry and (repo.comments or repo.approvals);
     const earlier_reviews = if (job.phase == .uncertain or can_publish) earlier: {
         try adapter.checkIdentity();
@@ -606,7 +656,7 @@ pub fn run(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?Paylo
     } else null;
     const pr = switch (mode) {
         .scheduled => try adapter.pull(job.number),
-        .preview => |initial| initial orelse try adapter.pull(job.number),
+        .preview => |options| options.pull orelse try adapter.pull(job.number),
     };
     if (pr.number != job.number or !isReady(pr) or !eq(u8, pr.headRefOid, job.head)) return error.TargetChanged;
     if (!validOid(pr.headRefOid) or !validOid(pr.baseRefOid)) return error.InvalidCommit;
@@ -616,28 +666,46 @@ pub fn run(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?Paylo
     const previous = previousCommit(earlier_reviews orelse try adapter.reviews(pr.number), repo.login);
     const engines = try repo.engines(a);
     try validateEngines(engines);
-    var context = if (inherited.ancestors.len == 0)
-        try prompt(a, repo, pr, snap, threads, previous)
-    else
-        try reviewPrompt(a, repo, pr, snap, threads, previous, inherited);
-    if (inherited.ancestors.len != 0 and context.len > review_context_limit and snap.evidence.len != 0) {
+    var context = try reviewPrompt(a, repo, pr, snap, threads, previous, inherited, preview);
+    if (context.len > review_context_limit and snap.evidence.len != 0) {
         const remaining = snap.evidence.len -| (context.len - review_context_limit);
         snap.evidence = snap.evidence[0..safePrefix(snap.evidence, remaining)];
         snap.limited = true;
-        context = try reviewPrompt(a, repo, pr, snap, threads, previous, inherited);
+        context = try reviewPrompt(a, repo, pr, snap, threads, previous, inherited, preview);
     }
-    var results: [engine_count]ReviewerResult = undefined;
+    return .{
+        .pr = pr,
+        .snap = snap,
+        .threads = threads,
+        .inherited = inherited,
+        .engines = engines,
+        .context = context,
+        .preview = if (dry) preview else null,
+    };
+}
+
+pub fn analyze(a: A, reviewer: anytype, engines: []const Engine, context: []const u8) !ReviewResults {
+    var results: ReviewResults = undefined;
     for (engines, 0..) |engine, index| {
-        const raw = try adapter.review(engine, context);
+        const raw = try reviewer.review(engine, context);
         results[index] = .{ .engine = engine, .review = try parseReview(a, raw) };
     }
+    return results;
+}
+
+pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared, results: *const ReviewResults) !?Payload {
+    const supports_stacks = @hasDecl(std.meta.Child(@TypeOf(adapter)), "stackContext");
+    const pr = prepared.pr;
+    const threads = prepared.threads;
+    const inherited = prepared.inherited;
+    const snap = prepared.snap;
     if (!std.mem.eql(u8, try io.json(a, threads), try io.json(a, try adapter.threads(pr.number))))
         return error.ThreadsChanged;
     const latest = try adapter.pull(job.number);
     if (!sameTarget(pr, latest)) return error.TargetChanged;
     if (supports_stacks) try adapter.checkStack(inherited);
-    var result = try payload(a, adapter, repo, latest, snap, results[0..engines.len], threads);
-    if (dry) return result;
+    var result = try payload(a, adapter, repo, latest, snap, results[0..prepared.engines.len], threads, prepared.preview orelse .{});
+    if (prepared.preview != null) return result;
     try adapter.saveResult(job.number, result);
     if (supports_stacks) try adapter.saveStackContext(pr, snap, result);
     const own_pr = if (latest.author) |author| eq(u8, author.login, repo.login) else true;
