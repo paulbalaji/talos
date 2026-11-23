@@ -19,8 +19,9 @@ const usage =
     \\talos [--home DIR] add OWNER/REPO [options]
     \\talos [--home DIR] defaults [--engine ENGINE[,ENGINE...]]
     \\talos [--home DIR] status [OWNER/REPO] [--json]
+    \\talos [--home DIR] result OWNER/REPO PR
     \\talos [--home DIR] queue-budget [STARTS]
-    \\talos [--home DIR] queue OWNER/REPO PR
+    \\talos [--home DIR] queue OWNER/REPO PR [--mode MODE] [--prompt TEXT]
     \\talos [--home DIR] stack OWNER/REPO STACK_NUMBER
     \\talos [--home DIR] stack OWNER/REPO NAME PR PR [PR ...]
     \\talos [--home DIR] unstack OWNER/REPO NAME
@@ -29,7 +30,7 @@ const usage =
     \\talos [--home DIR] install|remove [--label dev.talos.NAME]
     \\talos [--home DIR] tick
     \\
-    \\Review modes for a numbered preview
+    \\Review modes for queue and numbered previews
     \\  general (default), perf-maxxing, reliability-maxxing, security-maxxing
     \\
     \\Registration options
@@ -700,8 +701,8 @@ const Main = struct {
         return pr;
     }
 
-    fn previewOptions(args: []const []const u8) !core.Preview {
-        var options: core.Preview = .{};
+    fn reviewOptions(args: []const []const u8) !core.ReviewOptions {
+        var options: core.ReviewOptions = .{};
         var has_mode = false;
         if (args.len % 2 != 0) return error.Usage;
         var index: usize = 0;
@@ -720,7 +721,9 @@ const Main = struct {
     }
 
     fn dry(self: Main, state: *store.State, args: []const []const u8) !void {
-        var preview = try previewOptions(args[@min(args.len, 2)..]);
+        var preview: core.Preview = .{
+            .options = if (args.len > 2) try reviewOptions(args[2..]) else null,
+        };
         if (args.len >= 1 and !core.validRepoName(args[0])) return error.Usage;
         const number = if (args.len >= 2) try prNumber(args[1]) else null;
         const target = if (args.len > 0) state.find(args[0]) orelse return error.UnknownRepository else null;
@@ -774,7 +777,10 @@ const Main = struct {
                 // Show pins and scheduling separately without echoing stored PR text.
                 summary.stacks = &.{};
                 summary.jobs = try self.a.dupe(core.Job, entry.jobs);
-                for (summary.jobs) |*job| job.analysis = null;
+                for (summary.jobs) |*job| {
+                    job.analysis = null;
+                    if (job.options.request != null) job.options.request = "(set)";
+                }
                 try self.out("{s}{s}", .{ if (first) "" else ",", try io.json(self.a, .{
                     .paused = paused,
                     .state = summary,
@@ -814,6 +820,21 @@ const Main = struct {
                 });
             }
             if (queued == 0) try self.out("  Queue empty\n", .{});
+            var completed: usize = 0;
+            var index = entry.jobs.len;
+            while (index > 0 and completed < 5) {
+                index -= 1;
+                const job = entry.jobs[index];
+                if (job.phase != .complete) continue;
+                completed += 1;
+                try self.out("  #{d} {s} complete — {s}", .{
+                    job.number, job.head[0..@min(job.head.len, 10)], job.outcome orelse "review finished",
+                });
+                if (job.receipt) |id| try self.out("  https://github.com/{s}/pull/{d}#pullrequestreview-{d}", .{
+                    entry.repo.name, job.number, id,
+                });
+                try self.out("\n", .{});
+            }
             for (stacks) |item| {
                 if (item.native_number) |number| {
                     try self.out("  GitHub stack #{d} (bottom to top)\n", .{number});
@@ -842,6 +863,13 @@ const Main = struct {
         if (eq(u8, cmd, "status")) {
             var state = try self.db.load();
             return self.status(&state, params);
+        }
+        if (eq(u8, cmd, "result")) {
+            if (params.len != 2) return error.Usage;
+            var state = try self.db.load();
+            const entry = state.find(params[0]) orelse return error.UnknownRepository;
+            const candidate = try self.db.readResult(entry.repo.name, try prNumber(params[1]));
+            return self.out("{s}\n", .{candidate});
         }
         if (eq(u8, cmd, "defaults") and params.len == 0) {
             var state = try self.db.load();
@@ -882,10 +910,11 @@ const Main = struct {
             try self.db.save(&state);
             return self.out("Removed {s} stack {s}\n", .{ entry.repo.name, params[1] });
         }
-        if (eq(u8, cmd, "queue") and params.len == 2) {
+        if (eq(u8, cmd, "queue") and params.len >= 2) {
+            const options = if (params.len > 2) try reviewOptions(params[2..]) else null;
             const entry = state.find(params[0]) orelse return error.UnknownRepository;
             const pull = try self.choose(entry, try prNumber(params[1]));
-            try entry.queue(self.a, pull, true);
+            try entry.queue(self.a, pull, options);
             try self.db.save(&state);
             return self.out("Selected {s} #{d} at {s}\n", .{ entry.repo.name, pull.number, pull.headRefOid });
         }
@@ -1136,14 +1165,14 @@ test "a budget-deferred ensemble gets first turn after reload" {
 test "numbered preview accepts each mode and one operator prompt" {
     const t = std.testing;
     for (std.meta.tags(core.ReviewFocus)) |mode| {
-        const options = try Main.previewOptions(&.{ "--prompt", "Review the allocator path.", "--mode", @tagName(mode) });
+        const options = try Main.reviewOptions(&.{ "--prompt", "Review the allocator path.", "--mode", @tagName(mode) });
         try t.expectEqual(mode, options.focus);
         try t.expectEqualStrings("Review the allocator path.", options.request.?);
     }
-    try t.expectError(error.InvalidReviewMode, Main.previewOptions(&.{ "--mode", "unknown" }));
-    try t.expectError(error.Usage, Main.previewOptions(&.{ "--mode", "general", "--mode", "general" }));
-    try t.expectError(error.Usage, Main.previewOptions(&.{"--prompt"}));
-    try t.expectError(error.InvalidReviewPrompt, Main.previewOptions(&.{ "--prompt", "  " }));
+    try t.expectError(error.InvalidReviewMode, Main.reviewOptions(&.{ "--mode", "unknown" }));
+    try t.expectError(error.Usage, Main.reviewOptions(&.{ "--mode", "general", "--mode", "general" }));
+    try t.expectError(error.Usage, Main.reviewOptions(&.{"--prompt"}));
+    try t.expectError(error.InvalidReviewPrompt, Main.reviewOptions(&.{ "--prompt", "  " }));
 }
 
 test "review workers overlap and use separate scratch directories" {

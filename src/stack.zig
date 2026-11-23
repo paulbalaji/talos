@@ -199,7 +199,7 @@ pub fn register(entry: *core.Entry, a: io.A, name: []const u8, pins: []const Pin
             local_count += 1;
         }
     }
-    for (pins) |pin| try entry.queue(a, pin.pull(), true);
+    for (pins) |pin| try entry.queue(a, pin.pull(), null);
     entry.stacks = stacks.items;
 }
 
@@ -506,7 +506,7 @@ pub fn queueNative(entry: *core.Entry, a: io.A, group: NativeGroup) !usize {
     }
     try syncNative(entry, a, groups.items);
     for (group.pins) |pin| {
-        if (pin.ready()) try entry.queue(a, pin.pull(), true);
+        if (pin.ready()) try entry.queue(a, pin.pull(), null);
     }
     return count;
 }
@@ -516,7 +516,7 @@ fn refreshJob(entry: *core.Entry, a: io.A, pin: Pin, automatic: bool) !void {
     if (matchingJob(entry.jobs, pin)) |job| {
         if (job.phase == .uncertain) return;
     } else if (automatic) return;
-    try entry.queue(a, pin.pull(), true);
+    try entry.queue(a, pin.pull(), null);
 }
 
 const fixture_repo = core.Repo{ .name = "example/repo", .login = "author" };
@@ -620,7 +620,7 @@ test "an inferred child can use a baselined ancestor without queueing a new revi
     try t.expectEqual(@as(u32, 11), entry.stacks[0].members[0].pin.number);
     try t.expectEqual(@as(u32, 12), entry.stacks[0].members[1].pin.number);
     try t.expect(!blocked(entry, entry.jobs[0]));
-    try entry.queue(a, fixture_parent.pull(), true);
+    try entry.queue(a, fixture_parent.pull(), null);
     entry.jobs[1].phase = .failed;
     try t.expect(blocked(entry, entry.jobs[0]));
     try register(&entry, a, "explicit", &.{ fixture_parent, fixture_child });
@@ -689,7 +689,7 @@ test "inferred stacks retain merged ancestors and uncertain receipt backoff" {
     const before = [_]core.Pull{ fixture_parent.pull(), fixture_child.pull() };
     try entry.discover(a, &before, true);
     try autogroup(&entry, a, &before);
-    try entry.queue(a, fixture_child.pull(), true);
+    try entry.queue(a, fixture_child.pull(), null);
     entry.jobs[0].phase = .uncertain;
     entry.jobs[0].attempts = 4;
     entry.jobs[0].next = 1234;
@@ -745,7 +745,7 @@ test "GitHub order is authoritative for a 26-member stack" {
     try t.expectEqual(@as(usize, 26), entry.stacks[0].members.len);
     try t.expectEqual(@as(usize, 0), entry.jobs.len);
     try t.expectEqual(@as(usize, 0), (try numbers(a, entry.stacks)).len);
-    try entry.queue(a, pulls[24], true);
+    try entry.queue(a, pulls[24], null);
     try t.expect(!blocked(entry, entry.jobs[0]));
     const report = try statuses(a, entry);
     try t.expectEqual(@as(?u32, 23), report[0].native_number);

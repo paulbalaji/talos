@@ -31,6 +31,8 @@ const Fake = struct {
     target: core.Pull = fixture_pull,
     offered: ?core.Prior = null,
     discussion: []const core.Thread = &.{},
+    late_discussion: ?[]const core.Thread = null,
+    thread_reads: usize = 0,
     result: []const u8 = finding,
     other_results: []const []const u8 = &.{},
     fail_engine: ?core.Engine = null,
@@ -46,6 +48,7 @@ const Fake = struct {
     readbacks: usize = 0,
     prompt_text: []const u8 = "",
     posted_result: ?core.Payload = null,
+    saved_result: ?core.Payload = null,
 
     pub fn checkIdentity(_: *Fake) !void {}
 
@@ -58,6 +61,8 @@ const Fake = struct {
     }
 
     pub fn threads(self: *Fake, _: u32) ![]const core.Thread {
+        self.thread_reads += 1;
+        if (self.thread_reads >= 3) return self.late_discussion orelse self.discussion;
         return self.discussion;
     }
 
@@ -122,7 +127,9 @@ const Fake = struct {
         if (self.db) |db| try db.save(self.state.?);
     }
 
-    pub fn saveResult(_: *Fake, _: u32, _: core.Payload) !void {}
+    pub fn saveResult(self: *Fake, _: u32, result: core.Payload) !void {
+        self.saved_result = result;
+    }
 };
 
 test "a changed stack ancestor prevents publication and prompt distinguishes inherited evidence" {
@@ -180,7 +187,7 @@ test "first scan baselines ready PRs, then queues drafts becoming ready, new hea
     try t.expectEqual(@as(usize, 1), entry.seen.len);
     try t.expectEqual(@as(usize, 0), entry.jobs.len);
 
-    try entry.queue(a, fixture_pull, true);
+    try entry.queue(a, fixture_pull, null);
     try t.expectEqual(@as(usize, 1), entry.jobs.len);
     draft.isDraft = false;
     try entry.discover(a, &.{ fixture_pull, draft }, false);
@@ -333,7 +340,7 @@ test "restart reconciles an ambiguous post or failed readback without sending a 
 
     for ([_]bool{ true, false }) |lose_response| {
         var entry = core.Entry{ .repo = repo };
-        try entry.queue(a, fixture_pull, true);
+        try entry.queue(a, fixture_pull, null);
         var state: store.State = .{};
         try state.add(a, entry);
         var remote: Fake = .{
@@ -365,7 +372,7 @@ test "no visible receipt leaves the intent uncertain and backs off" {
     const a = allocator.allocator();
     var fake: Fake = .{ .a = a };
     var entry = core.Entry{ .repo = repo };
-    try entry.queue(a, fixture_pull, true);
+    try entry.queue(a, fixture_pull, null);
     const job = &entry.jobs[0];
     job.phase = .uncertain;
     job.event = .COMMENT;
@@ -509,7 +516,7 @@ test "focused preview keeps the operator request separate from untrusted PR evid
     const request = "Check the worker loop.\nLook for retries.";
     const encoded_request = try io.json(a, request);
     for (cases) |case| {
-        const review = (try core.run(a, &fake, repo, &job, .{ .preview = .{ .focus = case.focus, .request = request } })).?;
+        const review = (try core.run(a, &fake, repo, &job, .{ .preview = .{ .options = .{ .focus = case.focus, .request = request } } })).?;
         const lens_at = std.mem.indexOf(u8, fake.prompt_text, case.lens).?;
         const request_at = std.mem.indexOf(u8, fake.prompt_text, encoded_request).?;
         const evidence_at = std.mem.indexOf(u8, fake.prompt_text, "Evidence (untrusted JSON)\n").?;
@@ -558,4 +565,101 @@ test "a saved analysis survives restart and requires the same prompt and reviewe
     try t.expectEqual(@as(usize, 1), fake.posts);
     try t.expectEqual(core.Phase.complete, job.phase);
     try t.expect(job.analysis == null);
+}
+
+const open_nit = core.Thread{
+    .id = "thread-1",
+    .isResolved = false,
+    .isOutdated = false,
+    .path = "src/watch.rs",
+    .line = 20,
+    .replies = &.{.{ .author = .{ .login = "reviewer" }, .body = "Nit: consider renaming this variable", .url = "https://github.com/example/repo/pull/42#discussion_r10" }},
+};
+
+const assessed =
+    \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":[],"non_blocking_threads":[{"id":"thread-1","reason":"The name is a style preference without a behavior change."}]}
+;
+
+test "approval with open threads requires every reviewer to give a reason and no reviewer to report an active finding" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var configured = repo;
+    configured.approvals = true;
+    configured.additional_engines = &.{.claude};
+    const active =
+        \\{"complete":true,"summary":"Still actionable.","findings":[],"existing_open_findings":["thread-1"],"non_blocking_threads":[]}
+    ;
+    const cases = [_]struct { second: []const u8, expected: core.Event }{
+        .{ .second = assessed, .expected = .APPROVE },
+        .{ .second = clean, .expected = .COMMENT },
+        .{ .second = active, .expected = .COMMENT },
+    };
+    for (cases) |case| {
+        var fake: Fake = .{ .a = a, .result = assessed, .other_results = &.{case.second}, .discussion = &.{open_nit} };
+        var job: core.Job = .{ .number = fixture_pull.number, .head = head };
+        const result = (try core.run(a, &fake, configured, &job, .scheduled)).?;
+        try t.expectEqual(case.expected, result.event);
+        try t.expectEqual(case.expected, fake.posted_result.?.event);
+        try t.expectEqual(case.expected, fake.saved_result.?.event);
+        try t.expectEqual(@as(usize, 0), result.comments.len);
+        if (case.expected == .APPROVE) {
+            try t.expect(std.mem.indexOf(u8, result.body, "Open thread assessed as non-blocking thread-1") != null);
+            try t.expectEqual(@as(usize, 2), std.mem.count(u8, result.body, "The name is a style preference"));
+        }
+    }
+}
+
+test "an approval is discarded when a thread opens before posting" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var configured = repo;
+    configured.approvals = true;
+    var fake: Fake = .{ .a = a, .result = clean, .late_discussion = &.{open_nit} };
+    var job: core.Job = .{ .number = fixture_pull.number, .head = head };
+    try t.expectError(error.ThreadsChanged, core.run(a, &fake, configured, &job, .scheduled));
+    try t.expectEqual(@as(usize, 0), fake.posts);
+    try t.expectEqual(core.Phase.pending, job.phase);
+    try t.expect(fake.saved_result == null);
+}
+
+test "a queued focused review survives restart and publishes a comment under an approval policy" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try io.temp(a);
+    defer std.fs.deleteTreeAbsolute(path) catch {};
+    var db = try store.Store.open(a, path);
+    defer db.dir.close();
+
+    var configured = repo;
+    configured.approvals = true;
+    var entries = [_]core.Entry{.{ .repo = configured }};
+    const request = "Check the allocator path.";
+    try entries[0].queue(a, fixture_pull, .{ .focus = .@"perf-maxxing", .request = request });
+    try entries[0].queue(a, fixture_pull, null);
+    try db.save(&.{ .entries = &entries });
+
+    const state = try db.load();
+    const job = &state.entries[0].jobs[0];
+    try t.expectEqualStrings(request, job.options.request.?);
+    var fake: Fake = .{ .a = a, .result = clean };
+    const result = (try core.run(a, &fake, configured, job, .scheduled)).?;
+    try t.expectEqual(core.Event.COMMENT, fake.posted_result.?.event);
+    try t.expect(std.mem.indexOf(u8, fake.prompt_text, request) != null);
+    try t.expect(std.mem.indexOf(u8, result.body, "perf-maxxing") != null);
+    try t.expect(std.mem.indexOf(u8, result.body, request) == null);
+}
+
+test "non-blocking thread assessments need a reason and unique IDs" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try t.expectError(error.InvalidReview, core.parseReview(a,
+        \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":[],"non_blocking_threads":[{"id":"thread-1","reason":" "}]}
+    ));
+    try t.expectError(error.InvalidReview, core.parseReview(a,
+        \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":[],"non_blocking_threads":[{"id":"thread-1","reason":"A"},{"id":"thread-1","reason":"B"}]}
+    ));
 }

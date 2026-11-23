@@ -31,6 +31,8 @@ talos status                          # See scans, queue, errors, and cache size
 | Preview the next review in one repo | `talos run-once OWNER/REPO` |
 | Show or set the reviewer default for new repos | `talos defaults` or `talos defaults --engine claude` |
 | Queue a specific PR under the repo's publication policy | `talos queue OWNER/REPO 123` |
+| Queue a review with a focus | `talos queue OWNER/REPO 123 --mode perf-maxxing --prompt 'Check allocations on the request path.'` |
+| Read the latest local review candidate for a PR | `talos result OWNER/REPO 123` |
 | Queue a numbered GitHub stack | `talos stack OWNER/REPO 10088` |
 | Queue branches as an explicit stack | `talos stack OWNER/REPO feature 123 124 125` |
 | Remove an explicit local stack definition | `talos unstack OWNER/REPO feature` |
@@ -45,7 +47,7 @@ talos status                          # See scans, queue, errors, and cache size
 
 ### Focus a review
 
-Use a review mode on a numbered preview. Add `--prompt` to give the configured reviewers specific context or a question.
+Use a review mode on a numbered preview or queued review. Add `--prompt` to give the configured reviewers specific context or a question.
 
 ```sh
 talos run-once OWNER/REPO 123 --mode perf-maxxing --prompt 'Check allocations on the request path.'
@@ -53,7 +55,9 @@ talos run-once OWNER/REPO 123 --mode reliability-maxxing
 talos run-once OWNER/REPO 123 --mode security-maxxing
 ```
 
-Performance covers hot paths and scaling. Reliability covers partial failure, retries, and recovery. Security checks trust boundaries and mitigations from static source. With no mode, Talos runs the general review. The prompt is sent to your configured reviewers, so keep credentials out of it.
+Performance covers hot paths and scaling. Reliability covers partial failure, retries, and recovery. Security checks trust boundaries and mitigations from static source. With no mode, Talos runs the general review. Talos saves queued prompts locally and sends them to the configured reviewers. Keep credentials out of them. A focused or custom-prompt review can publish a comment when the repo allows comments. Queue the same head again with no flags to retry with its saved options. A verified GitHub review already recorded for that head is deduplicated.
+
+`talos status OWNER/REPO` shows completed jobs still tracked and links to verified GitHub reviews. `talos result OWNER/REPO 123` prints the last saved local candidate, including its reviewed commit. A review reconciled from GitHub can have a receipt without a local candidate.
 
 ### Review a PR stack
 
@@ -109,7 +113,7 @@ Fable receives the review context when Claude consults it. It requires Fable acc
 
 Each reviewer in a list gets the same pinned source and discussion. Talos runs them in order, groups findings at the same diff line, and sends one review with reviewer attribution. A failed reviewer retries the job. Choose providers that can receive the repo's source and discussion.
 
-`--comments` allows publishing a comment review. `--approvals` requires complete coverage and no findings from every configured reviewer, passing checks, no merge conflicts, and no unresolved threads. The author must differ from the configured GitHub identity. A clean candidate can become a comment when only comments are enabled.
+`--comments` allows publishing a comment review. `--approvals` requires complete coverage and no findings from every configured reviewer, passing checks, and no merge conflicts. Each reviewer must give an evidence-based reason why each open thread is non-blocking. Any active finding or unassessed thread blocks approval. GitHub applies the target branch’s conversation-resolution rule at merge time. The author must differ from the configured GitHub identity. A clean candidate can become a comment when only comments are enabled.
 
 ### macOS build fallback
 

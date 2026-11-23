@@ -95,6 +95,14 @@ pub const Store = struct {
         }
     }
 
+    pub fn readResult(self: Store, repo: []const u8, number: u32) ![]const u8 {
+        const path = try self.repoPath(repo, try io.fmt(self.a, "results/{d}.json", .{number}));
+        return self.dir.readFileAlloc(self.a, path, 4 * 1024 * 1024) catch |err| switch (err) {
+            error.FileNotFound => error.NoLocalReview,
+            else => err,
+        };
+    }
+
     pub fn result(self: Store, repo: []const u8, number: u32, payload: core.Payload) !void {
         const dir = try self.repoPath(repo, "results");
         try self.dir.makePath(dir);
