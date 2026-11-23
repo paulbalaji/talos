@@ -7,6 +7,7 @@ pub const auth_env = [_][]const u8{ "CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "C
 pub const failure = error.ClaudeFailed;
 
 pub fn configureEnv(env: *std.process.EnvMap, profile: shared.Profile) !void {
+    try env.put("CLAUDE_CODE_DISABLE_FAST_MODE", "1");
     if (profile.advisor == null) try env.put("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", "1");
 }
 

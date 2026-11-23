@@ -1,7 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io = @import("io.zig");
-const c = @cImport(@cInclude("unistd.h"));
 
 pub const default_label = "dev.talos.watcher";
 
@@ -39,7 +38,7 @@ pub fn manage(cmd: io.Command, home: []const u8, path_env: []const u8, root: []c
     defer dir.close();
     const name = try io.fmt(a, "{s}.plist", .{label});
     const full_path = try std.fs.path.join(a, &.{ agents, name });
-    const domain = try io.fmt(a, "gui/{d}", .{c.getuid()});
+    const domain = try io.fmt(a, "gui/{d}", .{std.posix.getuid()});
     const service = try io.fmt(a, "{s}/{s}", .{ domain, label });
     const owner = try io.fmt(a, "<key>WorkingDirectory</key><string>{s}</string>", .{try xml(a, root)});
     const existing = dir.readFileAlloc(a, name, 128 * 1024) catch |err| switch (err) {

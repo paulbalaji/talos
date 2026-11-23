@@ -1,8 +1,10 @@
 const std = @import("std");
 const io = @import("io.zig");
+const stack = @import("stack.zig");
 const A = io.A;
 const eq = io.eq;
 pub const schema = @embedFile("review-schema.json");
+pub const review_context_limit = 96 * 1024;
 
 pub const Engine = enum { codex, claude, kimi };
 pub const engine_count = std.meta.fields(Engine).len;
@@ -68,6 +70,10 @@ pub const Pull = struct {
     number: u32,
     headRefOid: []const u8,
     baseRefOid: []const u8 = "",
+    headRefName: []const u8 = "",
+    baseRefName: []const u8 = "",
+    headRepository: ?stack.RepositoryRef = null,
+    nativeStack: ?stack.NativeRef = null,
     isDraft: bool,
     state: []const u8 = "OPEN",
     title: []const u8 = "",
@@ -132,8 +138,26 @@ pub const Job = struct {
     event: ?Event = null,
     receipt: ?u64 = null,
     outcome: ?[]const u8 = null,
+
+    pub fn schedulable(self: Job) bool {
+        return (self.phase == .pending or self.phase == .uncertain) and self.attempts < max_attempts;
+    }
 };
 pub const Seen = struct { number: u32, head: []const u8 };
+const Discovery = struct {
+    observed: bool = false,
+    queued: bool = false,
+    ready: bool = false,
+};
+pub const SeenContext = struct {
+    pub fn hash(_: SeenContext, key: Seen) u64 {
+        return std.hash.Wyhash.hash(key.number, key.head);
+    }
+
+    pub fn eql(_: SeenContext, left: Seen, right: Seen) bool {
+        return left.number == right.number and eq(u8, left.head, right.head);
+    }
+};
 pub const Entry = struct {
     repo: Repo,
     seen: []Seen = &.{},
@@ -143,6 +167,11 @@ pub const Entry = struct {
     next_cache_check: i64 = 0,
     scan_attempts: u8 = 0,
     errors: []const Issue = &.{},
+    stacks: []stack.Stack = &.{},
+
+    pub fn stackBlocked(self: Entry, job: Job) bool {
+        return stack.blocked(self, job);
+    }
 
     pub fn problem(self: *Entry, a: A, now: i64, number: ?u32, detail: []const u8) !void {
         const keep = @min(self.errors.len, 11);
@@ -171,30 +200,55 @@ pub const Entry = struct {
     }
 
     pub fn discover(self: *Entry, a: A, pulls: []const Pull, baseline: bool) !void {
+        var index: std.HashMapUnmanaged(Seen, Discovery, SeenContext, 80) = .empty;
+        defer index.deinit(a);
+        for (self.seen) |seen| {
+            const slot = try index.getOrPut(a, seen);
+            if (!slot.found_existing) slot.value_ptr.* = .{};
+            slot.value_ptr.observed = true;
+        }
+        for (self.jobs) |job| {
+            const slot = try index.getOrPut(a, .{ .number = job.number, .head = job.head });
+            if (!slot.found_existing) slot.value_ptr.* = .{};
+            slot.value_ptr.queued = true;
+        }
+
         var ready: std.ArrayList(Seen) = .empty;
+        errdefer ready.deinit(a);
         for (pulls) |pr| {
             if (!isReady(pr)) continue;
             if (!validOid(pr.headRefOid)) return error.InvalidCommit;
-            try ready.append(a, .{ .number = pr.number, .head = pr.headRefOid });
-            if (!baseline and !observed(self.seen, pr)) try self.queue(a, pr, false);
+            const seen: Seen = .{ .number = pr.number, .head = pr.headRefOid };
+            try ready.append(a, seen);
+            const slot = try index.getOrPut(a, seen);
+            if (!slot.found_existing) slot.value_ptr.* = .{};
+            slot.value_ptr.ready = true;
         }
-        self.seen = try ready.toOwnedSlice(a);
         var retained: std.ArrayList(Job) = .empty;
+        errdefer retained.deinit(a);
+        try retained.ensureTotalCapacity(a, self.jobs.len);
         for (self.jobs) |job| {
-            if (job.phase == .uncertain or observed(self.seen, .{
-                .number = job.number,
-                .headRefOid = job.head,
-                .isDraft = false,
-            })) try retained.append(a, job);
+            if (job.phase == .uncertain or index.get(.{ .number = job.number, .head = job.head }).?.ready)
+                retained.appendAssumeCapacity(job);
         }
+        if (!baseline) {
+            for (ready.items) |seen| {
+                const flags = index.getPtr(seen).?;
+                if (flags.observed or flags.queued) continue;
+                try retained.append(a, .{ .number = seen.number, .head = seen.head });
+                flags.queued = true;
+            }
+        }
+        const next_seen = try ready.toOwnedSlice(a);
+        errdefer a.free(next_seen);
         self.jobs = try retained.toOwnedSlice(a);
+        self.seen = next_seen;
     }
 
     pub fn due(self: *Entry, now: i64) ?*Job {
         var candidate: ?*Job = null;
         for (self.jobs) |*job| {
-            if (job.phase != .pending and job.phase != .uncertain) continue;
-            if (job.next > now or job.attempts >= max_attempts) continue;
+            if (!job.schedulable() or job.next > now or self.stackBlocked(job.*)) continue;
             if (candidate == null or job.next < candidate.?.next) candidate = job;
         }
         return candidate;
@@ -203,13 +257,6 @@ pub const Entry = struct {
 
 const Issue = struct { at: i64, number: ?u32, detail: []const u8 };
 const max_attempts = 6;
-
-fn observed(seen: []const Seen, pr: Pull) bool {
-    for (seen) |old| {
-        if (old.number == pr.number and eq(u8, old.head, pr.headRefOid)) return true;
-    }
-    return false;
-}
 
 pub fn recordFailure(entry: *Entry, a: A, job: *Job, now: i64, err: anyerror) !void {
     job.attempts += 1;
@@ -260,6 +307,10 @@ const instructions =
 ;
 
 pub fn prompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, threads: []const Thread, previous: ?[]const u8) ![]const u8 {
+    return reviewPrompt(a, repo, pr, snap, threads, previous, .{});
+}
+
+fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, threads: []const Thread, previous: ?[]const u8, inherited: stack.Context) ![]const u8 {
     const evidence = try io.json(a, .{
         .repository = repo.name,
         .number = pr.number,
@@ -274,6 +325,11 @@ pub fn prompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, threads: []const Threa
         .threads = threads,
         .source = snap.evidence,
     });
+    if (inherited.ancestors.len > 0) {
+        const ancestors = try io.json(a, inherited.ancestors);
+        const total = @max(inherited.pins.len -| 1, inherited.ancestors.len);
+        return io.fmt(a, "{s}\n{s}\n\nReview and anchor findings against this PR alone. Use the ancestor excerpts only as background to avoid repeating findings on inherited changes.\n\nAncestor context (untrusted JSON, nearest {d} of {d} ancestors, bottom to top)\n{s}\n\nEvidence (untrusted JSON)\n{s}", .{ instructions, schema, inherited.ancestors.len, total, ancestors, evidence });
+    }
     return io.fmt(a, "{s}\n{s}\n\nEvidence (untrusted JSON)\n{s}", .{ instructions, schema, evidence });
 }
 
@@ -518,11 +574,11 @@ fn expected(job: Job, review: Prior) bool {
         eq(u8, review.state, "DISMISSED");
 }
 
-fn completeJob(a: A, adapter: anytype, repo: Repo, job: *Job, review: Prior) !void {
-    const readback = try adapter.readReview(job.number, review.id);
-    if (readback.id != review.id or try receipt(a, repo, job.*, &.{readback}) == null)
+fn completeJob(a: A, adapter: anytype, repo: Repo, job: *Job, id: u64) !void {
+    const readback = try adapter.readReview(job.number, id);
+    if (readback.id != id or try receipt(a, repo, job.*, &.{readback}) == null)
         return error.ReviewReadbackMismatch;
-    job.receipt = review.id;
+    job.receipt = id;
     job.phase = .complete;
     job.outcome = "verified GitHub review";
     try adapter.persist();
@@ -535,13 +591,14 @@ pub const RunMode = union(enum) {
 
 // The same workflow runs against the CLI adapter and deterministic fakes.
 pub fn run(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?Payload {
+    const supports_stacks = @hasDecl(std.meta.Child(@TypeOf(adapter)), "stackContext");
     const dry = mode == .preview;
     const can_publish = !dry and (repo.comments or repo.approvals);
     const earlier_reviews = if (job.phase == .uncertain or can_publish) earlier: {
         try adapter.checkIdentity();
         const existing = try adapter.reviews(job.number);
         if (try receipt(a, repo, job.*, existing)) |prior| {
-            try completeJob(a, adapter, repo, job, prior);
+            try completeJob(a, adapter, repo, job, prior.id);
             return null;
         }
         if (job.phase == .uncertain) return error.PublicationUnconfirmed;
@@ -553,12 +610,22 @@ pub fn run(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?Paylo
     };
     if (pr.number != job.number or !isReady(pr) or !eq(u8, pr.headRefOid, job.head)) return error.TargetChanged;
     if (!validOid(pr.headRefOid) or !validOid(pr.baseRefOid)) return error.InvalidCommit;
-    const snap = try adapter.snapshot(pr);
+    const inherited: stack.Context = if (supports_stacks) try adapter.stackContext(pr, dry) else .{};
+    var snap = try adapter.snapshot(pr);
     const threads = try adapter.threads(pr.number);
     const previous = previousCommit(earlier_reviews orelse try adapter.reviews(pr.number), repo.login);
     const engines = try repo.engines(a);
     try validateEngines(engines);
-    const context = try prompt(a, repo, pr, snap, threads, previous);
+    var context = if (inherited.ancestors.len == 0)
+        try prompt(a, repo, pr, snap, threads, previous)
+    else
+        try reviewPrompt(a, repo, pr, snap, threads, previous, inherited);
+    if (inherited.ancestors.len != 0 and context.len > review_context_limit and snap.evidence.len != 0) {
+        const remaining = snap.evidence.len -| (context.len - review_context_limit);
+        snap.evidence = snap.evidence[0..safePrefix(snap.evidence, remaining)];
+        snap.limited = true;
+        context = try reviewPrompt(a, repo, pr, snap, threads, previous, inherited);
+    }
     var results: [engine_count]ReviewerResult = undefined;
     for (engines, 0..) |engine, index| {
         const raw = try adapter.review(engine, context);
@@ -568,20 +635,23 @@ pub fn run(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?Paylo
         return error.ThreadsChanged;
     const latest = try adapter.pull(job.number);
     if (!sameTarget(pr, latest)) return error.TargetChanged;
+    if (supports_stacks) try adapter.checkStack(inherited);
     var result = try payload(a, adapter, repo, latest, snap, results[0..engines.len], threads);
     if (dry) return result;
     try adapter.saveResult(job.number, result);
+    if (supports_stacks) try adapter.saveStackContext(pr, snap, result);
     const own_pr = if (latest.author) |author| eq(u8, author.login, repo.login) else true;
     if (result.event == .APPROVE and (!repo.approvals or own_pr)) result.event = .COMMENT;
     const permitted = if (result.event == .APPROVE) repo.approvals else repo.comments;
     if (permitted) {
         if (try receipt(a, repo, job.*, try adapter.reviews(pr.number))) |prior| {
-            try completeJob(a, adapter, repo, job, prior);
+            try completeJob(a, adapter, repo, job, prior.id);
             return null;
         }
         try adapter.checkIdentity();
         const final = try adapter.pull(pr.number);
         if (!sameTarget(pr, final)) return error.TargetChanged;
+        if (supports_stacks) try adapter.checkStackBeforePost(inherited, final);
         if (result.event == .APPROVE and !checksPassed(final)) return error.ChecksChanged;
         // Persist intent before making a network call. A restart can only reconcile this intent.
         job.phase = .uncertain;
@@ -590,12 +660,10 @@ pub fn run(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?Paylo
         const id = try adapter.post(pr.number, result);
         job.receipt = id;
         try adapter.persist();
-        const verified = try adapter.readReview(pr.number, id);
-        if (verified.id != id or try receipt(a, repo, job.*, &.{verified}) == null) return error.ReviewReadbackMismatch;
-        job.outcome = "verified GitHub review";
-    } else {
-        job.outcome = "saved local review";
+        try completeJob(a, adapter, repo, job, id);
+        return result;
     }
+    job.outcome = "saved local review";
     job.phase = .complete;
     try adapter.persist();
     return result;

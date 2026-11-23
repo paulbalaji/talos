@@ -2,6 +2,7 @@ const std = @import("std");
 const core = @import("core.zig");
 const io = @import("io.zig");
 const store = @import("store.zig");
+const stack = @import("stack.zig");
 
 const t = std.testing;
 const repo = core.Repo{ .name = "example/repo", .login = "reviewer", .comments = true };
@@ -36,6 +37,9 @@ const Fake = struct {
     lose_response: bool = false,
     lose_readback: bool = false,
     move_during_review: enum { none, head, base } = .none,
+    inherited: stack.Context = .{},
+    move_ancestor_during_review: bool = false,
+    join_native_before_post: bool = false,
     posts: usize = 0,
     reviews_run: usize = 0,
     reviewed_engines: [core.engine_count]core.Engine = undefined,
@@ -60,6 +64,21 @@ const Fake = struct {
     pub fn snapshot(_: *Fake, _: core.Pull) !core.Snapshot {
         return .{ .merge_base = base, .evidence = "Diff in src/watch.rs" };
     }
+
+    pub fn stackContext(self: *Fake, _: core.Pull, _: bool) !stack.Context {
+        return self.inherited;
+    }
+
+    pub fn checkStack(self: *Fake, _: stack.Context) !void {
+        if (self.move_ancestor_during_review and self.reviews_run != 0) return error.StackChanged;
+    }
+
+    pub fn checkStackBeforePost(self: *Fake, context: stack.Context, _: core.Pull) !void {
+        if (self.join_native_before_post) return error.StackChanged;
+        try self.checkStack(context);
+    }
+
+    pub fn saveStackContext(_: *Fake, _: core.Pull, _: core.Snapshot, _: core.Payload) !void {}
 
     pub fn anchor(_: *Fake, _: core.Pull, _: core.Snapshot, path: []const u8, line: u32) !bool {
         return std.mem.eql(u8, path, "src/watch.rs") and line == 20;
@@ -105,6 +124,49 @@ const Fake = struct {
 
     pub fn saveResult(_: *Fake, _: u32, _: core.Payload) !void {}
 };
+
+test "a changed stack ancestor prevents publication and prompt distinguishes inherited evidence" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fake: Fake = .{
+        .a = a,
+        .move_ancestor_during_review = true,
+        .inherited = .{ .ancestors = &.{.{
+            .number = 2,
+            .head = changed,
+            .base = base,
+            .state = "OPEN",
+            .diff_excerpt = "Parent diff",
+            .review_excerpt = "Parent finding",
+        }} },
+    };
+    var job: core.Job = .{ .number = fixture_pull.number, .head = head };
+    try t.expectError(error.StackChanged, core.run(a, &fake, repo, &job, .scheduled));
+    try t.expectEqual(@as(usize, 0), fake.posts);
+    try t.expectEqual(core.Phase.pending, job.phase);
+    const inherited_at = std.mem.indexOf(u8, fake.prompt_text, "Ancestor context (untrusted JSON") orelse
+        return error.MissingAncestorContext;
+    const own_at = std.mem.indexOf(u8, fake.prompt_text, "Evidence (untrusted JSON)") orelse
+        return error.MissingTargetContext;
+    try t.expect(inherited_at < own_at);
+    try t.expect(std.mem.indexOf(u8, fake.prompt_text[inherited_at..own_at], "Parent diff") != null);
+    try t.expect(std.mem.indexOf(u8, fake.prompt_text[inherited_at..own_at], "Parent finding") != null);
+    try t.expect(std.mem.indexOf(u8, fake.prompt_text[own_at..], "Diff in src/watch.rs") != null);
+}
+
+test "late native stack membership aborts before the durable publication intent" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fake: Fake = .{ .a = a, .join_native_before_post = true };
+    var job: core.Job = .{ .number = fixture_pull.number, .head = head };
+    try t.expectError(error.StackChanged, core.run(a, &fake, repo, &job, .scheduled));
+    try t.expectEqual(@as(usize, 0), fake.posts);
+    try t.expectEqual(core.Phase.pending, job.phase);
+    try t.expect(job.event == null);
+    try t.expect(job.receipt == null);
+}
 
 test "first scan baselines ready PRs, then queues drafts becoming ready, new heads, and explicit selections" {
     var allocator = std.heap.ArenaAllocator.init(t.allocator);

@@ -10,27 +10,50 @@ const diff_limit = 48 * 1024;
 const context_limit = 24 * 1024;
 const max_blob_size = 16 * 1024;
 const batch_size = 32;
-const excluded_paths = [_][]const u8{
-    ":(exclude,glob)**/.env*",
-    ":(exclude,glob)**/*.pem",
-    ":(exclude,glob)**/*.key",
-    ":(exclude,glob)**/*.p12",
-    ":(exclude,glob)**/*.pfx",
-    ":(exclude,glob)**/.npmrc",
-    ":(exclude,glob)**/.netrc",
-    ":(exclude,glob)**/id_rsa",
-    ":(exclude,glob)**/id_ed25519",
+
+const SensitiveName = union(enum) {
+    exact: []const u8,
+    prefix: []const u8,
+    suffix: []const u8,
+
+    fn gitPathspec(comptime self: SensitiveName) []const u8 {
+        const glob = switch (self) {
+            .exact => |name| name,
+            .prefix => |prefix| prefix ++ "*",
+            .suffix => |suffix| "*" ++ suffix,
+        };
+        return ":(exclude,glob)**/" ++ glob;
+    }
+
+    fn matches(self: SensitiveName, name: []const u8) bool {
+        return switch (self) {
+            .exact => |exact| eq(u8, name, exact),
+            .prefix => |prefix| std.mem.startsWith(u8, name, prefix),
+            .suffix => |suffix| std.mem.endsWith(u8, name, suffix),
+        };
+    }
+};
+
+const sensitive_names = [_]SensitiveName{
+    .{ .prefix = ".env" },
+    .{ .suffix = ".pem" },
+    .{ .suffix = ".key" },
+    .{ .suffix = ".p12" },
+    .{ .suffix = ".pfx" },
+    .{ .exact = ".npmrc" },
+    .{ .exact = ".netrc" },
+    .{ .exact = "id_rsa" },
+    .{ .exact = "id_ed25519" },
+};
+const excluded_paths = specs: {
+    var result: [sensitive_names.len][]const u8 = undefined;
+    for (sensitive_names, &result) |rule, *pathspec| pathspec.* = rule.gitPathspec();
+    break :specs result;
 };
 
 fn sensitive(path: []const u8) bool {
     const name = std.fs.path.basename(path);
-    if (std.mem.startsWith(u8, name, ".env")) return true;
-    for (excluded_paths[1..5]) |pattern| {
-        if (std.mem.endsWith(u8, name, pattern[pattern.len - 4 ..])) return true;
-    }
-    for (excluded_paths[5..]) |pattern| {
-        if (eq(u8, name, std.fs.path.basename(pattern))) return true;
-    }
+    for (sensitive_names) |rule| if (rule.matches(name)) return true;
     return false;
 }
 
@@ -286,6 +309,32 @@ fn range(text: []const u8) ?struct { start: u32, count: u32 } {
     const count = if (parts.next()) |value| std.fmt.parseUnsigned(u32, value, 10) catch return null else 1;
     if (parts.next() != null) return null;
     return .{ .start = start, .count = count };
+}
+
+test "sensitive names keep existing Git exclusions and match root and nested basenames" {
+    const t = std.testing;
+    const previous = [_][]const u8{
+        ":(exclude,glob)**/.env*",
+        ":(exclude,glob)**/*.pem",
+        ":(exclude,glob)**/*.key",
+        ":(exclude,glob)**/*.p12",
+        ":(exclude,glob)**/*.pfx",
+        ":(exclude,glob)**/.npmrc",
+        ":(exclude,glob)**/.netrc",
+        ":(exclude,glob)**/id_rsa",
+        ":(exclude,glob)**/id_ed25519",
+    };
+    for (previous, excluded_paths) |expected, pathspec| try t.expectEqualStrings(expected, pathspec);
+    inline for (.{ ".env", ".envrc", ".env.production", ".pem", "ca.pem", "server.key", "client.p12", "client.pfx", ".npmrc", ".netrc", "id_rsa", "id_ed25519" }) |name| {
+        try t.expect(sensitive(name));
+        try t.expect(sensitive("nested/dir/" ++ name));
+    }
+    inline for (.{ ".ENV.local", "env.local", "ca.PEM", "client.p12.txt", "server.key.example", ".npmrc.example", ".netrc.bak", "id_rsa.pub", "id_ed25519.pub" }) |name| {
+        try t.expect(!sensitive(name));
+        try t.expect(!sensitive("nested/dir/" ++ name));
+    }
+    try t.expect(!sensitive(".env/README.md"));
+    try t.expect(!sensitive("nested/id_rsa/README.md"));
 }
 
 test "right-side anchors honor deletions, context, and truncated hunks" {

@@ -30,13 +30,33 @@ talos status                          # See scans, queue, errors, and cache size
 | Preview the next review in one repo | `talos run-once OWNER/REPO` |
 | Show or set the reviewer default for new repos | `talos defaults` or `talos defaults --engine claude` |
 | Queue a specific PR under the repo's publication policy | `talos queue OWNER/REPO 123` |
+| Queue a numbered GitHub stack | `talos stack OWNER/REPO 10088` |
+| Queue branches as an explicit stack | `talos stack OWNER/REPO feature 123 124 125` |
+| Remove an explicit local stack definition | `talos unstack OWNER/REPO feature` |
 | Inspect one repo or read JSON | `talos status OWNER/REPO` or `talos status --json` |
+| Show or set the review budget per tick | `talos queue-budget` or `talos queue-budget 3` |
 | Pause or resume reviews for a repo | `talos pause OWNER/REPO` or `talos resume OWNER/REPO` |
 | Run one scheduler pass | `talos tick` |
 | Remove the macOS scheduler | `talos remove` |
 | List flags and commands | `talos --help` |
 
 `run-once` always previews. `tick` uses the configured publication policy. A numbered preview also works while its repo is paused.
+
+### Review a PR stack
+
+When Talos scans ready PRs, it uses the number and member order GitHub recorded for each `gh stack`. It reads that metadata through the GitHub API. Stack detection keeps the baseline intact and groups existing per-head jobs.
+
+For PRs without a GitHub stack, Talos can infer a linear chain when each PR targets the previous PR's branch and exact head in the same repo. Ambiguous or branched relationships stay in the ordinary queue. You can also define a local stack with two to eight ready PRs in one repo, bottom to top.
+
+```sh
+talos stack OWNER/REPO 10088
+talos stack OWNER/REPO feature 123 124 125
+talos status OWNER/REPO
+talos run-once OWNER/REPO 124
+talos unstack OWNER/REPO feature
+```
+
+Talos waits for queued ancestor reviews or merges before starting the next scheduled PR. A baselined ancestor can contribute its pinned diff and any available review without starting a new model run. Reviewers see excerpts from the nearest ancestors, and Talos rechecks the entire ordered prefix before publication. Each PR keeps its own diff anchors and publication receipt. Use `status` to see the stack number, order, and why a PR is blocked. `unstack` removes an explicit local definition and keeps its queued jobs. A later scan can detect the chain again. [GitHub stack APIs](https://docs.github.com/en/pull-requests/reference/stacked-pull-requests-apis-and-webhooks)
 
 ### Configure each repo
 
@@ -69,6 +89,8 @@ Use `--model MODEL` for the first reviewer, or repeat `--reviewer-model ENGINE=M
 | Kimi Code | K3.1 Pro (`kimi-code/k3.1-pro`) | High | |
 
 Use `--reviewer-effort ENGINE=LEVEL` to change effort. Use `default` to leave effort to the CLI. Codex and Claude accept `low`, `medium`, `high`, `xhigh`, and `max`. Kimi accepts `low`, `high`, and `max`. The chosen model must support the requested settings.
+
+Talos requests standard serving speed in Codex and disables Claude's fast mode. It selects regular Kimi models and rejects model IDs named as premium speed variants. Use standard-speed routes when defining custom model aliases. [Codex speed](https://learn.chatgpt.com/docs/agent-configuration/speed) · [Claude fast mode](https://code.claude.com/docs/en/fast-mode) · [Kimi models](https://www.kimi.com/code/docs/en/kimi-code/models.html)
 
 Fable receives the review context when Claude consults it. It requires Fable access and can use usage credits. Set `--claude-advisor off` on a repo to disable it. If your Kimi plan lacks K3.1 Pro, select an available model with `--reviewer-model kimi=MODEL`. [Claude advisor](https://code.claude.com/docs/en/advisor) · [Kimi models](https://www.kimi.com/code/docs/en/kimi-code/models.html)
 
@@ -120,7 +142,11 @@ launchctl print "gui/$(id -u)/dev.talos.watcher"
 talos status --json
 ```
 
-The state directory is `~/.local/state/talos`. One process holds its lock at a time. Each tick takes at most one due PR per repo and runs the work serially. `state.json` holds reviewer defaults, the baseline, queue, publication receipts, and recent errors. `repos/OWNER/REPO/results/` holds candidate reviews. Check `launchd.log` for scheduler errors.
+The state directory is `~/.local/state/talos`. One process holds its lock at a time. Each tick takes at most one due PR per repo and runs the work serially. `state.json` holds reviewer defaults, the baseline, queue, stacks, publication receipts, and recent errors. `repos/OWNER/REPO/results/` holds candidate reviews. Check `launchd.log` for scheduler errors.
+
+The default machine budget is three reviewer starts per tick. A PR with two configured reviewers reserves two starts. The same limit applies separately to receipt lookups, which use GitHub calls and zero reviewer starts. Set it with `talos queue-budget 3`. It must fit the largest configured reviewer list. Unserved work stays queued, and Talos rotates between repos across restarts. `status` shows the next eligible PR and the last active tick's review starts and GitHub CLI calls. Each repo keeps its own scan interval and Git cache limits.
+
+A recognized GitHub rate limit holds scans and review jobs. A recognized reviewer rate limit holds jobs that use that reviewer. Talos saves these cooldowns across restarts and backs off from 60 seconds up to 16 minutes.
 
 Job retries back off from 30 seconds, with six attempts per head. Use `queue` to retry. If a POST may have reached GitHub, Talos retries the receipt lookup and leaves the head `uncertain` until it can confirm the result. Run one publisher per repo because GitHub has no cross-machine idempotency key for reviews.
 
@@ -147,8 +173,10 @@ Use `talos remove` to stop the default scheduler and keep its data. For a full u
 
 | Change | Start here |
 | --- | --- |
-| CLI, scheduling, and status | `src/main.zig`, `src/launchd.zig` |
+| CLI parsing, registration, and scheduling | `src/repo_config.zig`, `src/main.zig`, `src/launchd.zig` |
 | Discovery, retries, and publication policy | `src/core.zig`, `src/store.zig` |
+| Review budget, scheduling order, and cooldowns | `src/queue.zig` |
+| PR stacks and inherited context | `src/stack.zig` |
 | Git snapshots, anchors, and cache eviction | `src/source.zig`, `src/cache.zig` |
 | GitHub API | `src/github.zig` |
 | Reviewer adapters and result schema | `src/reviewers/`, `src/runner.zig`, `src/review-schema.json` |

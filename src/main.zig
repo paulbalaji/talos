@@ -3,12 +3,14 @@ const core = @import("core.zig");
 const cache = @import("cache.zig");
 const github = @import("github.zig");
 const source = @import("source.zig");
+const stack = @import("stack.zig");
 const runner = @import("runner.zig");
 const store = @import("store.zig");
 const launchd = @import("launchd.zig");
 const io = @import("io.zig");
+const repo_config = @import("repo_config.zig");
+const queue = @import("queue.zig");
 
-const c = @cImport(@cInclude("sys/stat.h"));
 const eq = io.eq;
 const A = io.A;
 const usage =
@@ -17,7 +19,11 @@ const usage =
     \\talos [--home DIR] add OWNER/REPO [options]
     \\talos [--home DIR] defaults [--engine ENGINE[,ENGINE...]]
     \\talos [--home DIR] status [OWNER/REPO] [--json]
+    \\talos [--home DIR] queue-budget [STARTS]
     \\talos [--home DIR] queue OWNER/REPO PR
+    \\talos [--home DIR] stack OWNER/REPO STACK_NUMBER
+    \\talos [--home DIR] stack OWNER/REPO NAME PR PR [PR ...]
+    \\talos [--home DIR] unstack OWNER/REPO NAME
     \\talos [--home DIR] run-once [OWNER/REPO [PR]]
     \\talos [--home DIR] pause|resume OWNER/REPO
     \\talos [--home DIR] install|remove [--label dev.talos.NAME]
@@ -48,20 +54,15 @@ fn pick(a: A, env: *const std.process.EnvMap, names: []const []const u8) !std.pr
 
 const common_env = [_][]const u8{ "HOME", "PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR" };
 
-const Tool = enum { git, gh, codex, claude, kimi };
-const Programs = struct {
-    git: []const u8 = "git",
-    gh: []const u8 = "gh",
-    codex: []const u8 = "codex",
-    claude: []const u8 = "claude",
-    kimi: []const u8 = "kimi",
-};
+const Tool = repo_config.Tool;
+const Programs = repo_config.Programs;
 const Local = struct {
     a: A,
     env: *const std.process.EnvMap,
     scratch: [:0]const u8,
     scratch_dir: std.fs.Dir,
     programs: Programs,
+    counts: ?*queue.TickCounts = null,
 
     fn command(self: Local, env: *const std.process.EnvMap) io.Command {
         return .{ .a = self.a, .env = env, .cwd = self.scratch, .dir = self.scratch_dir };
@@ -82,7 +83,12 @@ const Local = struct {
     }
 
     fn gh(self: Local, env: *const std.process.EnvMap, name: []const u8) !github.Client {
-        return .{ .cmd = self.command(env), .gh = try self.bin(.gh), .repo = name };
+        return .{
+            .cmd = self.command(env),
+            .gh = try self.bin(.gh),
+            .repo = name,
+            .calls = if (self.counts) |counts| &counts.github_commands else null,
+        };
     }
 
     fn git(self: Local, env: *std.process.EnvMap, db: store.Store, repo: core.Repo) !source.Git {
@@ -111,6 +117,7 @@ const Adapter = struct {
     db: store.Store,
     state: *const store.State,
     repo: core.Repo,
+    entry: *core.Entry,
     github_client: github.Client,
     git_source: source.Git,
     tools: Local,
@@ -138,6 +145,98 @@ const Adapter = struct {
         return self.git_source.snapshot(pr, self.files);
     }
 
+    pub fn stackContext(self: *Adapter, pr: core.Pull, preview: bool) !stack.Context {
+        const position = stack.find(self.entry.stacks, pr.number) orelse return .{};
+        const item = self.entry.stacks[position.stack_index];
+        const prefix = item.members[0 .. position.member_index + 1];
+        const pins = if (item.native) |identity|
+            (try self.github_client.nativeStack(identity, prefix.len)).pins
+        else local: {
+            if (prefix.len > stack.max_members) return error.InvalidStackSize;
+            var numbers: [stack.max_members]u32 = undefined;
+            for (prefix, numbers[0..prefix.len]) |member, *number| number.* = member.pin.number;
+            break :local try self.github_client.stackPulls(numbers[0..prefix.len]);
+        };
+        const target = pins[pins.len - 1];
+        if (target.number != pr.number or !target.ready() or !eq(u8, target.headRefOid, pr.headRefOid) or !eq(u8, target.baseRefOid, pr.baseRefOid))
+            return error.StackChanged;
+        const parent_count = pins.len - 1;
+        const detail_start = parent_count -| stack.context_members;
+        const ancestors = try self.db.a.alloc(stack.Ancestor, parent_count - detail_start);
+        for (prefix, pins, 0..) |member, pin, index| {
+            if (member.pin.number != pin.number or (item.native == null and pin.nativeStack != null)) return error.StackChanged;
+            if (!preview and !stack.samePin(member.pin, pin)) return error.StackChanged;
+            if (pin.state != .MERGED and !pin.ready()) return error.StackChanged;
+            if (item.native == null and index > 0 and pin.state != .MERGED and pins[index - 1].state != .MERGED and
+                !stack.linked(self.repo.name, pins[index - 1], pin)) return error.StackChanged;
+        }
+        for (prefix[detail_start..parent_count], pins[detail_start..parent_count], ancestors) |member, pin, *ancestor| {
+            const merged_pin = pin.state == .MERGED and eq(u8, pin.headRefOid, member.pin.headRefOid);
+            const base = if (merged_pin) member.diff_base else pin.baseRefOid;
+            var ancestor_pr = pin.pull();
+            ancestor_pr.baseRefOid = base;
+            const digest = digest: {
+                if (merged_pin or stack.samePin(member.pin, pin)) {
+                    if (member.digest) |stored| break :digest stored;
+                }
+                const snapshot_value = try self.git_source.snapshot(ancestor_pr, &.{});
+                break :digest try stack.Digest.make(self.db.a, snapshot_value.evidence, try self.ancestorReview(pin));
+            };
+            ancestor.* = .{
+                .number = pin.number,
+                .head = pin.headRefOid,
+                .base = base,
+                .state = @tagName(pin.state),
+                .diff_excerpt = digest.diff,
+                .review_excerpt = digest.findings,
+            };
+        }
+        return .{ .pins = pins, .ancestors = ancestors, .native = item.native };
+    }
+
+    fn ancestorReview(self: *Adapter, pin: stack.Pin) !?core.Payload {
+        const reviews_value = try self.github_client.reviews(pin.number);
+        var newest: ?core.Prior = null;
+        for (reviews_value) |prior| {
+            const user = prior.user orelse continue;
+            if (!std.ascii.eqlIgnoreCase(user.login, self.repo.login) or !eq(u8, prior.commit_id, pin.headRefOid) or
+                eq(u8, prior.state, "PENDING") or (newest != null and newest.?.id >= prior.id)) continue;
+            newest = prior;
+        }
+        const prior = newest orelse return null;
+        return .{ .commit_id = prior.commit_id, .event = .COMMENT, .body = prior.body orelse "", .comments = &.{} };
+    }
+
+    pub fn checkStack(self: *Adapter, context: stack.Context) !void {
+        if (context.pins.len == 0) return;
+        const latest = if (context.native) |identity|
+            (try self.github_client.nativeStack(identity, context.pins.len)).pins
+        else local: {
+            var numbers: [stack.max_members]u32 = undefined;
+            for (context.pins, numbers[0..context.pins.len]) |pin, *number| number.* = pin.number;
+            break :local try self.github_client.stackPulls(numbers[0..context.pins.len]);
+        };
+        for (context.pins, latest) |before, after| {
+            if (!stack.samePin(before, after)) return error.StackChanged;
+        }
+    }
+
+    pub fn checkStackBeforePost(self: *Adapter, context: stack.Context, target: core.Pull) !void {
+        if (context.pins.len != 0) return self.checkStack(context);
+        // A normal PR can join a native stack after the most recent scan.
+        // Refuse to publish a standalone review for it before persisting intent.
+        const pins = try self.github_client.stackPulls(&.{target.number});
+        const pin = pins[0];
+        if (pin.nativeStack != null or !pin.ready() or !eq(u8, pin.headRefOid, target.headRefOid) or
+            !eq(u8, pin.baseRefOid, target.baseRefOid)) return error.StackChanged;
+    }
+
+    pub fn saveStackContext(self: *Adapter, pr: core.Pull, snap: core.Snapshot, payload: core.Payload) !void {
+        const position = stack.find(self.entry.stacks, pr.number) orelse return;
+        const member = &self.entry.stacks[position.stack_index].members[position.member_index];
+        member.digest = try stack.Digest.make(self.db.a, snap.evidence, payload);
+    }
+
     pub fn anchor(self: *Adapter, _: core.Pull, _: core.Snapshot, path: []const u8, line: u32) !bool {
         return source.anchor(self.files, path, line);
     }
@@ -151,6 +250,7 @@ const Adapter = struct {
             .bin = bin,
             .engine = engine,
             .profile = profile,
+            .starts = if (self.tools.counts) |counts| &counts.reviewer_starts else null,
         };
         return reviewer.review(prompt);
     }
@@ -180,23 +280,14 @@ const Main = struct {
     scratch: [:0]const u8,
     scratch_dir: std.fs.Dir,
     output: std.fs.File = std.fs.File.stdout(),
+    counts: ?*queue.TickCounts = null,
 
     fn out(self: Main, comptime pattern: []const u8, args: anytype) !void {
         return io.print(self.output, pattern, args);
     }
 
     fn local(self: Main, entry: ?core.Repo) Local {
-        var result: Local = .{ .a = self.a, .env = self.env, .scratch = self.scratch, .scratch_dir = self.scratch_dir, .programs = .{} };
-        if (entry) |repo| {
-            result.programs = .{
-                .git = repo.git,
-                .gh = repo.gh,
-                .codex = repo.codex,
-                .claude = repo.claude,
-                .kimi = repo.kimi,
-            };
-        }
-        return result;
+        return .{ .a = self.a, .env = self.env, .scratch = self.scratch, .scratch_dir = self.scratch_dir, .programs = Programs.fromRepo(entry), .counts = self.counts };
     }
 
     fn objectCache(self: Main, repo: core.Repo) cache.Cache {
@@ -207,91 +298,15 @@ const Main = struct {
         if (args.len == 0) return error.Usage;
         const name = try repoName(self.a, args[0]);
         const previous = if (state.find(name)) |entry| entry.repo else null;
-        var repo: core.Repo = .{
-            .name = name,
-            .login = "",
-        };
-        if (previous) |old| {
-            repo.reviewer_efforts = old.reviewer_efforts;
-            repo.claude_advisor = old.claude_advisor;
-        }
-        var programs = self.local(previous).programs;
-        var engines = if (previous) |old| try old.engines(self.a) else state.default_engines;
-        var new_engines = false;
-        var models = std.EnumArray(core.Engine, ?[]const u8).initFill(null);
-        var options = args[1..];
-        // Preserve the v0 command line without opening the old checkout.
-        if (options.len != 0 and !std.mem.startsWith(u8, options[0], "--")) options = options[1..];
-        while (options.len > 0) {
-            const opt = options[0];
-            options = options[1..];
-            if (eq(u8, opt, "--comments")) {
-                repo.comments = true;
-            } else if (eq(u8, opt, "--approvals")) {
-                repo.approvals = true;
-            } else {
-                if (options.len == 0) return error.Usage;
-                const value = options[0];
-                options = options[1..];
-                if (eq(u8, opt, "--interval")) {
-                    repo.interval = std.fmt.parseUnsigned(u32, value, 10) catch return error.InvalidInterval;
-                    if (repo.interval < 15) return error.InvalidInterval;
-                } else if (eq(u8, opt, "--cache-mib")) {
-                    repo.cache_mib = std.fmt.parseUnsigned(u32, value, 10) catch return error.InvalidCacheSize;
-                } else if (eq(u8, opt, "--cache-idle-days")) {
-                    repo.cache_idle_days = std.fmt.parseUnsigned(u16, value, 10) catch return error.InvalidCacheAge;
-                    if (repo.cache_idle_days == 0) return error.InvalidCacheAge;
-                } else if (eq(u8, opt, "--engine")) {
-                    engines = try parseEngines(self.a, value);
-                    new_engines = true;
-                } else if (eq(u8, opt, "--model")) {
-                    repo.model = try modelName(value);
-                } else if (eq(u8, opt, "--reviewer-model")) {
-                    const split = std.mem.indexOfScalar(u8, value, '=') orelse return error.InvalidModel;
-                    const engine = std.meta.stringToEnum(core.Engine, value[0..split]) orelse return error.UnknownReviewer;
-                    models.set(engine, try modelName(value[split + 1 ..]));
-                } else if (eq(u8, opt, "--reviewer-effort")) {
-                    const split = std.mem.indexOfScalar(u8, value, '=') orelse return error.InvalidReviewerEffort;
-                    const engine = std.meta.stringToEnum(core.Engine, value[0..split]) orelse return error.UnknownReviewer;
-                    const effort = std.meta.stringToEnum(core.ReviewEffort, value[split + 1 ..]) orelse return error.InvalidReviewerEffort;
-                    if (engine == .kimi and (effort == .medium or effort == .xhigh)) return error.InvalidReviewerEffort;
-                    switch (engine) {
-                        inline else => |selected| @field(repo.reviewer_efforts, @tagName(selected)) = effort,
-                    }
-                } else if (eq(u8, opt, "--claude-advisor")) {
-                    repo.claude_advisor = std.meta.stringToEnum(core.ClaudeAdvisor, value) orelse return error.InvalidClaudeAdvisor;
-                } else if (std.mem.startsWith(u8, opt, "--")) {
-                    const tool = std.meta.stringToEnum(Tool, opt[2..]) orelse return error.Usage;
-                    switch (tool) {
-                        inline else => |t| @field(programs, @tagName(t)) = value,
-                    }
-                } else return error.Usage;
-            }
-        }
-        repo.engine = engines[0];
-        repo.additional_engines = engines[1..];
-        var model_options = models.iterator();
-        while (model_options.next()) |option| {
-            if (option.value.* != null and std.mem.indexOfScalar(core.Engine, engines, option.key) == null)
-                return error.ReviewerModelForUnselectedEngine;
-        }
-        const retained = if (new_engines) null else previous;
-        if (models.get(repo.engine)) |named| {
-            repo.model = named;
-        } else if (repo.model == null) {
-            if (retained) |old| repo.model = old.modelFor(repo.engine);
-        }
-        var additional_models: std.ArrayList(core.ReviewerModel) = .empty;
-        for (repo.additional_engines) |engine| {
-            const model = models.get(engine) orelse if (retained) |old| old.modelFor(engine) else null;
-            if (model) |value| try additional_models.append(self.a, .{ .engine = engine, .model = value });
-        }
-        repo.additional_models = additional_models.items;
+        const config = try repo_config.parse(self.a, name, previous, state.default_engines, args[1..]);
+        var repo = config.repo;
+        if (queue.reviewerCost(repo) > state.queue_budget.limit) return error.ReviewBudgetTooSmall;
+        var programs = config.programs;
         var tools = self.local(null);
         tools.programs = programs;
         repo.git = try tools.bin(.git);
         repo.gh = try tools.bin(.gh);
-        for (engines) |engine| {
+        for (try repo.engines(self.a)) |engine| {
             const tool = reviewerTool(engine);
             const bin = try tools.bin(tool);
             switch (tool) {
@@ -314,10 +329,13 @@ const Main = struct {
             try self.out("Updated {s} as {s}\n", .{ name, repo.login });
         } else {
             const pulls = try client.ready();
+            const natives = try client.nativeGroups(pulls);
             var repo_dir = (try self.objectCache(repo).repoDir(true)) orelse return error.RepositoryDirectoryMissing;
             repo_dir.close();
             var entry: core.Entry = .{ .repo = repo };
             try entry.discover(self.a, pulls, true);
+            try stack.syncNative(&entry, self.a, natives);
+            try stack.autogroup(&entry, self.a, pulls);
             entry.last_scan = std.time.timestamp();
             entry.next_scan = entry.last_scan + repo.interval;
             try state.add(self.a, entry);
@@ -343,6 +361,7 @@ const Main = struct {
             .db = self.db,
             .state = state,
             .repo = repo,
+            .entry = entry,
             .github_client = try tools.gh(gh_env, repo.name),
             .git_source = try tools.git(gh_env, self.db, repo),
             .tools = tools,
@@ -354,10 +373,19 @@ const Main = struct {
         const env = try local_tools.githubEnv();
         const client = try local_tools.gh(&env, entry.repo.name);
         if (!std.ascii.eqlIgnoreCase(entry.repo.login, try client.identity())) return error.GitHubIdentityChanged;
-        try entry.discover(self.a, try client.ready(), false);
+        const pulls = try client.ready();
+        const natives = try client.nativeGroups(pulls);
+        const pins = try client.stackPulls(try stack.numbers(self.a, entry.stacks));
+        try entry.discover(self.a, pulls, false);
+        try stack.refresh(entry, self.a, pins);
+        try stack.syncNative(entry, self.a, natives);
+        try stack.autogroup(entry, self.a, pulls);
     }
 
     fn tick(self: Main, state: *store.State) !void {
+        var counts: queue.TickCounts = .{ .at = std.time.timestamp() };
+        var worker = self;
+        worker.counts = &counts;
         for (state.entries) |*entry| {
             const now = std.time.timestamp();
             var changed = false;
@@ -368,35 +396,115 @@ const Main = struct {
                 entry.next_cache_check = now + cache.check_interval;
                 changed = true;
             }
-            if (entry.next_scan <= now and !try self.db.paused(entry.repo.name)) {
-                if (self.scan(entry)) |_| {
+            if (entry.next_scan <= now and state.queue_budget.canScan(now) and !try self.db.paused(entry.repo.name)) {
+                if (worker.scan(entry)) |_| {
                     entry.last_scan = std.time.timestamp();
                     entry.next_scan = entry.last_scan + entry.repo.interval;
                     entry.scan_attempts = 0;
                 } else |err| {
+                    state.queue_budget.noteFailure(std.time.timestamp(), err);
                     entry.scan_attempts +|= 1;
                     entry.next_scan = now + core.delay(entry.scan_attempts);
                     try entry.problem(self.a, now, null, @errorName(err));
                 }
                 changed = true;
             }
-            if (changed) try self.db.save(state);
+            if (changed) {
+                if (counts.github_commands != 0) state.queue_budget.last_tick = counts;
+                try self.db.save(state);
+            }
         }
-        for (state.entries) |*entry| {
+        if (state.entries.len == 0) return;
+        var starts_left = state.queue_budget.limit;
+        var receipts_left = state.queue_budget.limit;
+        const first = state.queue_budget.next_repo % state.entries.len;
+        var deferred_repo: ?usize = null;
+        for (0..state.entries.len) |offset| {
+            const index = (first + offset) % state.entries.len;
+            const entry = &state.entries[index];
             const now = std.time.timestamp();
             if (try self.db.paused(entry.repo.name)) continue;
-            const job = entry.due(now) orelse continue;
-            self.runJob(state, entry, job) catch |err| {
-                try core.recordFailure(entry, self.a, job, std.time.timestamp(), err);
+            const decision = state.queue_budget.pick(entry, now, starts_left, receipts_left);
+            if (decision.budget_deferred and deferred_repo == null) deferred_repo = index;
+            const job = decision.job orelse continue;
+
+            // Reserve the full ensemble before touching GitHub. Failed and
+            // deduplicated jobs cannot open an unbounded series of lookups.
+            if (job.phase == .uncertain) {
+                receipts_left -= 1;
+                counts.receipt_checks += 1;
+            } else {
+                starts_left -= queue.reviewerCost(entry.repo);
+            }
+            counts.jobs += 1;
+            state.queue_budget.next_repo = deferred_repo orelse (index + 1) % state.entries.len;
+            worker.runJob(state, entry, job) catch |err| {
+                const failed_at = std.time.timestamp();
+                state.queue_budget.noteFailure(failed_at, err);
+                try core.recordFailure(entry, self.a, job, failed_at, err);
                 try self.db.save(state);
             };
         }
+        // Give the first budget-deferred repo a full budget next time.
+        if (deferred_repo) |index| state.queue_budget.next_repo = index;
+        if (counts.jobs != 0) {
+            state.queue_budget.last_tick = counts;
+            try self.db.save(state);
+        }
+    }
+
+    fn showQueueBudget(self: Main, budget: queue.Budget) !void {
+        try self.out("Queue budget {d} reviewer starts and {d} receipt checks per tick\n", .{ budget.limit, budget.limit });
+        const counts = budget.last_tick;
+        if (counts.at != 0) {
+            try self.out("  Last active tick {s}  |  Reviewer starts {d}  |  GitHub CLI calls {d}  |  Jobs {d}  |  Receipt checks {d}\n", .{
+                try formatTime(self.a, counts.at), counts.reviewer_starts, counts.github_commands, counts.jobs, counts.receipt_checks,
+            });
+        }
+    }
+
+    fn setQueueBudget(self: Main, state: *store.State, args: []const []const u8) !void {
+        if (args.len != 1) return error.Usage;
+        var proposed = state.queue_budget;
+        proposed.limit = std.fmt.parseUnsigned(u32, args[0], 10) catch return error.InvalidReviewBudget;
+        try proposed.validate(state.entries);
+        state.queue_budget = proposed;
+        try self.db.save(state);
+        try self.showQueueBudget(state.queue_budget);
     }
 
     fn runJob(self: Main, state: *const store.State, entry: *core.Entry, job: *core.Job) !void {
         var gh_env: std.process.EnvMap = undefined;
         var live = try self.adapter(entry, state, &gh_env);
-        _ = try core.run(self.a, &live, entry.repo, job, .scheduled);
+        _ = core.run(self.a, &live, entry.repo, job, .scheduled) catch |err| {
+            if (err == error.StackChanged or err == error.GitHubStackChanged) entry.next_scan = 0;
+            return err;
+        };
+    }
+
+    fn registerStack(self: Main, state: *store.State, args: []const []const u8) !void {
+        if (args.len != 2 and (args.len < 4 or args.len > stack.max_members + 2)) return error.Usage;
+        const entry = state.find(args[0]) orelse return error.UnknownRepository;
+        const tools = self.local(entry.repo);
+        const env = try tools.githubEnv();
+        const client = try tools.gh(&env, entry.repo.name);
+        if (args.len == 2) {
+            const number = try prNumber(args[1]);
+            if (!std.ascii.eqlIgnoreCase(entry.repo.login, try client.identity())) return error.GitHubIdentityChanged;
+            const group = try client.nativeByNumber(number);
+            const count = try stack.queueNative(entry, self.a, group);
+            try self.db.save(state);
+            return self.out("Queued {s} GitHub stack #{d} with {d} ready PRs\n", .{ entry.repo.name, number, count });
+        }
+        const name = args[1];
+        var members: [stack.max_members]u32 = undefined;
+        const numbers = members[0 .. args.len - 2];
+        for (args[2..], numbers) |arg, *number| number.* = try prNumber(arg);
+        try stack.validateRegistration(entry.*, name, numbers);
+        if (!std.ascii.eqlIgnoreCase(entry.repo.login, try client.identity())) return error.GitHubIdentityChanged;
+        try stack.register(entry, self.a, name, try client.stackPulls(numbers));
+        try self.db.save(state);
+        try self.out("Queued {s} stack {s} with {d} PRs\n", .{ entry.repo.name, name, numbers.len });
     }
 
     fn choose(self: Main, entry: *core.Entry, number: u32) !core.Pull {
@@ -445,8 +553,10 @@ const Main = struct {
             } else return error.Usage;
         }
         if (repo) |name| if (state.find(name) == null) return error.UnknownRepository;
+        if (!json_output) try self.showQueueBudget(state.queue_budget);
         if (state.entries.len == 0 and !json_output) try self.out("No repositories registered\n", .{});
         if (json_output) try self.out("[", .{});
+        const now = std.time.timestamp();
         var first = true;
         for (state.entries) |entry| {
             if (repo != null and !std.ascii.eqlIgnoreCase(repo.?, entry.repo.name)) continue;
@@ -454,8 +564,21 @@ const Main = struct {
             const measurement = self.objectCache(entry.repo).measure();
             const retained: ?u64 = if (measurement) |bytes| bytes else |_| null;
             const cache_error: ?[]const u8 = if (measurement) |_| null else |err| @errorName(err);
+            const stacks = try stack.statuses(self.a, entry);
+            const next = if (paused) null else state.queue_budget.nextEligible(entry, now);
             if (json_output) {
-                try self.out("{s}{s}", .{ if (first) "" else ",", try io.json(self.a, .{ .paused = paused, .state = entry, .cache_bytes = retained, .cache_error = cache_error }) });
+                var summary = entry;
+                // Show pins and scheduling separately without echoing stored PR text.
+                summary.stacks = &.{};
+                try self.out("{s}{s}", .{ if (first) "" else ",", try io.json(self.a, .{
+                    .paused = paused,
+                    .state = summary,
+                    .stacks = stacks,
+                    .cache_bytes = retained,
+                    .cache_error = cache_error,
+                    .queue_budget = state.queue_budget,
+                    .next_eligible = next,
+                }) });
                 first = false;
                 continue;
             }
@@ -463,6 +586,11 @@ const Main = struct {
                 entry.repo.name,     if (paused) "paused" else "active",       try engineNames(self.a, try entry.repo.engines(self.a)),
                 entry.repo.interval, if (entry.repo.comments) "on" else "off", if (entry.repo.approvals) "on" else "off",
             });
+            if (next) |item| {
+                try self.out("  Next eligible PR #{d} at {s}  |  Reviewer slots {d}\n", .{
+                    item.number, try formatTime(self.a, item.at), item.reviewer_starts,
+                });
+            }
             try self.out("  Last successful scan {s}  |  Next scan {s}  |  Ready PRs {d}\n", .{
                 try formatTime(self.a, entry.last_scan), try formatTime(self.a, entry.next_scan), entry.seen.len,
             });
@@ -481,6 +609,19 @@ const Main = struct {
                 });
             }
             if (queued == 0) try self.out("  Queue empty\n", .{});
+            for (stacks) |item| {
+                if (item.native_number) |number| {
+                    try self.out("  GitHub stack #{d} (bottom to top)\n", .{number});
+                } else {
+                    try self.out("  {s} {s} (bottom to top)\n", .{ if (item.automatic) "Auto stack" else "Stack", item.name });
+                }
+                for (item.members) |member| {
+                    try self.out("    #{d} {s} {s}", .{ member.number, member.state, member.review });
+                    if (member.blocked_by) |reason|
+                        try self.out(" | Blocked by #{d} ({s})", .{ reason.number, reason.reason });
+                    try self.out("\n", .{});
+                }
+            }
             for (entry.errors) |issue| {
                 try self.out("  {s}  {s}", .{ try formatTime(self.a, issue.at), issue.detail });
                 if (issue.number) |number| try self.out("  PR #{d}", .{number});
@@ -500,6 +641,10 @@ const Main = struct {
         if (eq(u8, cmd, "defaults") and params.len == 0) {
             var state = try self.db.load();
             return self.defaults(&state, params);
+        }
+        if (eq(u8, cmd, "queue-budget") and params.len == 0) {
+            const state = try self.db.load();
+            return self.showQueueBudget(state.queue_budget);
         }
         if (eq(u8, cmd, "pause") or eq(u8, cmd, "resume")) {
             if (params.len != 1) return error.Usage;
@@ -522,8 +667,16 @@ const Main = struct {
         var state = try self.db.load();
         if (eq(u8, cmd, "add")) return self.add(&state, params);
         if (eq(u8, cmd, "defaults")) return self.defaults(&state, params);
+        if (eq(u8, cmd, "queue-budget")) return self.setQueueBudget(&state, params);
         if (eq(u8, cmd, "tick") and params.len == 0) return self.tick(&state);
         if (eq(u8, cmd, "run-once")) return self.dry(&state, params);
+        if (eq(u8, cmd, "stack")) return self.registerStack(&state, params);
+        if (eq(u8, cmd, "unstack") and params.len == 2) {
+            const entry = state.find(params[0]) orelse return error.UnknownRepository;
+            try stack.remove(entry, self.a, params[1]);
+            try self.db.save(&state);
+            return self.out("Removed {s} stack {s}\n", .{ entry.repo.name, params[1] });
+        }
         if (eq(u8, cmd, "queue") and params.len == 2) {
             const entry = state.find(params[0]) orelse return error.UnknownRepository;
             const pull = try self.choose(entry, try prNumber(params[1]));
@@ -551,21 +704,7 @@ fn reviewerProfile(repo: core.Repo, engine: core.Engine) runner.Profile {
     };
 }
 
-fn modelName(value: []const u8) ![]const u8 {
-    if (value.len == 0 or value[0] == '-' or value.len > 200) return error.InvalidModel;
-    return value;
-}
-
-fn parseEngines(a: A, value: []const u8) ![]const core.Engine {
-    var parts = std.mem.splitScalar(u8, value, ',');
-    var engines: std.ArrayList(core.Engine) = .empty;
-    while (parts.next()) |part| {
-        const engine = std.meta.stringToEnum(core.Engine, part) orelse return error.UnknownReviewer;
-        if (std.mem.indexOfScalar(core.Engine, engines.items, engine) != null) return error.DuplicateReviewer;
-        try engines.append(a, engine);
-    }
-    return engines.toOwnedSlice(a);
-}
+const parseEngines = repo_config.parseEngines;
 
 fn engineNames(a: A, engines: []const core.Engine) ![]const u8 {
     var names: [core.engine_count][]const u8 = undefined;
@@ -599,7 +738,7 @@ fn formatTime(a: A, timestamp: i64) ![]const u8 {
 }
 
 fn start(a: A) !void {
-    _ = c.umask(0o077);
+    _ = std.c.umask(0o077);
     const argv = try std.process.argsAlloc(a);
     var args: []const []const u8 = argv[1..];
     const env = try std.process.getEnvMap(a);
@@ -715,6 +854,7 @@ test "each reviewer combination registers with only its selected executables" {
     try t.expect(kimi_env.get("CLAUDE_CODE_DISABLE_ADVISOR_TOOL") == null);
     const claude_env = try tools.reviewerEnv(.claude, modeled.claude, reviewerProfile(modeled, .claude));
     try t.expectEqualStrings("1", claude_env.get("CLAUDE_CODE_DISABLE_ADVISOR_TOOL").?);
+    try t.expectEqualStrings("1", claude_env.get("CLAUDE_CODE_DISABLE_FAST_MODE").?);
     try t.expect(claude_env.get("KIMI_MODEL_THINKING_EFFORT") == null);
     const default_kimi_env = try tools.reviewerEnv(.kimi, modeled.kimi, .{});
     try t.expectEqualStrings("high", default_kimi_env.get("KIMI_MODEL_THINKING_EFFORT").?);
@@ -732,4 +872,58 @@ fn writeExecutable(dir: std.fs.Dir, name: []const u8, contents: []const u8) !voi
     const file = try dir.createFile(name, .{ .mode = 0o700 });
     defer file.close();
     try file.writeAll(contents);
+}
+
+test "a budget-deferred ensemble gets first turn after reload" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try io.temp(a);
+    defer std.fs.deleteTreeAbsolute(path) catch {};
+    var db = try store.Store.open(a, path);
+    defer db.dir.close();
+    const commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const prior =
+        "{\"id\":1,\"commit_id\":\"" ++ commit ++ "\",\"state\":\"COMMENTED\",\"user\":{\"login\":\"test\"},\"body\":null}";
+    try writeExecutable(db.dir, "gh", "#!/bin/sh\ncase \"$4\" in\n" ++
+        "  user) printf '%s' '{\"login\":\"test\"}' ;;\n" ++
+        "  *'/reviews?per_page=100') printf '%s' '[[" ++ prior ++ "]]' ;;\n" ++
+        "  *'/reviews/1') printf '%s' '" ++ prior ++ "' ;;\n" ++
+        "  *) exit 1 ;;\nesac\n");
+    const gh = try db.dir.realpathAlloc(a, "gh");
+    const quiet_until = std.math.maxInt(i64);
+    var light_jobs = [_]core.Job{
+        .{ .number = 1, .head = commit },
+        .{ .number = 2, .head = commit },
+    };
+    var heavy_jobs = [_]core.Job{.{ .number = 3, .head = commit }};
+    var tail_jobs = [_]core.Job{.{ .number = 4, .head = commit }};
+    const repos = [_]core.Repo{
+        .{ .name = "test/light", .login = "test", .gh = gh, .git = "/usr/bin/true", .comments = true },
+        .{ .name = "test/heavy", .login = "test", .gh = gh, .git = "/usr/bin/true", .comments = true, .additional_engines = &.{ .claude, .kimi } },
+        .{ .name = "test/tail", .login = "test", .gh = gh, .git = "/usr/bin/true", .comments = true },
+    };
+    var entries = [_]core.Entry{
+        .{ .repo = repos[0], .jobs = &light_jobs, .next_scan = quiet_until, .next_cache_check = quiet_until },
+        .{ .repo = repos[1], .jobs = &heavy_jobs, .next_scan = quiet_until, .next_cache_check = quiet_until },
+        .{ .repo = repos[2], .jobs = &tail_jobs, .next_scan = quiet_until, .next_cache_check = quiet_until },
+    };
+    const env = std.process.EnvMap.init(a);
+    const app: Main = .{ .a = a, .db = db, .env = &env, .home = path, .scratch = path, .scratch_dir = db.dir };
+    try db.save(&.{ .entries = &entries });
+    try t.expectError(error.ReviewBudgetTooSmall, app.dispatch(&.{ "queue-budget", "2" }));
+    try app.dispatch(&.{"tick"});
+    const first = try db.load();
+    try t.expectEqual(@as(usize, 1), first.queue_budget.next_repo);
+    try t.expectEqual(core.Phase.complete, first.entries[0].jobs[0].phase);
+    try t.expectEqual(core.Phase.pending, first.entries[1].jobs[0].phase);
+    try t.expectEqual(core.Phase.complete, first.entries[2].jobs[0].phase);
+    try t.expectEqual(@as(u32, 6), first.queue_budget.last_tick.github_commands);
+    try t.expectEqual(@as(u32, 0), first.queue_budget.last_tick.reviewer_starts);
+    try app.dispatch(&.{"tick"});
+    const second = try db.load();
+    try t.expectEqual(core.Phase.pending, second.entries[0].jobs[1].phase);
+    try t.expectEqual(core.Phase.complete, second.entries[1].jobs[0].phase);
+    try t.expectEqual(@as(u32, 3), second.queue_budget.last_tick.github_commands);
 }
