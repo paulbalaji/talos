@@ -337,7 +337,7 @@ const Main = struct {
         var gh_env: std.process.EnvMap = undefined;
         var reviewer_env: std.process.EnvMap = undefined;
         var live = try self.adapter(entry, state, &gh_env, &reviewer_env);
-        _ = try core.run(self.a, &live, entry.repo, job, false);
+        _ = try core.run(self.a, &live, entry.repo, job, .scheduled);
     }
 
     fn choose(self: Main, entry: *core.Entry, number: u32) !core.Pull {
@@ -356,8 +356,10 @@ const Main = struct {
         for (state.entries) |*entry| {
             if (target != null and entry != target.?) continue;
             var job: core.Job = undefined;
+            var initial: ?core.Pull = null;
             if (args.len == 2) {
                 const pull = try self.choose(entry, try prNumber(args[1]));
+                initial = pull;
                 job = .{ .number = pull.number, .head = pull.headRefOid };
             } else {
                 if (try self.db.paused(entry.repo.name)) continue;
@@ -369,7 +371,7 @@ const Main = struct {
             var gh_env: std.process.EnvMap = undefined;
             var reviewer_env: std.process.EnvMap = undefined;
             var live = try self.adapter(entry, state, &gh_env, &reviewer_env);
-            const payload = (try core.run(self.a, &live, entry.repo, &job, true)).?;
+            const payload = (try core.run(self.a, &live, entry.repo, &job, .{ .preview = initial })).?;
             try io.out("{s}\n", .{try io.json(self.a, .{ .repo = entry.repo.name, .pr = job.number, .review = payload })});
         }
     }
@@ -529,6 +531,7 @@ pub fn main() void {
 
 test {
     _ = @import("cache.zig");
+    _ = @import("github.zig");
     _ = @import("source.zig");
     _ = @import("runner.zig");
     _ = @import("tests.zig");

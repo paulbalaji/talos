@@ -9,6 +9,9 @@ const Page = struct { hasNextPage: bool, endCursor: ?[]const u8 };
 fn Connection(comptime T: type) type {
     return struct { nodes: []const T, pageInfo: Page };
 }
+fn GraphResponse(comptime T: type) type {
+    return struct { data: ?T = null, errors: ?[]const std.json.Value = null };
+}
 const RawThread = struct {
     id: []const u8,
     isResolved: bool,
@@ -51,9 +54,9 @@ pub const Client = struct {
     }
 
     const ready_query =
-        \\query($owner: String!, $name: String!, $cursor: String) {
+        \\query($owner: String!, $name: String!, $endCursor: String) {
         \\  repository(owner: $owner, name: $name) {
-        \\    pullRequests(first: 100, after: $cursor, states: [OPEN]) {
+        \\    pullRequests(first: 100, after: $endCursor, states: [OPEN]) {
         \\      pageInfo { hasNextPage endCursor }
         \\      nodes { number headRefOid isDraft }
         \\    }
@@ -64,16 +67,28 @@ pub const Client = struct {
     pub fn ready(self: Client) ![]const core.Pull {
         const a = self.cmd.a;
         const fields = try self.repoFields();
+        const args = [_][]const u8{
+            "--paginate", "--slurp", "-f", try io.fmt(a, "query={s}", .{ready_query}),
+        } ++ fields;
+        const raw = self.api("graphql", &args, "") catch return error.GitHubListFailed;
+        return decodeReady(a, raw);
+    }
+
+    fn decodeReady(a: A, raw: []const u8) ![]const core.Pull {
         const Data = struct { repository: struct { pullRequests: Connection(core.Pull) } };
+        const responses = try io.parse(a, []const GraphResponse(Data), raw);
+        if (responses.len == 0) return error.InvalidPagination;
         var pulls: std.ArrayList(core.Pull) = .empty;
         var cursor: ?[]const u8 = null;
-        while (true) {
-            const data = self.graph(Data, ready_query, &fields, cursor) catch return error.GitHubListFailed;
-            const page = data.repository.pullRequests;
-            try pulls.appendSlice(a, page.nodes);
-            cursor = try next(page.pageInfo, cursor);
-            if (cursor == null) return pulls.toOwnedSlice(a);
+        for (responses, 0..) |page, index| {
+            if (page.errors != null) return error.GitHubListFailed;
+            const data = page.data orelse return error.GitHubListFailed;
+            const connection = data.repository.pullRequests;
+            cursor = try next(connection.pageInfo, cursor);
+            if ((cursor == null) != (index + 1 == responses.len)) return error.InvalidPagination;
+            try pulls.appendSlice(a, connection.nodes);
         }
+        return pulls.toOwnedSlice(a);
     }
 
     pub fn pull(self: Client, number: u32) !core.Pull {
@@ -120,7 +135,7 @@ pub const Client = struct {
         try args.appendSlice(a, fields);
         if (cursor) |value| try args.appendSlice(a, &.{ "-f", try io.fmt(a, "cursor={s}", .{value}) });
         const input = self.api("graphql", args.items, "") catch return error.GitHubThreadsFailed;
-        const result = try io.parse(a, struct { data: ?Data = null, errors: ?[]const std.json.Value = null }, input);
+        const result = try io.parse(a, GraphResponse(Data), input);
         if (result.errors != null) return error.GitHubThreadsFailed;
         return result.data orelse error.GitHubThreadsFailed;
     }
@@ -210,3 +225,22 @@ pub const Client = struct {
         }
     }
 };
+
+test "a paginated scan rejects partial responses and preserves discovery order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const page1 =
+        \\{"data":{"repository":{"pullRequests":{"nodes":[{"number":20,"headRefOid":"aaa","isDraft":false}],"pageInfo":{"hasNextPage":true,"endCursor":"next"}}}}}
+    ;
+    const page2 =
+        \\{"data":{"repository":{"pullRequests":{"nodes":[{"number":10,"headRefOid":"bbb","isDraft":true}],"pageInfo":{"hasNextPage":false,"endCursor":"final"}}}}}
+    ;
+    const pulls = try Client.decodeReady(a, "[" ++ page1 ++ "," ++ page2 ++ "]");
+    try std.testing.expectEqual(@as(usize, 2), pulls.len);
+    try std.testing.expectEqual(@as(u32, 20), pulls[0].number);
+    try std.testing.expect(pulls[1].isDraft);
+    try std.testing.expectError(error.InvalidPagination, Client.decodeReady(a, "[" ++ page1 ++ "]"));
+    try std.testing.expectError(error.InvalidPagination, Client.decodeReady(a, "[" ++ page1 ++ "," ++ page1 ++ "]"));
+    try std.testing.expectError(error.GitHubListFailed, Client.decodeReady(a, "[" ++ page1 ++ ",{\"errors\":[{}]}]"));
+}
