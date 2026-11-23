@@ -1,0 +1,12 @@
+.zig-cache/
+zig-out/
+/talos
+/.talos/
+/state.json
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+.DS_Store

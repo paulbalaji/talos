@@ -1,0 +1,332 @@
+const std = @import("std");
+const core = @import("core.zig");
+const io = @import("io.zig");
+const store = @import("store.zig");
+
+const t = std.testing;
+const repo = core.Repo{ .name = "example/repo", .checkout = "/checkout", .login = "reviewer", .comments = true };
+const head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const base = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const changed = "cccccccccccccccccccccccccccccccccccccccc";
+const fixture_pull = core.Pull{
+    .number = 42,
+    .headRefOid = head,
+    .baseRefOid = base,
+    .isDraft = false,
+    .statusCheckRollup = &.{},
+    .author = .{ .login = "author" },
+};
+const finding =
+    \\{"complete":true,"summary":"Static review.","findings":[{"severity":"P2","path":"src/watch.rs","line":20,"body":"The cursor skips a height."}],"existing_open_findings":[]}
+;
+const clean =
+    \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":[]}
+;
+
+const Fake = struct {
+    a: io.A,
+    db: ?store.Store = null,
+    state: ?*const store.State = null,
+    target: core.Pull = fixture_pull,
+    offered: ?core.Prior = null,
+    discussion: []const core.Thread = &.{},
+    result: []const u8 = finding,
+    lose_response: bool = false,
+    lose_readback: bool = false,
+    move_during_review: enum { none, head, base } = .none,
+    posts: usize = 0,
+    reviews_run: usize = 0,
+    readbacks: usize = 0,
+    prompt_text: []const u8 = "",
+    posted_result: ?core.Payload = null,
+
+    pub fn checkIdentity(_: *Fake) !void {}
+
+    pub fn pull(self: *Fake, _: u32) !core.Pull {
+        return self.target;
+    }
+
+    pub fn reviews(self: *Fake, _: u32) ![]const core.Prior {
+        return if (self.offered != null) @as(*const [1]core.Prior, @ptrCast(&self.offered.?)) else &.{};
+    }
+
+    pub fn threads(self: *Fake, _: u32) ![]const core.Thread {
+        return self.discussion;
+    }
+
+    pub fn snapshot(_: *Fake, _: core.Pull) !core.Snapshot {
+        return .{ .merge_base = base, .evidence = "Diff in src/watch.rs" };
+    }
+
+    pub fn anchor(_: *Fake, _: core.Pull, _: core.Snapshot, path: []const u8, line: u32) !bool {
+        return std.mem.eql(u8, path, "src/watch.rs") and line == 20;
+    }
+
+    pub fn review(self: *Fake, prompt_text: []const u8) ![]const u8 {
+        self.prompt_text = prompt_text;
+        self.reviews_run += 1;
+        switch (self.move_during_review) {
+            .none => {},
+            .head => self.target.headRefOid = changed,
+            .base => self.target.baseRefOid = changed,
+        }
+        return self.result;
+    }
+
+    pub fn post(self: *Fake, _: u32, payload: core.Payload) !u64 {
+        self.posts += 1;
+        self.posted_result = payload;
+        self.offered = .{
+            .id = 55,
+            .commit_id = payload.commit_id,
+            .state = if (payload.event == .COMMENT) "COMMENTED" else "APPROVED",
+            .body = payload.body,
+            .user = .{ .login = repo.login },
+        };
+        if (self.lose_response) return error.GitHubPostUnconfirmed;
+        return 55;
+    }
+
+    pub fn readReview(self: *Fake, _: u32, _: u64) !core.Prior {
+        self.readbacks += 1;
+        if (self.lose_readback) return error.GitHubReadbackFailed;
+        return self.offered orelse error.NoReview;
+    }
+
+    pub fn persist(self: *Fake) !void {
+        if (self.db) |db| try db.save(self.state.?);
+    }
+
+    pub fn saveResult(_: *Fake, _: u32, _: core.Payload) !void {}
+};
+
+test "first scan baselines ready PRs, then queues drafts becoming ready, new heads, and explicit selections" {
+    var allocator = std.heap.ArenaAllocator.init(t.allocator);
+    defer allocator.deinit();
+    const a = allocator.allocator();
+    var entry = core.Entry{ .repo = repo };
+    var draft = fixture_pull;
+    draft.number = 43;
+    draft.isDraft = true;
+    try entry.discover(a, &.{ fixture_pull, draft }, true);
+    try t.expectEqual(@as(usize, 1), entry.seen.len);
+    try t.expectEqual(@as(usize, 0), entry.jobs.len);
+
+    try entry.queue(a, fixture_pull, true);
+    try t.expectEqual(@as(usize, 1), entry.jobs.len);
+    draft.isDraft = false;
+    try entry.discover(a, &.{ fixture_pull, draft }, false);
+    try t.expectEqual(@as(usize, 2), entry.jobs.len);
+
+    var updated = fixture_pull;
+    updated.headRefOid = changed;
+    var new = fixture_pull;
+    new.number = 44;
+    try entry.discover(a, &.{ updated, draft, new }, false);
+    try t.expectEqual(@as(usize, 3), entry.jobs.len);
+    try t.expectEqual(@as(u32, 43), entry.jobs[0].number);
+    try t.expectEqualStrings(changed, entry.jobs[1].head);
+    try t.expectEqual(@as(u32, 44), entry.jobs[2].number);
+    try entry.discover(a, &.{ updated, draft, new }, false);
+    try t.expectEqual(@as(usize, 3), entry.jobs.len);
+}
+
+test "publishes one commit-bound comment, verifies it, and deduplicates a second review" {
+    var allocator = std.heap.ArenaAllocator.init(t.allocator);
+    defer allocator.deinit();
+    const a = allocator.allocator();
+    var fake: Fake = .{ .a = a };
+    var work: core.Job = .{ .number = fixture_pull.number, .head = head };
+    _ = try core.run(a, &fake, repo, &work, false);
+    try t.expectEqual(.complete, work.phase);
+    try t.expectEqual(@as(?u64, 55), work.receipt);
+    try t.expectEqual(@as(usize, 1), fake.posts);
+    try t.expectEqual(@as(usize, 1), fake.readbacks);
+    const payload = fake.posted_result.?;
+    try t.expectEqualStrings(head, payload.commit_id);
+    try t.expectEqual(@as(usize, 1), payload.comments.len);
+    try t.expectEqual(@as(u32, 20), payload.comments[0].line);
+
+    work = .{ .number = fixture_pull.number, .head = head };
+    try t.expectEqual(@as(?core.Payload, null), try core.run(a, &fake, repo, &work, false));
+    try t.expectEqual(@as(usize, 1), fake.posts);
+    try t.expectEqual(@as(usize, 1), fake.reviews_run);
+}
+
+test "dry runs never post and comments and approvals are independent" {
+    var allocator = std.heap.ArenaAllocator.init(t.allocator);
+    defer allocator.deinit();
+    const a = allocator.allocator();
+    var fake: Fake = .{ .a = a };
+    var permissions = repo;
+    permissions.comments = false;
+    permissions.approvals = true;
+    var work: core.Job = .{ .number = fixture_pull.number, .head = head };
+    _ = try core.run(a, &fake, repo, &work, true);
+    try t.expectEqual(.pending, work.phase);
+    _ = try core.run(a, &fake, permissions, &work, false);
+    try t.expectEqual(@as(usize, 0), fake.posts);
+    work = .{ .number = fixture_pull.number, .head = head };
+    fake.result = clean;
+    _ = try core.run(a, &fake, permissions, &work, false);
+    try t.expectEqual(core.Event.APPROVE, fake.posted_result.?.event);
+}
+
+test "head and base changes during analysis prevent any publication" {
+    var allocator = std.heap.ArenaAllocator.init(t.allocator);
+    defer allocator.deinit();
+    const a = allocator.allocator();
+    for ([_]@FieldType(Fake, "move_during_review"){ .head, .base }) |move| {
+        var fake: Fake = .{ .a = a, .move_during_review = move };
+        var work: core.Job = .{ .number = fixture_pull.number, .head = head };
+        try t.expectError(error.TargetChanged, core.run(a, &fake, repo, &work, false));
+        try t.expectEqual(@as(usize, 0), fake.posts);
+        try t.expectEqual(.pending, work.phase);
+    }
+}
+
+test "restart reconciles an ambiguous post or failed readback without sending a duplicate" {
+    var allocator = std.heap.ArenaAllocator.init(t.allocator);
+    defer allocator.deinit();
+    const a = allocator.allocator();
+    const dir_path = try io.temp(a);
+    defer std.fs.deleteTreeAbsolute(dir_path) catch {};
+    var db = try store.Store.open(a, dir_path);
+    defer db.dir.close();
+
+    for ([_]bool{ true, false }) |lose_response| {
+        var entry = core.Entry{ .repo = repo };
+        try entry.queue(a, fixture_pull, true);
+        var state: store.State = .{};
+        try state.add(a, entry);
+        var remote: Fake = .{
+            .a = a,
+            .db = db,
+            .state = &state,
+            .lose_response = lose_response,
+            .lose_readback = !lose_response,
+        };
+        const err = if (lose_response) error.GitHubPostUnconfirmed else error.GitHubReadbackFailed;
+        try t.expectError(err, core.run(a, &remote, repo, &state.entries[0].jobs[0], false));
+
+        var restart = try db.load();
+        remote.state = &restart;
+        remote.lose_response = false;
+        remote.lose_readback = false;
+        const job = &restart.entries[0].jobs[0];
+        try t.expectEqual(.uncertain, job.phase);
+        try t.expectEqual(if (lose_response) @as(?u64, null) else 55, job.receipt);
+        _ = try core.run(a, &remote, repo, job, false);
+        try t.expectEqual(@as(usize, 1), remote.posts);
+        try t.expectEqual(.complete, (try db.load()).entries[0].jobs[0].phase);
+    }
+}
+
+test "no visible receipt leaves the intent uncertain and backs off" {
+    var allocator = std.heap.ArenaAllocator.init(t.allocator);
+    defer allocator.deinit();
+    const a = allocator.allocator();
+    var fake: Fake = .{ .a = a };
+    var entry = core.Entry{ .repo = repo };
+    try entry.queue(a, fixture_pull, true);
+    const job = &entry.jobs[0];
+    job.phase = .uncertain;
+    job.event = .COMMENT;
+    for (0..6) |attempt| {
+        const now: i64 = @intCast(attempt * 1000);
+        try t.expectError(error.PublicationUnconfirmed, core.run(a, &fake, repo, job, false));
+        try core.recordFailure(&entry, a, job, now, error.PublicationUnconfirmed);
+        try t.expect(entry.due(now) == null);
+    }
+    try t.expect(entry.due(100_000) == null);
+    try t.expectEqual(@as(usize, 0), fake.posts);
+    try t.expectEqual(.uncertain, job.phase);
+    try t.expectEqual(@as(usize, 6), entry.errors.len);
+}
+
+test "Hyperlane PR 10122 resolved reorg acceptance reaches the model without resurfacing as an open finding" {
+    var allocator = std.heap.ArenaAllocator.init(t.allocator);
+    defer allocator.deinit();
+    const a = allocator.allocator();
+    const threads: []const core.Thread = &.{
+        .{
+            .id = "resolved-reorg",
+            .isResolved = true,
+            .isOutdated = false,
+            .path = "src/watch.rs",
+            .line = 20,
+            .replies = &.{
+                .{ .author = .{ .login = "reviewer" }, .body = "A reorg between polls may be missed.", .url = "https://github.com/hyperlane-xyz/hyperlane-monorepo/pull/10122#discussion_r1" },
+                .{ .author = .{ .login = "author" }, .body = "The polling tradeoff is intentional and accepted.", .url = "https://github.com/hyperlane-xyz/hyperlane-monorepo/pull/10122#discussion_r2" },
+            },
+        },
+        .{
+            .id = "open-different-finding",
+            .isResolved = false,
+            .isOutdated = false,
+            .path = "src/watch.rs",
+            .line = 30,
+            .replies = &.{},
+        },
+    };
+    var fixture = fixture_pull;
+    fixture.number = 10122;
+    var fixture_repo = repo;
+    fixture_repo.name = "hyperlane-xyz/hyperlane-monorepo";
+    var fake: Fake = .{
+        .a = a,
+        .target = fixture,
+        .discussion = threads,
+        .result =
+        \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":["resolved-reorg","open-different-finding"]}
+        ,
+    };
+    var work: core.Job = .{ .number = fixture.number, .head = head };
+    const payload = (try core.run(a, &fake, fixture_repo, &work, true)).?;
+    try t.expect(std.mem.indexOf(u8, fake.prompt_text, "The polling tradeoff is intentional and accepted.") != null);
+    try t.expect(std.mem.indexOf(u8, fake.prompt_text, "\"isResolved\":true") != null);
+    try t.expect(std.mem.indexOf(u8, payload.body, "open-different-finding") != null);
+    try t.expect(std.mem.indexOf(u8, payload.body, "resolved-reorg") == null);
+    try t.expectEqual(@as(usize, 0), payload.comments.len);
+}
+
+test "strict result validation rejects extra keys and invalid paths" {
+    var allocator = std.heap.ArenaAllocator.init(t.allocator);
+    defer allocator.deinit();
+    const a = allocator.allocator();
+    try t.expectError(error.InvalidReview, core.parseReview(a,
+        \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":[],"command":"test"}
+    ));
+    try t.expectError(error.InvalidReview, core.parseReview(a,
+        \\{"complete":true,"summary":"Static review.","findings":[{"severity":"P2","path":"../secrets","line":20,"body":"x"}],"existing_open_findings":[]}
+    ));
+}
+
+test "a second process cannot acquire the watcher lock" {
+    var allocator = std.heap.ArenaAllocator.init(t.allocator);
+    defer allocator.deinit();
+    const a = allocator.allocator();
+    const path = try io.temp(a);
+    defer std.fs.deleteTreeAbsolute(path) catch {};
+    var db = try store.Store.open(a, path);
+    defer db.dir.close();
+    const lock = try db.lock();
+    try t.expectError(error.AlreadyRunning, db.lock());
+    lock.close();
+    const reclaimed = try db.lock();
+    reclaimed.close();
+}
+
+test "subprocesses return bounded output and time out" {
+    var allocator = std.heap.ArenaAllocator.init(t.allocator);
+    defer allocator.deinit();
+    const a = allocator.allocator();
+    const path = try io.temp(a);
+    defer std.fs.deleteTreeAbsolute(path) catch {};
+    var dir = try std.fs.openDirAbsolute(path, .{});
+    defer dir.close();
+    var env = std.process.EnvMap.init(a);
+    const command: io.Command = .{ .a = a, .env = &env, .cwd = path, .dir = dir };
+    try t.expectEqualStrings("prompt", try command.run(&.{"/bin/cat"}, "prompt", 2));
+    try t.expectError(error.SubprocessTimeout, command.run(&.{ "/bin/sleep", "5" }, "", 1));
+}

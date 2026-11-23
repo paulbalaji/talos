@@ -1,0 +1,212 @@
+const std = @import("std");
+const core = @import("core.zig");
+const io = @import("io.zig");
+const A = io.A;
+const eq = io.eq;
+
+const User = struct { login: []const u8 };
+const Page = struct { hasNextPage: bool, endCursor: ?[]const u8 };
+fn Connection(comptime T: type) type {
+    return struct { nodes: []const T, pageInfo: Page };
+}
+const RawThread = struct {
+    id: []const u8,
+    isResolved: bool,
+    isOutdated: bool,
+    path: []const u8,
+    line: ?u32,
+    comments: Connection(core.Reply),
+};
+
+pub const File = struct { filename: []const u8, patch: ?[]const u8 = null };
+
+pub const Client = struct {
+    cmd: io.Command,
+    gh: []const u8,
+    repo: []const u8,
+
+    fn endpoint(self: Client, suffix: []const u8) ![]const u8 {
+        return io.fmt(self.cmd.a, "repos/{s}/{s}", .{ self.repo, suffix });
+    }
+
+    fn api(self: Client, endpoint_path: []const u8, extra: []const []const u8, input: []const u8) ![]const u8 {
+        var args: std.ArrayList([]const u8) = .empty;
+        try args.appendSlice(self.cmd.a, &.{ self.gh, "api", "--hostname", "github.com", endpoint_path });
+        try args.appendSlice(self.cmd.a, extra);
+        return self.cmd.run(args.items, input, 90);
+    }
+
+    pub fn identity(self: Client) ![]const u8 {
+        const result = self.api("user", &.{}, "") catch return error.GitHubIdentityFailed;
+        return (try io.parse(self.cmd.a, User, result)).login;
+    }
+
+    fn pages(self: Client, comptime T: type, suffix: []const u8) ![]const T {
+        const input = try self.api(try self.endpoint(suffix), &.{ "--paginate", "--slurp" }, "");
+        const a = self.cmd.a;
+        const blocks = try io.parse(a, []const []const T, input);
+        var combined: std.ArrayList(T) = .empty;
+        for (blocks) |block| try combined.appendSlice(a, block);
+        return combined.toOwnedSlice(a);
+    }
+
+    const ready_query =
+        \\query($owner: String!, $name: String!, $cursor: String) {
+        \\  repository(owner: $owner, name: $name) {
+        \\    pullRequests(first: 100, after: $cursor, states: [OPEN]) {
+        \\      pageInfo { hasNextPage endCursor }
+        \\      nodes { number headRefOid isDraft }
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    pub fn ready(self: Client) ![]const core.Pull {
+        const a = self.cmd.a;
+        const fields = try self.repoFields();
+        const Data = struct { repository: struct { pullRequests: Connection(core.Pull) } };
+        var pulls: std.ArrayList(core.Pull) = .empty;
+        var cursor: ?[]const u8 = null;
+        while (true) {
+            const data = self.graph(Data, ready_query, &fields, cursor) catch return error.GitHubListFailed;
+            const page = data.repository.pullRequests;
+            try pulls.appendSlice(a, page.nodes);
+            cursor = try next(page.pageInfo, cursor);
+            if (cursor == null) return pulls.toOwnedSlice(a);
+        }
+    }
+
+    pub fn pull(self: Client, number: u32) !core.Pull {
+        const a = self.cmd.a;
+        const repository = try io.fmt(a, "github.com/{s}", .{self.repo});
+        const input = self.cmd.run(&.{
+            self.gh,                                                                                           "pr", "view", try io.fmt(a, "{d}", .{number}), "-R", repository, "--json",
+            "number,headRefOid,baseRefOid,isDraft,state,title,body,author,statusCheckRollup,mergeStateStatus",
+        }, "", 90) catch return error.GitHubPullFailed;
+        const result = try io.parse(a, core.Pull, input);
+        if (result.number != number) return error.GitHubTargetMismatch;
+        return result;
+    }
+
+    pub fn reviews(self: Client, number: u32) ![]const core.Prior {
+        return self.pages(core.Prior, try io.fmt(self.cmd.a, "pulls/{d}/reviews?per_page=100", .{number})) catch
+            error.GitHubReviewsFailed;
+    }
+
+    pub fn files(self: Client, number: u32) ![]const File {
+        return self.pages(File, try io.fmt(self.cmd.a, "pulls/{d}/files?per_page=100", .{number})) catch
+            error.GitHubFilesFailed;
+    }
+
+    pub fn post(self: Client, number: u32, payload: core.Payload) !u64 {
+        const a = self.cmd.a;
+        const target = try self.endpoint(try io.fmt(a, "pulls/{d}/reviews", .{number}));
+        const data = self.api(target, &.{ "--method", "POST", "--input", "-" }, try io.json(a, payload)) catch
+            return error.GitHubPostUnconfirmed;
+        return (try io.parse(a, struct { id: u64 }, data)).id;
+    }
+
+    pub fn readReview(self: Client, number: u32, id: u64) !core.Prior {
+        const a = self.cmd.a;
+        const target = try self.endpoint(try io.fmt(a, "pulls/{d}/reviews/{d}", .{ number, id }));
+        const data = self.api(target, &.{}, "") catch return error.GitHubReadbackFailed;
+        return io.parse(a, core.Prior, data);
+    }
+
+    fn graph(self: Client, comptime Data: type, query: []const u8, fields: []const []const u8, cursor: ?[]const u8) !Data {
+        const a = self.cmd.a;
+        var args: std.ArrayList([]const u8) = .empty;
+        try args.appendSlice(a, &.{ "-f", try io.fmt(a, "query={s}", .{query}) });
+        try args.appendSlice(a, fields);
+        if (cursor) |value| try args.appendSlice(a, &.{ "-f", try io.fmt(a, "cursor={s}", .{value}) });
+        const input = self.api("graphql", args.items, "") catch return error.GitHubThreadsFailed;
+        const result = try io.parse(a, struct { data: ?Data = null, errors: ?[]const std.json.Value = null }, input);
+        if (result.errors != null) return error.GitHubThreadsFailed;
+        return result.data orelse error.GitHubThreadsFailed;
+    }
+
+    const thread_query =
+        \\query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+        \\  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+        \\    reviewThreads(first: 50, after: $cursor) { pageInfo { hasNextPage endCursor }
+        \\      nodes { id isResolved isOutdated path line
+        \\        comments(first: 50) { pageInfo { hasNextPage endCursor }
+        \\          nodes { author { login } body url }
+        \\        }
+        \\      }
+        \\    }
+        \\  } }
+        \\}
+    ;
+    const reply_query =
+        \\query($id: ID!, $cursor: String) {
+        \\  node(id: $id) { ... on PullRequestReviewThread {
+        \\    comments(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor }
+        \\      nodes { author { login } body url }
+        \\    }
+        \\  } }
+        \\}
+    ;
+
+    fn next(page: Page, current: ?[]const u8) !?[]const u8 {
+        if (!page.hasNextPage) return null;
+        const cursor = page.endCursor orelse return error.InvalidPagination;
+        if (current != null and eq(u8, cursor, current.?)) return error.InvalidPagination;
+        return cursor;
+    }
+
+    fn thread(self: Client, raw: RawThread) !core.Thread {
+        const a = self.cmd.a;
+        var replies: std.ArrayList(core.Reply) = .empty;
+        try replies.appendSlice(a, raw.comments.nodes);
+        var cursor = try next(raw.comments.pageInfo, null);
+        const Data = struct { node: struct { comments: Connection(core.Reply) } };
+        while (cursor != null) {
+            if (replies.items.len > 800) return error.ThreadContextLimit;
+            const data = try self.graph(Data, reply_query, &.{ "-f", try io.fmt(a, "id={s}", .{raw.id}) }, cursor);
+            try replies.appendSlice(a, data.node.comments.nodes);
+            cursor = try next(data.node.comments.pageInfo, cursor);
+        }
+        var truncated = false;
+        for (replies.items) |*reply| {
+            if (reply.body.len > 2400) {
+                truncated = true;
+                reply.body = try io.fmt(a, "{s} [reply truncated]", .{reply.body[0..core.safePrefix(reply.body, 2400)]});
+            }
+        }
+        return .{
+            .id = raw.id,
+            .isResolved = raw.isResolved,
+            .isOutdated = raw.isOutdated,
+            .path = raw.path,
+            .line = raw.line,
+            .replies = replies.items,
+            .truncated = truncated,
+        };
+    }
+
+    fn repoFields(self: Client) ![4][]const u8 {
+        const a = self.cmd.a;
+        const slash = std.mem.indexOfScalar(u8, self.repo, '/') orelse return error.InvalidRepository;
+        return .{
+            "-f", try io.fmt(a, "owner={s}", .{self.repo[0..slash]}),
+            "-f", try io.fmt(a, "name={s}", .{self.repo[slash + 1 ..]}),
+        };
+    }
+
+    pub fn threads(self: Client, number: u32) ![]const core.Thread {
+        const a = self.cmd.a;
+        const fields = (try self.repoFields()) ++ [_][]const u8{ "-F", try io.fmt(a, "number={d}", .{number}) };
+        const Data = struct { repository: struct { pullRequest: struct { reviewThreads: Connection(RawThread) } } };
+        var collected: std.ArrayList(core.Thread) = .empty;
+        var cursor: ?[]const u8 = null;
+        while (true) {
+            const data = try self.graph(Data, thread_query, &fields, cursor);
+            const connection = data.repository.pullRequest.reviewThreads;
+            for (connection.nodes) |raw| try collected.append(a, try self.thread(raw));
+            cursor = try next(connection.pageInfo, cursor);
+            if (cursor == null) return collected.toOwnedSlice(a);
+            if (collected.items.len > 500) return error.ThreadContextLimit;
+        }
+    }
+};
