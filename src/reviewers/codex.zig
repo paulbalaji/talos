@@ -1,5 +1,4 @@
 const std = @import("std");
-const core = @import("../core.zig");
 const io = @import("../io.zig");
 const shared = @import("shared.zig");
 
@@ -8,12 +7,12 @@ pub const failure = error.CodexFailed;
 
 pub fn configureEnv(_: *std.process.EnvMap, _: shared.Profile) !void {}
 
-pub fn prepare(cmd: io.Command, bin: []const u8, profile: shared.Profile, prompt: []const u8) !shared.Invocation {
+pub fn prepare(cmd: io.Command, bin: []const u8, profile: shared.Profile, prompt: []const u8, schema: []const u8) !shared.Invocation {
     cmd.dir.deleteFile("result.json") catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
-    try io.write(cmd.dir, "schema.json", core.schema);
+    try io.write(cmd.dir, "schema.json", schema);
     var args: std.ArrayList([]const u8) = .empty;
     try args.appendSlice(cmd.a, &.{
         bin,                     "exec",                     "--ignore-user-config", "--ignore-rules",

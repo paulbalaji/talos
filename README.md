@@ -37,6 +37,8 @@ talos status                          # See scans, queue, errors, and cache size
 | Queue branches as an explicit stack | `talos stack OWNER/REPO feature 123 124 125` |
 | Remove an explicit local stack definition | `talos unstack OWNER/REPO feature` |
 | Inspect one repo or read JSON | `talos status OWNER/REPO` or `talos status --json` |
+| Show provider starts and cooldowns | `talos usage` |
+| Set a provider’s starts per UTC day | `talos usage codex 40` |
 | Show or set the review budget per tick | `talos queue-budget` or `talos queue-budget 3` |
 | Pause or resume reviews for a repo | `talos pause OWNER/REPO` or `talos resume OWNER/REPO` |
 | Run one scheduler pass | `talos tick` |
@@ -74,6 +76,46 @@ talos unstack OWNER/REPO feature
 ```
 
 Talos waits for queued ancestor reviews or merges before starting the next scheduled PR. A baselined ancestor can contribute its pinned diff and any available review without starting a new model run. Reviewers see excerpts from the nearest ancestors, and Talos rechecks the entire ordered prefix before publication. Each PR keeps its own diff anchors and publication receipt. Use `status` to see the stack number, order, and why a PR is blocked. `unstack` removes an explicit local definition and keeps its queued jobs. A later scan can detect the chain again. [GitHub stack APIs](https://docs.github.com/en/pull-requests/reference/stacked-pull-requests-apis-and-webhooks)
+
+### Route reviews by risk
+
+Fixed routing is the default. To evaluate adaptive routing, use a separate state directory and queue a few ready PRs.
+
+```sh
+trial_state=$(mktemp -d)
+talos --home "$trial_state" add OWNER/REPO --routing shadow --light-model codex=gpt-6-luna
+talos --home "$trial_state" queue OWNER/REPO 123
+talos --home "$trial_state" tick
+talos --home "$trial_state" status OWNER/REPO --json
+```
+
+Shadow runs the configured full review and records the suggested route, per-pass timings, and finding-anchor differences. Compare those results against the actual changes before enabling adaptive routing. Matching anchors are a rough comparison. Check the findings themselves for missed defects and incorrect escalations.
+
+Adaptive routing uses four levels.
+
+| Level | Review |
+| --- | --- |
+| Light | One lightweight review of a complete, narrowly mechanical image patch bump. Any finding, unclear discussion, or missing evidence sends it to full review. A light review can post a comment. |
+| Regular | The configured reviewer or reviewer group. |
+| Focused | The regular reviewers receive the relevant performance, reliability, or defensive security prompts. |
+| Multi | At least two independent providers, using the relevant focused prompts. Talos waits if the provider pool cannot supply both. |
+
+Talos routes obvious high-impact changes directly to focused or multi-provider review. A configured lightweight model can recommend a stronger route for ambiguous changes. Manual modes and prompts take precedence. GitHub approvals require a full review.
+
+### Configure provider fallback
+
+```sh
+talos add OWNER/REPO --engine codex --fallback claude,kimi
+talos add OWNER/REPO --routing shadow --light-model codex=gpt-6-luna --light-model claude=haiku
+talos usage codex 40
+talos usage
+```
+
+List only providers approved to receive the repo’s source and discussions. Talos tries the primary reviewer list in order and uses authorized fallbacks when a provider is cooling down or at its daily start cap. A multi-review job keeps successful passes across ticks and restarts while waiting for the remaining independent providers. Talos rechecks the pinned input before reusing a pass. Use `--fallback off` to remove fallback providers and `--light-model ENGINE=off` to remove a screening model. Include publication flags when updating a tracked repo.
+
+`talos usage` counts starts made by this Talos state directory. It includes screening, failed attempts, and previews. Daily caps reset at midnight UTC. A cap of `0` means unlimited. The count estimates local workload. It has no view of requests made by other tools or of the provider’s remaining subscription quota.
+
+Every model start also counts against the per-tick budget. Adaptive routing reserves enough starts for its strongest possible route and releases unused starts after the job returns. Routing reports and accumulated passes are private local state. Screens use standard speed and skip advisor calls.
 
 ### Configure each repo
 
@@ -193,6 +235,8 @@ Use `talos remove` to stop the default scheduler and keep its data. For a full u
 | CLI parsing, registration, and scheduling | `src/repo_config.zig`, `src/main.zig`, `src/launchd.zig` |
 | Discovery, retries, and publication policy | `src/core.zig`, `src/store.zig` |
 | Review budget, scheduling order, and cooldowns | `src/queue.zig` |
+| Review routing and fallback execution | `src/routing.zig`, `src/adaptive.zig` |
+| Durable provider start counts and limits | `src/usage.zig` |
 | PR stacks and inherited context | `src/stack.zig` |
 | Git snapshots, anchors, and cache eviction | `src/source.zig`, `src/cache.zig` |
 | GitHub API | `src/github.zig` |

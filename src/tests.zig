@@ -669,3 +669,18 @@ test "non-blocking thread assessments need a reason and unique IDs" {
         \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":[],"non_blocking_threads":[{"id":"thread-1","reason":"A"},{"id":"thread-1","reason":"B"}]}
     ));
 }
+
+test "a clean lightweight result publishes a comment under an approval policy" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var configured = repo;
+    configured.approvals = true;
+    var fake: Fake = .{ .a = a, .result = clean };
+    var job: core.Job = .{ .number = fixture_pull.number, .head = head };
+    var prepared = (try core.prepare(a, &fake, configured, &job, .scheduled)).?;
+    prepared.route_depth = .light;
+    const candidate = core.ReviewerResult{ .engine = .codex, .review = try core.parseReview(a, clean) };
+    _ = (try core.finish(a, &fake, configured, &job, prepared, &.{candidate})).?;
+    try t.expectEqual(core.Event.COMMENT, fake.posted_result.?.event);
+}

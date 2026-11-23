@@ -9,7 +9,7 @@ pub fn configureEnv(env: *std.process.EnvMap, profile: shared.Profile) !void {
     if (profile.effort != .default) try env.put("KIMI_MODEL_THINKING_EFFORT", @tagName(profile.effort));
 }
 
-pub fn prepare(cmd: io.Command, bin: []const u8, profile: shared.Profile, prompt: []const u8) !shared.Invocation {
+pub fn prepare(cmd: io.Command, bin: []const u8, profile: shared.Profile, prompt: []const u8, _: []const u8) !shared.Invocation {
     try cmd.dir.makePath("skills");
     try io.write(cmd.dir, "reviewer.md",
         \\---

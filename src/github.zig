@@ -22,7 +22,7 @@ const RawThread = struct {
     comments: Connection(core.Reply),
 };
 
-pub const File = struct { filename: []const u8, patch: ?[]const u8 = null };
+pub const File = struct { filename: []const u8, patch: ?[]const u8 = null, status: []const u8 = "", previous_filename: ?[]const u8 = null, additions: ?u32 = null, deletions: ?u32 = null };
 
 pub const Client = struct {
     cmd: io.Command,

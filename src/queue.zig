@@ -1,5 +1,6 @@
 const std = @import("std");
 const core = @import("core.zig");
+const usage = @import("usage.zig");
 
 pub const jobs_per_repo = 3;
 pub const active_repos = 5;
@@ -86,32 +87,61 @@ pub const Budget = struct {
         return self.github.until <= now;
     }
 
-    fn providerRetry(self: Budget, engine: core.Engine) i64 {
+    pub fn providerRetry(self: Budget, engine: core.Engine) i64 {
         return switch (engine) {
             inline else => |selected| @field(self, @tagName(selected)).until,
         };
     }
 
-    pub fn canReview(self: Budget, repo: core.Repo, now: i64, limited: u8) bool {
-        if (usesLimitedEngine(repo, limited) or self.providerRetry(repo.engine) > now) return false;
-        for (repo.additional_engines) |engine| if (self.providerRetry(engine) > now) return false;
-        return true;
+    pub fn canReview(self: Budget, repo: core.Repo, progress: ?core.RouteProgress, now: i64, limited: u8, current: usage.Snapshot) bool {
+        return (self.reviewAt(repo, progress, now, limited, current) orelse return false) <= now;
     }
 
-    fn eligibleAt(self: Budget, entry: core.Entry, job: core.Job) ?i64 {
+    fn reviewAt(self: Budget, repo: core.Repo, progress: ?core.RouteProgress, now: i64, limited: u8, current: usage.Snapshot) ?i64 {
+        const can_make_progress = repo.routing_mode != .fixed or repo.fallback_engines.len != 0 or progress != null;
+        var result: ?i64 = if (can_make_progress) null else 0;
+        providers: for (std.meta.tags(core.Engine)) |engine| {
+            const primary = engine == repo.engine or std.mem.indexOfScalar(core.Engine, repo.additional_engines, engine) != null;
+            if (!primary and std.mem.indexOfScalar(core.Engine, repo.fallback_engines, engine) == null) continue;
+            if (progress) |partial| {
+                for (partial.results) |pass| {
+                    if (pass.engine == engine) continue :providers;
+                }
+            }
+            const at = self.engineAt(engine, now, limited, current);
+            if (can_make_progress) {
+                if (at) |available| result = @min(result orelse available, available);
+            } else {
+                result = @max(result.?, at orelse return null);
+            }
+        }
+        return result;
+    }
+
+    pub fn engineAt(self: Budget, engine: core.Engine, now: i64, limited: u8, current: usage.Snapshot) ?i64 {
+        if (engineBit(engine) & limited != 0) return null;
+        const quota_at = current.availableAt(engine, now);
+        return @max(if (quota_at > now) quota_at else 0, self.providerRetry(engine));
+    }
+
+    fn eligibleAt(self: Budget, entry: core.Entry, job: core.Job, now: i64, limited: u8, current: usage.Snapshot) ?i64 {
         if (!job.schedulable() or entry.stackBlocked(job)) return null;
         var at = @max(job.next, self.github.until);
         if (job.phase != .uncertain and job.analysis == null) {
-            at = @max(at, self.providerRetry(entry.repo.engine));
-            for (entry.repo.additional_engines) |engine| at = @max(at, self.providerRetry(engine));
+            if (job.route_progress) |progress| {
+                if (progress.decision) |decision| {
+                    if (entry.repo.routing_mode == .adaptive and decision.depth == .multi and entry.repo.providerCount() < 2) return null;
+                }
+            }
+            at = @max(at, self.reviewAt(entry.repo, job.route_progress, now, limited, current) orelse return null);
         }
         return at;
     }
 
-    pub fn nextEligible(self: Budget, entry: core.Entry, now: i64) ?Eligible {
+    pub fn nextEligible(self: Budget, entry: core.Entry, now: i64, current: usage.Snapshot) ?Eligible {
         var next: ?Eligible = null;
         for (entry.jobs) |job| {
-            const at = self.eligibleAt(entry, job) orelse continue;
+            const at = self.eligibleAt(entry, job, now, 0, current) orelse continue;
             if (next == null or at < next.?.at) {
                 next = .{ .number = job.number, .head = job.head, .at = at, .reviewer_starts = jobCost(entry.repo, job) };
             }
@@ -120,12 +150,10 @@ pub const Budget = struct {
         return next;
     }
 
-    pub fn pick(self: Budget, entry: *core.Entry, now: i64, remaining: u32, receipts: u32, selected: []const u32, limited: u8) Pick {
+    pub fn pick(self: Budget, entry: *core.Entry, now: i64, remaining: u32, receipts: u32, selected: []const u32, limited: u8, current: usage.Snapshot) Pick {
         var result: Pick = .{};
-        const provider_limited = usesLimitedEngine(entry.repo, limited);
         for (entry.jobs) |*job| {
-            const at = self.eligibleAt(entry.*, job.*) orelse continue;
-            if (provider_limited and job.phase != .uncertain and job.analysis == null) continue;
+            const at = self.eligibleAt(entry.*, job.*, now, limited, current) orelse continue;
             if (at > now or std.mem.indexOfScalar(u32, selected, job.number) != null) continue;
             if (jobCost(entry.repo, job.*) > remaining or (job.phase == .uncertain and receipts == 0)) {
                 result.budget_deferred = true;
@@ -142,14 +170,9 @@ pub fn engineBit(engine: core.Engine) u8 {
     return @as(u8, 1) << @intCast(@intFromEnum(engine));
 }
 
-fn usesLimitedEngine(repo: core.Repo, limited: u8) bool {
-    if (engineBit(repo.engine) & limited != 0) return true;
-    for (repo.additional_engines) |engine| if (engineBit(engine) & limited != 0) return true;
-    return false;
-}
-
 pub fn reviewerCost(repo: core.Repo) u32 {
-    return @intCast(1 + repo.additional_engines.len);
+    const full = if (repo.routing_mode == .adaptive) @max(2, repo.reviewSize()) else repo.reviewSize();
+    return @intCast(full + @intFromBool(repo.routing_mode != .fixed and repo.light_models.len != 0));
 }
 
 fn jobCost(repo: core.Repo, job: core.Job) u32 {
@@ -168,17 +191,17 @@ test "queue selection accounts for reviewer count and leaves receipt lookup elig
     const budget: Budget = .{};
     try t.expectError(error.ReviewBudgetTooSmall, (Budget{ .limit = 2 }).validate(&.{entry}));
     const limited = engineBit(.claude);
-    const cooled = budget.pick(&entry, 100, budget.limit, budget.limit, &.{}, limited);
+    const cooled = budget.pick(&entry, 100, budget.limit, budget.limit, &.{}, limited, .{});
     try t.expect(!cooled.budget_deferred);
     try t.expectEqual(@as(u32, 2), cooled.job.?.number);
-    const receipt = budget.pick(&entry, 100, 0, budget.limit, &.{}, 0);
+    const receipt = budget.pick(&entry, 100, 0, budget.limit, &.{}, 0, .{});
     try t.expect(receipt.budget_deferred);
     try t.expectEqual(@as(u32, 2), receipt.job.?.number);
-    try t.expect(budget.pick(&entry, 100, 0, 0, &.{}, 0).job == null);
-    const next = budget.pick(&entry, 100, budget.limit, budget.limit, &.{}, 0);
+    try t.expect(budget.pick(&entry, 100, 0, 0, &.{}, 0, .{}).job == null);
+    const next = budget.pick(&entry, 100, budget.limit, budget.limit, &.{}, 0, .{});
     try t.expect(!next.budget_deferred);
     try t.expectEqual(@as(u32, 1), next.job.?.number);
-    try t.expectEqual(@as(u32, 3), budget.nextEligible(entry, 100).?.reviewer_starts);
+    try t.expectEqual(@as(u32, 3), budget.nextEligible(entry, 100, .{}).?.reviewer_starts);
 }
 
 test "a batch excludes multiple heads of the same PR" {
@@ -190,10 +213,10 @@ test "a batch excludes multiple heads of the same PR" {
     var entry: core.Entry = .{ .repo = .{ .name = "owner/repo", .login = "user" }, .jobs = &jobs };
     var lane: RepoJobs = .{ .index = 0 };
     const budget: Budget = .{};
-    const first = budget.pick(&entry, 100, 3, 3, lane.selected(), 0).job.?;
+    const first = budget.pick(&entry, 100, 3, 3, lane.selected(), 0, .{}).job.?;
     try std.testing.expectEqualStrings("old", first.head);
     lane.add(first.number);
-    const next = budget.pick(&entry, 100, 3, 3, lane.selected(), 0).job.?;
+    const next = budget.pick(&entry, 100, 3, 3, lane.selected(), 0, .{}).job.?;
     try std.testing.expectEqual(@as(u32, 2), next.number);
 }
 
@@ -209,14 +232,14 @@ test "transport cooldowns block only affected starts and stay bounded" {
         .{ .number = 1, .head = "next", .attempts = 1, .next = 130 },
     };
     var entry: core.Entry = .{ .repo = .{ .name = "owner/repo", .login = "user", .additional_engines = &.{.claude} }, .jobs = &jobs };
-    try t.expect(budget.pick(&entry, 130, 2, 2, &.{}, 0).job == null);
-    try t.expectEqual(@as(i64, 160), budget.nextEligible(entry, 130).?.at);
-    try t.expect(budget.pick(&entry, 160, 2, 2, &.{}, 0).job != null);
+    try t.expect(budget.pick(&entry, 130, 2, 2, &.{}, 0, .{}).job == null);
+    try t.expectEqual(@as(i64, 160), budget.nextEligible(entry, 130, .{}).?.at);
+    try t.expect(budget.pick(&entry, 160, 2, 2, &.{}, 0, .{}).job != null);
     entry.jobs[0].phase = .uncertain;
-    try t.expect(budget.pick(&entry, 130, 0, 2, &.{}, 0).job != null);
+    try t.expect(budget.pick(&entry, 130, 0, 2, &.{}, 0, .{}).job != null);
     budget.noteFailure(130, error.GitHubRateLimited);
     try t.expect(!budget.canScan(131));
-    try t.expect(budget.pick(&entry, 131, 0, 2, &.{}, 0).job == null);
+    try t.expect(budget.pick(&entry, 131, 0, 2, &.{}, 0, .{}).job == null);
     for (0..15) |_| budget.noteFailure(budget.github.until, error.GitHubRateLimited);
     try t.expectEqual(@as(u8, 5), budget.github.attempts);
 }
@@ -251,4 +274,19 @@ test "large discovery bursts keep ordering and deduplicate exact heads" {
     try t.expectEqual(@as(u32, 2001), entry.jobs[2000].number);
     try entry.discover(a, pulls, false);
     try t.expectEqual(@as(usize, 2001), entry.jobs.len);
+}
+
+test "a fixed ensemble can resume when its completed provider is at the daily cap" {
+    const t = std.testing;
+    const now = 10 * std.time.s_per_day;
+    const repo: core.Repo = .{ .name = "owner/repo", .login = "user", .additional_engines = &.{.claude} };
+    const current: usage.Snapshot = .{ .day = 10, .codex = .{ .limit = 1, .starts = 1 } };
+    const budget: Budget = .{};
+    try t.expect(!budget.canReview(repo, null, now, 0, current));
+    const progress: core.RouteProgress = .{
+        .fingerprint = @splat(0),
+        .results = &.{.{ .engine = .codex, .review = .{ .complete = true, .summary = "Fixture", .findings = &.{}, .existing_open_findings = &.{} } }},
+    };
+    try t.expect(budget.canReview(repo, progress, now, 0, current));
+    try t.expect(!budget.canReview(repo, progress, now, engineBit(.claude), current));
 }

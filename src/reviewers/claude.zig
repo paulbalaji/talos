@@ -1,5 +1,4 @@
 const std = @import("std");
-const core = @import("../core.zig");
 const io = @import("../io.zig");
 const shared = @import("shared.zig");
 
@@ -11,13 +10,13 @@ pub fn configureEnv(env: *std.process.EnvMap, profile: shared.Profile) !void {
     if (profile.advisor == null) try env.put("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", "1");
 }
 
-pub fn prepare(cmd: io.Command, bin: []const u8, profile: shared.Profile, prompt: []const u8) !shared.Invocation {
+pub fn prepare(cmd: io.Command, bin: []const u8, profile: shared.Profile, prompt: []const u8, schema: []const u8) !shared.Invocation {
     var args: std.ArrayList([]const u8) = .empty;
     try args.appendSlice(cmd.a, &.{
         bin,                         "-p",                                                            "--restricted",             "--tools",                  "",
         "--setting-sources",         "",                                                              "--strict-mcp-config",      "--disable-slash-commands", "--no-chrome",
         "--settings",                "{\"disableAllHooks\":true,\"disableClaudeAiConnectors\":true}", "--no-session-persistence", "--permission-mode",        "dontAsk",
-        "--output-format",           "json",                                                          "--json-schema",            core.schema,                "--model",
+        "--output-format",           "json",                                                          "--json-schema",            schema,                     "--model",
         profile.model orelse "opus",
     });
     if (profile.effort != .default) try args.appendSlice(cmd.a, &.{ "--effort", @tagName(profile.effort) });
@@ -30,6 +29,6 @@ pub fn result(cmd: io.Command, output: []const u8) ![]const u8 {
         is_error: bool,
         structured_output: ?std.json.Value = null,
     }, output);
-    if (decoded.is_error) return failure;
+    if (decoded.is_error) return if (io.claudeRateLimit(cmd.a, output)) error.ClaudeRateLimited else failure;
     return io.json(cmd.a, decoded.structured_output orelse return error.InvalidReview);
 }
