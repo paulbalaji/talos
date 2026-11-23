@@ -50,6 +50,7 @@ talos add OWNER/REPO --engine claude --model sonnet
 talos add OWNER/REPO --engine kimi --model kimi-code/kimi-for-coding
 talos add OWNER/REPO --engine claude,codex --model sonnet
 talos add OWNER/REPO --engine claude,codex,kimi --reviewer-model claude=sonnet --reviewer-model kimi=kimi-code/kimi-for-coding
+talos add OWNER/REPO --engine claude,codex --claude-advisor off --reviewer-effort codex=medium
 talos add OWNER/REPO --comments
 talos add OWNER/REPO --approvals
 talos add OWNER/REPO --comments --approvals
@@ -60,6 +61,16 @@ talos add OWNER/REPO --cache-mib 0
 At registration, Talos resolves Git, GitHub CLI, and each selected reviewer on PATH. Set paths explicitly with `--git`, `--gh`, `--codex`, `--claude`, or `--kimi`.
 
 Use `--model MODEL` for the first reviewer, or repeat `--reviewer-model ENGINE=MODEL` for any selected reviewers. A named override takes precedence for that reviewer. When you set `--engine` again, repeat any model overrides you want to keep.
+
+| Reviewer | Default model | Effort | Advisor |
+| --- | --- | --- | --- |
+| Codex | GPT-6.2 Sol (`gpt-6.2-sol`) | High | |
+| Claude Code | Latest Opus (`opus`) | High | Latest Fable (`fable`) |
+| Kimi Code | K3.1 Pro (`kimi-code/k3.1-pro`) | High | |
+
+Use `--reviewer-effort ENGINE=LEVEL` to change effort. Use `default` to leave effort to the CLI. Codex and Claude accept `low`, `medium`, `high`, `xhigh`, and `max`. Kimi accepts `low`, `high`, and `max`. The chosen model must support the requested settings.
+
+Fable receives the review context when Claude consults it. It requires Fable access and can use usage credits. Set `--claude-advisor off` on a repo to disable it. If your Kimi plan lacks K3.1 Pro, select an available model with `--reviewer-model kimi=MODEL`. [Claude advisor](https://code.claude.com/docs/en/advisor) · [Kimi models](https://www.kimi.com/code/docs/en/kimi-code/models.html)
 
 Each reviewer in a list gets the same pinned source and discussion. Talos runs them in order, groups findings at the same diff line, and sends one review with reviewer attribution. A failed reviewer retries the job. Choose providers that can receive the repo's source and discussion.
 
@@ -96,7 +107,7 @@ flowchart TD
     Reviewer <--> Provider[Model provider]
 ```
 
-Talos pins the PR head and base, computes their merge base, and sends bounded source and review threads to the reviewer. The context includes resolved threads and author replies. Repo content and GitHub discussion are untrusted input. The reviewer runs in a temporary directory with execution tools disabled. Codex also uses its read-only sandbox. Use provider accounts approved to receive that repo's source and discussion. Kimi Code may retain its own sessions.
+Talos pins the PR head and base, computes their merge base, and sends bounded source and review threads to the reviewer. The context includes resolved threads and author replies. Repo content and GitHub discussion are untrusted input. Each reviewer runs in a temporary directory with local tools disabled. Codex also uses its read-only sandbox. Use provider accounts approved to receive that repo's source and discussion. Kimi Code may retain its own sessions.
 
 Talos validates the result and checks inline locations against GitHub's diff. It checks the head, base, and threads before publication and verifies the review in GitHub afterward. GitHub binds the review to the head commit. Talos checks the base separately before submission. Partial coverage rules out automatic approval.
 
@@ -139,7 +150,10 @@ Use `talos remove` to stop the default scheduler and keep its data. For a full u
 | CLI, scheduling, and status | `src/main.zig`, `src/launchd.zig` |
 | Discovery, retries, and publication policy | `src/core.zig`, `src/store.zig` |
 | Git snapshots, anchors, and cache eviction | `src/source.zig`, `src/cache.zig` |
-| GitHub and provider adapters | `src/github.zig`, `src/runner.zig`, `src/review-schema.json` |
+| GitHub API | `src/github.zig` |
+| Reviewer adapters and result schema | `src/reviewers/`, `src/runner.zig`, `src/review-schema.json` |
+
+Each reviewer adapter sets its allowed environment, builds the CLI invocation, and extracts the result. Register new adapters in `src/runner.zig` and add the corresponding engine and executable to the CLI. The shared pipeline validates findings and handles GitHub publication.
 
 ```sh
 zig fmt --check build.zig src
