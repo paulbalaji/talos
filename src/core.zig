@@ -1181,13 +1181,19 @@ pub fn parseScreen(a: A, output: []const u8) !ScreenResult {
         review: std.json.Value,
         evidence_requests: []const EvidenceRequest = &.{},
     }, a, output, .{}) catch return error.InvalidReview;
-    const decision: routing.Decision = .{
+    var decision: routing.Decision = .{
         .depth = raw.decision.depth,
         .performance = raw.decision.performance,
         .reliability = raw.decision.reliability,
         .security = raw.decision.security,
     };
-    if (!decision.valid() or raw.evidence_requests.len > max_evidence_requests) return error.InvalidReview;
+    // Preserve the stronger interpretation when a model selects a risk lens
+    // and a lower depth, or requests depth without naming a lens.
+    if (!decision.valid()) switch (decision.depth) {
+        .light, .regular => decision.depth = .focused,
+        .focused, .multi => decision.reliability = true,
+    };
+    if (raw.evidence_requests.len > max_evidence_requests) return error.InvalidReview;
     for (raw.evidence_requests, 0..) |request, index| {
         if (!validPath(request.path) or (request.start_line == null) != (request.end_line == null)) return error.InvalidReview;
         if (request.start_line) |start| {

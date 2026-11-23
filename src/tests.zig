@@ -296,6 +296,19 @@ test "published prose drops dash punctuation and preserves command flags" {
     try t.expect(std.mem.indexOf(u8, candidate.body, "Initial static pass") == null);
 }
 
+test "screening keeps evidence requests when a risk lens needs stronger review" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const response = try io.fmt(a,
+        \\{{"decision":{{"depth":"regular","performance":false,"reliability":true,"security":false}},"review":{s},"evidence_requests":[{{"path":"src/caller.zig","start_line":null,"end_line":null}}]}}
+    , .{clean});
+    const screening = try core.parseScreen(a, response);
+    try t.expectEqual(.focused, screening.decision.depth);
+    try t.expect(screening.decision.reliability);
+    try t.expectEqualStrings("src/caller.zig", screening.evidence_requests[0].path);
+}
+
 test "truncated discussion withholds approval and new findings flag an earlier approval" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
