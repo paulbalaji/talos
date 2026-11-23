@@ -7,6 +7,7 @@ const stack = @import("stack.zig");
 const runner = @import("runner.zig");
 const store = @import("store.zig");
 const launchd = @import("launchd.zig");
+const log_retention = @import("log_retention.zig");
 const io = @import("io.zig");
 const repo_config = @import("repo_config.zig");
 const queue = @import("queue.zig");
@@ -1069,6 +1070,32 @@ const Main = struct {
         }
     }
 
+    fn withUsage(self: Main, state: *store.State, preview_args: ?[]const []const u8) !void {
+        var metered = self;
+        var ledger: usage_meter.Ledger = .{
+            .dir = self.db.dir,
+            .data = try usage_meter.load(self.a, self.db.dir, std.time.timestamp()),
+        };
+        metered.meter = &ledger;
+        if (preview_args) |args| return metered.dry(state, args);
+        return metered.tick(state);
+    }
+
+    fn scheduledTick(self: Main) !void {
+        log_retention.rotate(self.db.dir, std.time.nanoTimestamp()) catch |err|
+            std.log.warn("diagnostic log rotation failed ({s})", .{@errorName(err)});
+        defer log_retention.maintain(self.a, self.db.dir, std.time.nanoTimestamp()) catch |err|
+            std.log.warn("diagnostic log maintenance failed ({s})", .{@errorName(err)});
+        const result: anyerror!void = tick: {
+            var state = self.db.load() catch |err| break :tick err;
+            break :tick self.withUsage(&state, null);
+        };
+        result catch |err| {
+            std.log.err("{s}", .{@errorName(err)});
+            return error.ScheduledTickFailed;
+        };
+    }
+
     fn dispatch(self: Main, args: []const []const u8) !void {
         const cmd = args[0];
         const params = args[1..];
@@ -1113,6 +1140,7 @@ const Main = struct {
             return err;
         };
         defer lock.close();
+        if (eq(u8, cmd, "tick") and params.len == 0) return self.scheduledTick();
         var state = try self.db.load();
         if (eq(u8, cmd, "add")) return self.add(&state, params);
         if (eq(u8, cmd, "defaults")) return self.defaults(&state, params);
@@ -1124,15 +1152,7 @@ const Main = struct {
             try usage_meter.save(self.db.dir, current);
             return self.showUsage(&state, current);
         }
-        if ((eq(u8, cmd, "tick") and params.len == 0) or eq(u8, cmd, "run-once")) {
-            var metered = self;
-            var ledger: usage_meter.Ledger = .{
-                .dir = self.db.dir,
-                .data = try usage_meter.load(self.a, self.db.dir, std.time.timestamp()),
-            };
-            metered.meter = &ledger;
-            return if (eq(u8, cmd, "tick")) metered.tick(&state) else metered.dry(&state, params);
-        }
+        if (eq(u8, cmd, "run-once")) return self.withUsage(&state, params);
         if (eq(u8, cmd, "stack")) return self.registerStack(&state, params);
         if (eq(u8, cmd, "unstack") and params.len == 2) {
             const entry = state.find(params[0]) orelse return error.UnknownRepository;
@@ -1236,7 +1256,7 @@ pub fn main() void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     start(arena.allocator()) catch |err| {
-        std.log.err("{s}", .{@errorName(err)});
+        if (err != error.ScheduledTickFailed) std.log.err("{s}", .{@errorName(err)});
         if (err == error.Usage)
             std.log.err("See talos --help", .{});
         std.process.exit(1);
@@ -1248,6 +1268,7 @@ test {
     _ = @import("github.zig");
     _ = @import("source.zig");
     _ = @import("runner.zig");
+    _ = @import("log_retention.zig");
     _ = @import("tests.zig");
 }
 
