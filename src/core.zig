@@ -254,7 +254,7 @@ pub const Job = struct {
     review_input: ?ReviewInput = null,
     followup: bool = false,
     awaiting_checks: bool = false,
-    followup_sequence: u64 = 0,
+    followup_id: [16]u8 = @splat(0),
 
     pub fn schedulable(self: Job) bool {
         return (self.phase == .pending or self.phase == .uncertain) and self.attempts < max_attempts;
@@ -284,7 +284,7 @@ pub const Job = struct {
         }
         self.phase = .pending;
         self.followup = true;
-        self.followup_sequence +|= 1;
+        std.crypto.random.bytes(&self.followup_id);
         self.next = 0;
         self.attempts = 0;
         self.outcome = null;
@@ -350,7 +350,7 @@ pub const Entry = struct {
             if (job.phase == .uncertain) {
                 job.next = 0;
                 job.attempts = 0;
-            } else if (job.phase == .failed and job.followup) {
+            } else if (job.followup and (job.phase == .pending or job.phase == .failed)) {
                 job.phase = .pending;
                 job.next = 0;
                 job.attempts = 0;
@@ -360,7 +360,6 @@ pub const Entry = struct {
                     .number = pr.number,
                     .head = pr.headRefOid,
                     .options = options orelse job.options,
-                    .followup_sequence = job.followup_sequence,
                 };
             }
             return;
@@ -673,12 +672,15 @@ fn checksPassed(pr: Pull) bool {
     return true;
 }
 
-fn marker(a: A, repo: Repo, number: u32, head: []const u8, input: ?ReviewInput, sequence: u64) ![]const u8 {
-    if (input) |key| {
+fn marker(a: A, repo: Repo, job: Job) ![]const u8 {
+    if (job.followup) {
+        const key = job.review_input orelse return error.MissingReviewInput;
+        const event = job.event orelse return error.MissingReviewEvent;
         const digest = std.fmt.bytesToHex(try key.receiptKey(a), .lower);
-        return io.fmt(a, "<!-- talos:review:v2:{s}:{d}:{s}:{d}:{s} -->", .{ repo.name, number, head, sequence, &digest });
+        const intent = std.fmt.bytesToHex(job.followup_id, .lower);
+        return io.fmt(a, "<!-- talos:review:v2:{s}:{d}:{s}:{s}:{s}:{s} -->", .{ repo.name, job.number, job.head, &intent, &digest, @tagName(event) });
     }
-    return io.fmt(a, "<!-- talos:review:v1:{s}:{d}:{s} -->", .{ repo.name, number, head });
+    return io.fmt(a, "<!-- talos:review:v1:{s}:{d}:{s} -->", .{ repo.name, job.number, job.head });
 }
 
 const Note = struct {
@@ -726,7 +728,7 @@ fn groupFindings(a: A, results: []const ReviewerResult) ![]const FindingGroup {
 
 const EvaluatedReview = struct { review: Payload, awaiting_checks: bool, has_findings: bool };
 
-fn payload(a: A, adapter: anytype, repo: Repo, pr: Pull, snap: Snapshot, results: []const ReviewerResult, threads: []const Thread, options: ReviewOptions, job: Job) !EvaluatedReview {
+fn payload(a: A, adapter: anytype, pr: Pull, snap: Snapshot, results: []const ReviewerResult, threads: []const Thread, options: ReviewOptions) !EvaluatedReview {
     var body: std.ArrayList(u8) = .empty;
     var comments: std.ArrayList(Inline) = .empty;
     const fmt = body.writer(a);
@@ -817,7 +819,6 @@ fn payload(a: A, adapter: anytype, repo: Repo, pr: Pull, snap: Snapshot, results
             try body.appendSlice(a, "\n\nOpen-thread assessments did not meet the approval criteria.");
         }
     }
-    try fmt.print("\n\n{s}", .{try marker(a, repo, pr.number, pr.headRefOid, if (job.followup) job.review_input else null, job.followup_sequence)});
     return .{
         .review = .{
             .commit_id = pr.headRefOid,
@@ -841,7 +842,7 @@ fn previousCommit(reviews: []const Prior, login: []const u8) ?[]const u8 {
 }
 
 fn receipt(a: A, repo: Repo, job: Job, reviews: []const Prior) !?Prior {
-    const token = try marker(a, repo, job.number, job.head, if (job.followup) job.review_input else null, job.followup_sequence);
+    const token = try marker(a, repo, job);
     for (reviews) |review| {
         if (!eq(u8, review.commit_id, job.head) or eq(u8, review.state, "PENDING")) continue;
         const own = if (review.user) |user| eq(u8, user.login, repo.login) else false;
@@ -1136,19 +1137,20 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
     reviewed.review_input = prepared.review_input;
     if (reviewed.review_input) |*input| input.checks_passed = checksPassed(latest);
     if (job.followup) reviewed.receipt = null;
-    const evaluated = try payload(a, adapter, repo, latest, snap, results, threads, prepared.options, reviewed);
+    const evaluated = try payload(a, adapter, latest, snap, results, threads, prepared.options);
     var result = evaluated.review;
     if (prepared.route_depth == .light) result.event = .COMMENT;
-    if (prepared.dry) return result;
     const own_pr = if (latest.author) |author| eq(u8, author.login, repo.login) else true;
     reviewed.awaiting_checks = evaluated.awaiting_checks and repo.approvals and !own_pr and prepared.route_depth != .light;
-    if (result.event == .APPROVE and (!repo.approvals or own_pr)) result.event = .COMMENT;
+    if (!prepared.dry and result.event == .APPROVE and (!repo.approvals or own_pr)) result.event = .COMMENT;
+    reviewed.event = result.event;
+    result.body = try io.fmt(a, "{s}\n\n{s}", .{ result.body, try marker(a, repo, reviewed) });
+    if (prepared.dry) return result;
     const permitted = if (result.event == .APPROVE)
         repo.approvals
     else
         repo.comments and (prepared.options.request == null or prepared.options.publish_prompted);
     if (permitted) {
-        reviewed.event = result.event;
         const existing = try adapter.reviews(pr.number);
         if (try receipt(a, repo, reviewed, existing)) |prior| {
             try completeJob(a, adapter, repo, job, reviewed, prior.id);

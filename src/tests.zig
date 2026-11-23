@@ -175,6 +175,7 @@ test "same-head discussion changes get one new receipt and survive an ambiguous 
     try t.expectEqual(core.Phase.complete, recovered.phase);
     try t.expectEqual(@as(usize, 2), fake.posts);
     const first_followup = fake.offered.?;
+    const first_id = recovered.followup_id;
     recovered.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false);
     try t.expectEqual(core.Phase.complete, recovered.phase);
 
@@ -182,9 +183,16 @@ test "same-head discussion changes get one new receipt and survive an ambiguous 
     fake.discussion = &.{thread};
     recovered.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false);
     try t.expectEqual(core.Phase.pending, recovered.phase);
+    var entry: core.Entry = .{ .repo = repo, .jobs = (&recovered)[0..1] };
+    const pending_id = recovered.followup_id;
+    const previous_receipt = recovered.receipt;
+    recovered.receipt = null;
+    try entry.queue(a, fixture_pull, null);
+    try t.expect(recovered.followup);
+    try t.expectEqual(pending_id, recovered.followup_id);
+    recovered.receipt = previous_receipt;
     recovered.phase = .failed;
     recovered.attempts = 6;
-    var entry: core.Entry = .{ .repo = repo, .jobs = (&recovered)[0..1] };
     try entry.queue(a, fixture_pull, null);
     try t.expectEqual(core.Phase.pending, recovered.phase);
     try t.expectEqual(@as(u8, 0), recovered.attempts);
@@ -195,7 +203,7 @@ test "same-head discussion changes get one new receipt and survive an ambiguous 
     fake.offered = first_followup;
     _ = (try core.run(a, &fake, repo, &recovered, .scheduled)).?;
     try t.expectEqual(@as(usize, 4), fake.posts);
-    try t.expectEqual(@as(u64, 3), recovered.followup_sequence);
+    try t.expect(!std.mem.eql(u8, &first_id, &recovered.followup_id));
     try t.expect(!std.mem.eql(u8, first_followup.body.?, fake.posted_result.?.body));
 }
 
@@ -219,7 +227,7 @@ test "truncated discussion withholds approval and new findings flag an earlier a
     fake.result = finding;
     fake.offered = .{ .id = 55, .commit_id = head, .state = "APPROVED", .user = .{ .login = repo.login }, .body = "Prior approval" };
     job.followup = true;
-    job.followup_sequence = 1;
+    job.followup_id = @splat(1);
     const result = (try core.run(a, &fake, configured, &job, .scheduled)).?;
     try t.expectEqual(core.Event.COMMENT, result.event);
     try t.expect(std.mem.indexOf(u8, result.body, "Reassess that approval before merging.") != null);
