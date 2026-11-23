@@ -27,6 +27,7 @@ talos status                          # See scans, queue, errors, and cache size
 | Do this | Run |
 | --- | --- |
 | Preview a specific PR with a review mode | `talos run-once OWNER/REPO 123 --mode perf-maxxing` |
+| Look for needless complexity in a refactor | `talos run-once OWNER/REPO 123 --mode simplicity` |
 | Preview the next eligible reviews | `talos run-once` |
 | Preview the next review in one repo | `talos run-once OWNER/REPO` |
 | Show or set the reviewer default for new repos | `talos defaults` or `talos defaults --engine claude` |
@@ -59,7 +60,7 @@ talos run-once OWNER/REPO 123 --mode security-maxxing
 
 Performance covers hot paths and scaling. Reliability covers partial failure, retries, and recovery. Security checks trust boundaries and mitigations from static source. With no mode, Talos runs the general review. Talos saves queued prompts locally and sends them to the configured reviewers. Keep credentials out of them. A review with a custom prompt stays local by default. Add `--publish` to allow its result to appear on GitHub when the repo allows comments. Review modes without a custom prompt follow the repo’s comment policy. Focused reviews publish as comments. Queue the same head again with no flags to retry with its saved options.
 
-After a review, Talos checks for new human conversation and inline replies, thread resolution or reopening, and changes to the base branch or merge base. A base-branch commit that leaves the merge base unchanged does not trigger a review. Talos skips discussion edits from bots and the account it reviews as. It checks up to four completed PRs per repo per scan and rotates through them in order. GitHub receipts distinguish a same-head rereview from the original review, so restarting after a lost response does not post it twice.
+After a review, Talos checks for new human replies, closed or reopened threads, and changes to the base branch or merge base. It checks up to four completed PRs per repo per scan. A rereview includes the previous verdict on individual findings and a bounded diff from the last reviewed commit when available. Talos keeps up to 16 notes for each tracked PR. The review receipt prevents a duplicate post after a restart.
 
 When approvals are enabled and CI is the only reason Talos withheld approval, passing checks trigger a rereview on the same head. The new review rechecks the current source and discussion before approving.
 
@@ -104,9 +105,11 @@ Adaptive routing uses four levels.
 | Light | One lightweight review of a complete, narrowly mechanical image patch bump. Any finding, unclear discussion, or missing evidence sends it to full review. A light review can post a comment. |
 | Regular | The configured reviewer or reviewer group. |
 | Focused | The regular reviewers receive the relevant performance, reliability, or defensive security prompts. |
-| Multi | At least two independent providers, using the relevant focused prompts. Talos waits if the provider pool cannot supply both. |
+| Multi | At least two providers with distinct briefs. A synthesis pass checks reported issues against the source and combines duplicates. Talos waits if the provider pool cannot supply both reviewers. |
 
 Talos routes contract changes, ownership and signing changes, deployment permissions, and changes to access policy directly to multi-provider review. Other clear risks go to the relevant focused review. A configured lightweight model can recommend a stronger route for ambiguous changes. Manual modes and prompts take precedence. GitHub approvals require a full review.
+
+On scheduled reviews, the screening model can request up to six specific files or excerpts from the pinned commit. Talos fetches those itself before starting the full review. A multi review with findings may use one more reviewer start for synthesis. If the current tick has no starts left, Talos saves the completed passes and finishes on a later tick.
 
 ### Configure provider fallback
 
@@ -196,7 +199,7 @@ flowchart TD
 
 Talos pins the PR head and base, computes their merge base, and sends bounded source and review threads to the reviewer. The context includes resolved threads and author replies. Repo content and GitHub discussion are untrusted input. Each reviewer runs in a temporary directory with local tools disabled. Codex also uses its read-only sandbox. Use provider accounts approved to receive that repo's source and discussion. Kimi Code may retain its own sessions.
 
-Talos validates the result and checks inline locations against GitHub's diff. It checks the head, base, and threads before publication and verifies the review in GitHub afterward. GitHub binds the review to the head commit. Talos checks the base separately before submission. Partial coverage rules out automatic approval.
+Talos publishes one short review with concrete findings inline and links to existing threads that still matter. It checks the head, base, and discussion before publication and reads back the review and posted inline locations. Partial coverage rules out automatic approval. The review names any material evidence gaps or checks holding up approval.
 
 ## Operate Talos
 

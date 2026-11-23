@@ -36,7 +36,7 @@ const usage =
     \\talos [--home DIR] tick
     \\
     \\Review modes for queue and numbered previews
-    \\  general (default), perf-maxxing, reliability-maxxing, security-maxxing
+    \\  general (default), perf-maxxing, reliability-maxxing, security-maxxing, simplicity
     \\
     \\Registration options
     \\  --interval SECONDS                  Default 180, minimum 15
@@ -158,6 +158,10 @@ const Adapter = struct {
         return self.git_source.snapshot(pr, self.files);
     }
 
+    pub fn supplement(self: *Adapter, pr: core.Pull, previous: ?[]const u8, requests: []const core.EvidenceRequest) !source.Supplement {
+        return self.git_source.supplement(pr, previous, requests);
+    }
+
     pub fn stackContext(self: *Adapter, pr: core.Pull, preview: bool) !stack.Context {
         const position = stack.find(self.entry.stacks, pr.number) orelse return .{};
         const item = self.entry.stacks[position.stack_index];
@@ -264,6 +268,10 @@ const Adapter = struct {
 
     pub fn readReview(self: *Adapter, number: u32, id: u64) !core.Prior {
         return self.github_client.readReview(number, id);
+    }
+
+    pub fn verifyReviewComments(self: *Adapter, number: u32, id: u64, head: []const u8, anchors: []const core.Inline) !void {
+        try self.github_client.verifyReviewComments(number, id, head, anchors);
     }
 
     pub fn persist(self: *Adapter) !void {
@@ -721,6 +729,9 @@ const Main = struct {
             if (try saved.matches(self.a, entry.repo, work.prepared)) {
                 if (try self.db.paused(entry.repo.name)) return;
                 work.prepared.route_depth = saved.route_depth;
+                work.prepared.synthesis_provider = saved.synthesis_provider;
+                work.prepared.synthesis_summary = saved.synthesis_summary;
+                work.prepared.additional_evidence_limited = saved.additional_evidence_limited;
                 _ = try core.finish(self.a, &work.adapter, entry.repo, job, work.prepared, saved.results);
                 return;
             }
@@ -743,9 +754,38 @@ const Main = struct {
                 routing.inspect(work.adapter.files, work.prepared.snap.limited)
             else
                 .{ .floor = .{}, .ask_model = false };
+            if (automatically_routed and entry.repo.routing_mode == .adaptive and work.prepared.snap.limited) {
+                // Keep the risk floor and use screening to request missing source.
+                screen.ask_model = true;
+            }
             if (automatically_routed and work.prepared.inherited.pins.len > 1) {
                 screen.floor = screen.floor.merge(.{ .depth = .focused, .reliability = true });
                 screen.ask_model = false;
+            }
+            var evidence: ?[]const u8 = null;
+            var evidence_limited = false;
+            if (progress.evidence_requests.len != 0) {
+                const capacity = adaptive.evidenceCapacity(work.prepared);
+                if (capacity == 0) {
+                    evidence = "";
+                    evidence_limited = true;
+                } else {
+                    const supplement = try work.adapter.supplement(work.prepared.pr, null, progress.evidence_requests);
+                    const excerpt = supplement.evidence[0..core.safePrefix(supplement.evidence, capacity)];
+                    evidence_limited = supplement.limited or excerpt.len < supplement.evidence.len;
+                    evidence = if (excerpt.len == supplement.evidence.len) excerpt else excerpt[0..(std.mem.lastIndexOfScalar(u8, excerpt, '\n') orelse 0)];
+                }
+                var hash = std.crypto.hash.sha2.Sha256.init(.{});
+                hash.update(evidence.?);
+                hash.update(&.{@intFromBool(evidence_limited)});
+                const evidence_key = hash.finalResult();
+                if (progress.evidence_key) |prior| {
+                    if (!eq(u8, &prior, &evidence_key)) {
+                        progress.results = &.{};
+                        progress.review_ms = 0;
+                    }
+                }
+                progress.evidence_key = evidence_key;
             }
             work.plan = .{
                 .repo = entry.repo,
@@ -754,6 +794,8 @@ const Main = struct {
                 .screen = screen,
                 .progress = progress,
                 .start_limit = queue.reviewerCost(entry.repo),
+                .evidence = evidence,
+                .evidence_limited = evidence_limited,
             };
         }
         if (!state.queue_budget.canReview(entry.repo, job.route_progress, std.time.timestamp(), batch.limited.load(.monotonic), batch.usageSnapshot()))
@@ -779,10 +821,13 @@ const Main = struct {
             }
             if (outcome.report) |report| {
                 work.prepared.route_depth = report.applied.depth;
+                work.prepared.synthesis_provider = report.synthesis_provider;
+                work.prepared.synthesis_summary = outcome.synthesis_summary;
+                work.prepared.additional_evidence_limited = outcome.evidence_limited;
                 work.job.route_report = report;
                 work.job.route_report.?.providers = try self.a.dupe(core.Engine, report.providers);
                 work.job.route_progress = null;
-                return self.finishReviews(state, work, outcome.progress.results);
+                return self.finishReviews(state, work, outcome.review_results orelse outcome.progress.results);
             }
             work.job.route_progress = try io.parse(self.a, core.RouteProgress, try io.json(self.a, outcome.progress));
             if (outcome.failure) |err| return err;
@@ -909,7 +954,7 @@ const Main = struct {
             if (number) |pr| {
                 const pull = try self.choose(entry, pr);
                 preview.pull = pull;
-                job = .{ .number = pull.number, .head = pull.headRefOid };
+                job = .{ .number = pull.number, .head = pull.headRefOid, .last_review = entry.lastReview(pull.number) };
             } else {
                 if (try self.db.paused(entry.repo.name)) continue;
                 try self.scan(entry); // This copy is never written back.
@@ -1024,7 +1069,7 @@ const Main = struct {
                 const job = entry.jobs[index];
                 if (job.phase != .complete) continue;
                 completed += 1;
-                try self.out("  #{d} {s} complete — {s}", .{
+                try self.out("  #{d} {s} complete. {s}", .{
                     job.number, job.head[0..@min(job.head.len, 10)], job.outcome orelse "review finished",
                 });
                 if (job.route_report) |report| try self.out("  {s} via {s}", .{
@@ -1218,7 +1263,7 @@ fn prNumber(arg: []const u8) !u32 {
 }
 
 fn formatTime(a: A, timestamp: i64) ![]const u8 {
-    if (timestamp <= 0) return "—";
+    if (timestamp <= 0) return "never";
     const seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
     const day = seconds.getEpochDay();
     const year_day = day.calculateYearDay();
