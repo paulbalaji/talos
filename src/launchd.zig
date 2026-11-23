@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io = @import("io.zig");
+const log_retention = @import("log_retention.zig");
 
 pub const default_label = "dev.talos.watcher";
 
@@ -61,10 +62,10 @@ pub fn manage(cmd: io.Command, home: []const u8, path_env: []const u8, root: []c
             \\<key>RunAtLoad</key><true/>
             \\<key>StartInterval</key><integer>15</integer>
             \\<key>EnvironmentVariables</key><dict><key>PATH</key><string>{s}</string></dict>
-            \\<key>StandardErrorPath</key><string>{s}/launchd.log</string>
+            \\<key>StandardErrorPath</key><string>{s}/{s}</string>
             \\</dict></plist>
             \\
-        , .{ label, try xml(a, self), try xml(a, root), owner, try xml(a, path_env), try xml(a, root) });
+        , .{ label, try xml(a, self), try xml(a, root), owner, try xml(a, path_env), try xml(a, root), log_retention.filename });
         try io.write(dir, name, body);
         errdefer dir.deleteFile(name) catch {};
         _ = cmd.run(&.{ "/bin/launchctl", "bootstrap", domain, full_path }, "", 15) catch
