@@ -258,6 +258,18 @@ pub const Client = struct {
             transportFailure(err, error.GitHubFilesFailed);
     }
 
+    pub fn mergeBase(self: Client, base: []const u8, head: []const u8) ![]const u8 {
+        if (!core.validOid(base) or !core.validOid(head)) return error.InvalidCommit;
+        const a = self.cmd.a;
+        // The compare API only returns file patches on page one.
+        const target = try self.endpoint(try io.fmt(a, "compare/{s}...{s}?per_page=1&page=2", .{ base, head }));
+        const raw = self.api(target, &.{}, "") catch |err| return transportFailure(err, error.GitHubCompareFailed);
+        const response = try io.parse(a, struct { merge_base_commit: struct { sha: []const u8 } }, raw);
+        const oid = response.merge_base_commit.sha;
+        if (!core.validOid(oid)) return error.InvalidMergeBase;
+        return oid;
+    }
+
     pub fn post(self: Client, number: u32, payload: core.Payload) !u64 {
         const a = self.cmd.a;
         const target = try self.endpoint(try io.fmt(a, "pulls/{d}/reviews", .{number}));
@@ -288,12 +300,24 @@ pub const Client = struct {
     const thread_query =
         \\query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
         \\  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+        \\    comments(first: 50) { pageInfo { hasNextPage endCursor }
+        \\      nodes { author { login kind: __typename } body url updatedAt association: authorAssociation }
+        \\    }
         \\    reviewThreads(first: 50, after: $cursor) { pageInfo { hasNextPage endCursor }
         \\      nodes { id isResolved isOutdated path line
         \\        comments(first: 50) { pageInfo { hasNextPage endCursor }
-        \\          nodes { author { login } body url }
+        \\          nodes { author { login kind: __typename } body url updatedAt association: authorAssociation }
         \\        }
         \\      }
+        \\    }
+        \\  } }
+        \\}
+    ;
+    const conversation_query =
+        \\query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+        \\  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+        \\    comments(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor }
+        \\      nodes { author { login kind: __typename } body url updatedAt association: authorAssociation }
         \\    }
         \\  } }
         \\}
@@ -302,7 +326,7 @@ pub const Client = struct {
         \\query($id: ID!, $cursor: String) {
         \\  node(id: $id) { ... on PullRequestReviewThread {
         \\    comments(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor }
-        \\      nodes { author { login } body url }
+        \\      nodes { author { login kind: __typename } body url updatedAt association: authorAssociation }
         \\    }
         \\  } }
         \\}
@@ -331,6 +355,7 @@ pub const Client = struct {
         for (replies.items) |*reply| {
             if (reply.body.len > 2400) {
                 truncated = true;
+                reply.truncated = true;
                 reply.body = try io.fmt(a, "{s} [reply truncated]", .{reply.body[0..core.safePrefix(reply.body, 2400)]});
             }
         }
@@ -345,6 +370,34 @@ pub const Client = struct {
         };
     }
 
+    fn conversation(self: Client, fields: []const []const u8, page: Connection(core.Reply)) ![]const core.Reply {
+        const a = self.cmd.a;
+        const Data = struct { repository: struct { pullRequest: struct { comments: Connection(core.Reply) } } };
+        var comments: std.ArrayList(core.Reply) = .empty;
+        var current = page;
+        var cursor: ?[]const u8 = null;
+        var total: usize = 0;
+        while (true) {
+            total += current.nodes.len;
+            if (total > 500) return error.ThreadContextLimit;
+            for (current.nodes) |reply| {
+                if (reply.author) |author| {
+                    if (eq(u8, author.kind, "Bot") or std.ascii.endsWithIgnoreCase(author.login, "[bot]")) continue;
+                }
+                var comment = reply;
+                if (comment.body.len > 2400) {
+                    comment.truncated = true;
+                    comment.body = try io.fmt(a, "{s} [reply truncated]", .{reply.body[0..core.safePrefix(reply.body, 2400)]});
+                }
+                try comments.append(a, comment);
+            }
+            cursor = try next(current.pageInfo, cursor);
+            if (cursor == null) return comments.items;
+            const data = try self.graph(Data, conversation_query, fields, cursor);
+            current = data.repository.pullRequest.comments;
+        }
+    }
+
     fn repoFields(self: Client) ![4][]const u8 {
         const a = self.cmd.a;
         const slash = std.mem.indexOfScalar(u8, self.repo, '/') orelse return error.InvalidRepository;
@@ -354,18 +407,26 @@ pub const Client = struct {
         };
     }
 
-    pub fn threads(self: Client, number: u32) ![]const core.Thread {
+    pub fn discussion(self: Client, number: u32) !core.Discussion {
         const a = self.cmd.a;
         const fields = (try self.repoFields()) ++ [_][]const u8{ "-F", try io.fmt(a, "number={d}", .{number}) };
-        const Data = struct { repository: struct { pullRequest: struct { reviewThreads: Connection(RawThread) } } };
+        const Data = struct { repository: struct { pullRequest: struct {
+            reviewThreads: Connection(RawThread),
+            comments: ?Connection(core.Reply) = null,
+        } } };
         var collected: std.ArrayList(core.Thread) = .empty;
+        var comments: []const core.Reply = &.{};
         var cursor: ?[]const u8 = null;
         while (true) {
             const data = try self.graph(Data, thread_query, &fields, cursor);
-            const connection = data.repository.pullRequest.reviewThreads;
+            const pr_data = data.repository.pullRequest;
+            if (cursor == null) {
+                if (pr_data.comments) |page| comments = try self.conversation(&fields, page);
+            }
+            const connection = pr_data.reviewThreads;
             for (connection.nodes) |raw| try collected.append(a, try self.thread(raw));
             cursor = try next(connection.pageInfo, cursor);
-            if (cursor == null) return collected.toOwnedSlice(a);
+            if (cursor == null) return .{ .threads = try collected.toOwnedSlice(a), .comments = comments };
             if (collected.items.len > 500) return error.ThreadContextLimit;
         }
     }

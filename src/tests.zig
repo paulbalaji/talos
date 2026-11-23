@@ -32,6 +32,7 @@ const Fake = struct {
     offered: ?core.Prior = null,
     discussion: []const core.Thread = &.{},
     late_discussion: ?[]const core.Thread = null,
+    comments: []const core.Reply = &.{},
     thread_reads: usize = 0,
     result: []const u8 = finding,
     other_results: []const []const u8 = &.{},
@@ -60,10 +61,12 @@ const Fake = struct {
         return if (self.offered != null) @as(*const [1]core.Prior, @ptrCast(&self.offered.?)) else &.{};
     }
 
-    pub fn threads(self: *Fake, _: u32) ![]const core.Thread {
+    pub fn reviewDiscussion(self: *Fake, _: u32) !core.Discussion {
         self.thread_reads += 1;
-        if (self.thread_reads >= 3) return self.late_discussion orelse self.discussion;
-        return self.discussion;
+        return .{
+            .threads = if (self.thread_reads >= 3) self.late_discussion orelse self.discussion else self.discussion,
+            .comments = self.comments,
+        };
     }
 
     pub fn snapshot(_: *Fake, _: core.Pull) !core.Snapshot {
@@ -132,6 +135,168 @@ const Fake = struct {
         self.saved_result = result;
     }
 };
+
+test "same-head discussion changes get one new receipt and survive an ambiguous post" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const own = core.Reply{ .author = .{ .login = repo.login }, .body = "Talos found a problem.", .url = "own" };
+    const bot = core.Reply{ .author = .{ .login = "coverage[bot]" }, .body = "Coverage changed.", .url = "bot" };
+    const author = core.Reply{ .author = .{ .login = "author" }, .body = "Accepted this tradeoff.", .url = "reply" };
+    var thread: core.Thread = .{ .id = "thread", .isResolved = false, .isOutdated = false, .path = "src/watch.rs", .line = 20, .replies = &.{own} };
+    var fake: Fake = .{ .a = a };
+    var job: core.Job = .{ .number = fixture_pull.number, .head = head };
+    _ = (try core.run(a, &fake, repo, &job, .scheduled)).?;
+    try t.expectEqual(core.Phase.complete, job.phase);
+    try t.expectEqual(@as(usize, 1), fake.posts);
+    try t.expect(std.mem.indexOf(u8, fake.posted_result.?.body, "talos:review:v1:") != null);
+
+    fake.discussion = &.{thread};
+    fake.comments = &.{bot};
+    job.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false);
+    try t.expectEqual(core.Phase.complete, job.phase);
+
+    thread.isResolved = true;
+    thread.replies = &.{ own, author };
+    fake.discussion = &.{thread};
+    job.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false);
+    try t.expectEqual(core.Phase.pending, job.phase);
+    fake.lose_response = true;
+    fake.result = clean;
+    try t.expectError(error.GitHubPostUnconfirmed, core.run(a, &fake, repo, &job, .scheduled));
+    try t.expectEqual(core.Phase.uncertain, job.phase);
+    try t.expectEqual(@as(usize, 2), fake.posts);
+    try t.expect(std.mem.indexOf(u8, fake.posted_result.?.body, "talos:review:v2:") != null);
+    try t.expect(std.mem.indexOf(u8, fake.prompt_text, "Accepted this tradeoff.") != null);
+
+    var recovered = try io.parse(a, core.Job, try io.json(a, job));
+    fake.lose_response = false;
+    try t.expect((try core.run(a, &fake, repo, &recovered, .scheduled)) == null);
+    try t.expectEqual(core.Phase.complete, recovered.phase);
+    try t.expectEqual(@as(usize, 2), fake.posts);
+    const first_followup = fake.offered.?;
+    const first_id = recovered.followup_id;
+    recovered.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false);
+    try t.expectEqual(core.Phase.complete, recovered.phase);
+
+    thread.isResolved = false;
+    fake.discussion = &.{thread};
+    recovered.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false);
+    try t.expectEqual(core.Phase.pending, recovered.phase);
+    var entry: core.Entry = .{ .repo = repo, .jobs = (&recovered)[0..1] };
+    const pending_id = recovered.followup_id;
+    const previous_receipt = recovered.receipt;
+    recovered.receipt = null;
+    try entry.queue(a, fixture_pull, null);
+    try t.expect(recovered.followup);
+    try t.expectEqual(pending_id, recovered.followup_id);
+    recovered.receipt = previous_receipt;
+    recovered.phase = .failed;
+    recovered.attempts = 6;
+    try entry.queue(a, fixture_pull, null);
+    try t.expectEqual(core.Phase.pending, recovered.phase);
+    try t.expectEqual(@as(u8, 0), recovered.attempts);
+    _ = (try core.run(a, &fake, repo, &recovered, .scheduled)).?;
+    thread.isResolved = true;
+    fake.discussion = &.{thread};
+    recovered.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false);
+    fake.offered = first_followup;
+    _ = (try core.run(a, &fake, repo, &recovered, .scheduled)).?;
+    try t.expectEqual(@as(usize, 4), fake.posts);
+    try t.expect(!std.mem.eql(u8, &first_id, &recovered.followup_id));
+    try t.expect(!std.mem.eql(u8, first_followup.body.?, fake.posted_result.?.body));
+}
+
+test "truncated discussion withholds approval and new findings flag an earlier approval" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var configured = repo;
+    configured.approvals = true;
+    var fake: Fake = .{
+        .a = a,
+        .result = clean,
+        .comments = &.{.{ .author = .{ .login = "author" }, .body = "Cut short", .url = "note", .truncated = true }},
+    };
+    var job: core.Job = .{ .number = fixture_pull.number, .head = head };
+    const preview = (try core.run(a, &fake, configured, &job, .{ .preview = .{} })).?;
+    try t.expectEqual(core.Event.COMMENT, preview.event);
+    try t.expect(std.mem.indexOf(u8, preview.body, "Review coverage was limited.") != null);
+
+    fake.comments = &.{};
+    fake.result = finding;
+    fake.offered = .{ .id = 55, .commit_id = head, .state = "APPROVED", .user = .{ .login = repo.login }, .body = "Prior approval" };
+    job.followup = true;
+    job.followup_id = @splat(1);
+    const result = (try core.run(a, &fake, configured, &job, .scheduled)).?;
+    try t.expectEqual(core.Event.COMMENT, result.event);
+    try t.expect(std.mem.indexOf(u8, result.body, "Reassess that approval before merging.") != null);
+}
+
+test "effective diff changes and human conversation comments trigger review" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const first = try core.ReviewInput.init(a, repo, fixture_pull, base, .{});
+    var moved = fixture_pull;
+    moved.baseRefOid = changed;
+    const advanced = try core.ReviewInput.init(a, repo, moved, base, .{});
+    try t.expect(first.same(advanced));
+    try t.expect(!first.same(try core.ReviewInput.init(a, repo, moved, changed, .{})));
+    moved.baseRefName = "release";
+    try t.expect(!first.same(try core.ReviewInput.init(a, repo, moved, base, .{})));
+
+    const human = core.Reply{ .author = .{ .login = "author" }, .body = "New rollout information.", .url = "note", .updatedAt = "2026-11-23T15:00:00Z" };
+    const own = core.Reply{ .author = .{ .login = repo.login }, .body = "Review", .url = "review", .updatedAt = "2026-11-23T15:00:00Z" };
+    const discussion = core.Discussion{ .comments = &.{human} };
+    try t.expect(!first.same(try core.ReviewInput.init(a, repo, fixture_pull, base, discussion)));
+    try t.expect(discussion.changedAfter(repo.login, "2026-11-23T14:30:00Z"));
+    try t.expect(!discussion.changedAfter(repo.login, "2026-11-23T15:30:00Z"));
+    try t.expect(!(core.Discussion{ .comments = &.{own} }).changedAfter(repo.login, "2026-11-23T14:30:00Z"));
+
+    const job: core.Job = .{ .number = fixture_pull.number, .head = head, .receipt = 55, .phase = .complete };
+    const earlier = core.Prior{ .id = 55, .commit_id = head, .state = "COMMENTED", .user = .{ .login = repo.login }, .body = "", .submitted_at = "2026-11-23T14:30:00Z" };
+    var manual = core.Prior{ .id = 56, .commit_id = head, .state = "APPROVED", .user = .{ .login = repo.login }, .body = "", .submitted_at = "2026-11-23T15:30:00Z" };
+    try t.expect(job.legacyDiscussionChanged(repo.login, discussion, &.{earlier}));
+    try t.expect(!job.legacyDiscussionChanged(repo.login, discussion, &.{ earlier, manual }));
+    manual.commit_id = changed;
+    try t.expect(job.legacyDiscussionChanged(repo.login, discussion, &.{ earlier, manual }));
+}
+
+test "an otherwise clean same-head review can approve once checks pass" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var configured = repo;
+    configured.approvals = true;
+    const resolved = core.Thread{
+        .id = "accepted",
+        .isResolved = true,
+        .isOutdated = false,
+        .path = "src/watch.rs",
+        .line = 20,
+        .replies = &.{.{ .author = .{ .login = "author" }, .body = "Documented follow-up accepted.", .url = "accepted-reply" }},
+    };
+    var fake: Fake = .{ .a = a, .result = clean, .discussion = &.{resolved} };
+    fake.target.statusCheckRollup = &.{.{ .status = "QUEUED" }};
+    var job: core.Job = .{ .number = fixture_pull.number, .head = head };
+    const before = (try core.run(a, &fake, configured, &job, .scheduled)).?;
+    try t.expectEqual(core.Event.COMMENT, before.event);
+    try t.expect(job.awaiting_checks);
+    job.observeReviewInput(try core.ReviewInput.init(a, configured, fake.target, base, try fake.reviewDiscussion(42)), false);
+    try t.expectEqual(core.Phase.complete, job.phase);
+
+    fake.target.statusCheckRollup = &.{.{ .status = "COMPLETED", .conclusion = "SUCCESS" }};
+    job.observeReviewInput(try core.ReviewInput.init(a, configured, fake.target, base, try fake.reviewDiscussion(42)), false);
+    try t.expectEqual(core.Phase.pending, job.phase);
+    const after = (try core.run(a, &fake, configured, &job, .scheduled)).?;
+    try t.expectEqual(core.Event.APPROVE, after.event);
+    try t.expectEqualStrings(head, after.commit_id);
+    try t.expect(!job.awaiting_checks);
+    try t.expectEqual(@as(usize, 2), fake.posts);
+    job.observeReviewInput(try core.ReviewInput.init(a, configured, fake.target, base, try fake.reviewDiscussion(42)), false);
+    try t.expectEqual(core.Phase.complete, job.phase);
+}
 
 test "a changed stack ancestor prevents publication and prompt distinguishes inherited evidence" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
