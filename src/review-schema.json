@@ -5,7 +5,8 @@
     "complete",
     "summary",
     "findings",
-    "existing_open_findings"
+    "existing_open_findings",
+    "non_blocking_threads"
   ],
   "properties": {
     "complete": {
@@ -51,6 +52,18 @@
       "type": "array",
       "items": {
         "type": "string"
+      }
+    },
+    "non_blocking_threads": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "reason"],
+        "properties": {
+          "id": { "type": "string" },
+          "reason": { "type": "string" }
+        }
       }
     }
   }
