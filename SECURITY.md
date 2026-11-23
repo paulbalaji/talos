@@ -1,9 +1,9 @@
 # Security
 
-Report vulnerabilities through [private vulnerability reporting](https://github.com/paulbalaji/talos/security/advisories/new). Include the Talos commit or version, operating system, and the smallest reproduction you can share. Redact credentials, private source, review replies, and home-directory details.
+Report vulnerabilities privately. Include the Talos commit, OS, and the smallest reproduction you can share. Redact credentials and private source or review discussion. [Report a vulnerability](https://github.com/paulbalaji/talos/security/advisories/new)
 
-Talos is a local process running as your user. Choose trusted executables and provider profiles. Use a private Talos state directory. Enable publication only for repositories where your GitHub identity is authorized to review and where unattended reviews are acceptable.
+Talos runs as your user. Use trusted executables and reviewer profiles, keep its state directory private, and enable publication only where your GitHub identity is authorized to review. Use reviewer providers approved to receive the repo's code and discussion.
 
-Keep credentials in the logins managed by the provider CLIs, a secret manager, or environment variables supported by the relevant CLI. CI builds and tests need no provider credentials. If a separate workflow ever needs credentials, store them in GitHub Actions secrets and inject them into the specific job step. Never add credential files, provider output, or live watcher state to this repository.
+Keep credentials in CLI logins, a secret manager, or supported environment variables. If a workflow needs credentials, inject GitHub Actions secrets into the relevant step. Talos CI uses no provider credentials. Keep credential files, live state, and reviewer output out of Git.
 
-GitHub secret scanning and push protection are enabled. CI scans Git history with Gitleaks. Contributors can install the staged-file hook with `git config core.hooksPath .githooks` after installing Gitleaks.
+GitHub secret scanning and push protection are enabled. CI scans Git history with Gitleaks. Install Gitleaks and run `git config core.hooksPath .githooks` to check staged files locally.

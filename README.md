@@ -1,12 +1,10 @@
 # Talos
 
-Talos watches open GitHub pull requests from your machine. It baselines the PRs that are already ready, then reviews new ready PRs, drafts that become ready, and new commits on open PRs. The watcher saves reviews locally by default. Each repository can opt into posting comment reviews, approvals, or both.
+Talos reviews GitHub pull requests from your machine using Codex, Claude Code, or Kimi Code. It records the ready PRs that already exist, then picks up new ready PRs, drafts that become ready, and new heads. Reviews stay local by default. Each repo can opt into comments and approvals separately.
 
-Talos is written in Zig. It uses your GitHub CLI login and runs the review through your choice of Codex, Claude Code, or Kimi Code CLI.
+## Use Talos
 
-## Install
-
-Use Zig 0.15.2, Git, a current GitHub CLI with `gh api --slurp`, and a current version of your selected review CLI. macOS needs Xcode Command Line Tools for the build. The scan and review commands also run on Linux.
+You need Zig 0.15.2, Git, GitHub CLI with `gh api --slurp`, and one reviewer CLI. On macOS, install the Xcode Command Line Tools. On Linux, run `talos tick` from your scheduler.
 
 ```sh
 git clone https://github.com/paulbalaji/talos.git
@@ -14,9 +12,53 @@ cd talos
 zig build -Doptimize=ReleaseSafe
 mkdir -p "$HOME/.local/bin"
 install -m 755 zig-out/bin/talos "$HOME/.local/bin/talos"
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-If Zig 0.15.2 cannot link against a newer macOS SDK, set a supported deployment target explicitly for the executable build.
+Sign in with `gh auth login` and sign in to your reviewer CLI. Replace `OWNER/REPO` and `123` with your repo and an open, ready PR.
+
+```sh
+talos add OWNER/REPO                   # Start tracking this repo with Codex
+talos run-once OWNER/REPO 123          # Preview this PR, including a baselined PR
+talos install                         # Start the macOS scheduler
+talos status                          # See scans, queue, errors, and cache sizes
+```
+
+| Do this | Run |
+| --- | --- |
+| Preview the next eligible reviews | `talos run-once` |
+| Preview the next review in one repo | `talos run-once OWNER/REPO` |
+| Queue a specific PR under the repo's publication policy | `talos queue OWNER/REPO 123` |
+| Inspect one repo or read JSON | `talos status OWNER/REPO` or `talos status --json` |
+| Pause or resume reviews for a repo | `talos pause OWNER/REPO` or `talos resume OWNER/REPO` |
+| Run one scheduler pass | `talos tick` |
+| Remove the macOS scheduler | `talos remove` |
+| List flags and commands | `talos --help` |
+
+`run-once` always previews. `tick` uses the configured publication policy. A numbered preview also works while its repo is paused.
+
+### Configure each repo
+
+Run `add` again to update settings and carry forward the baseline and queue. Include every setting you want to keep. Leaving out both publication flags returns the repo to dry-run.
+
+```sh
+talos add OWNER/REPO --engine codex --interval 180
+talos add OWNER/REPO --engine claude --model sonnet
+talos add OWNER/REPO --engine kimi --model kimi-code/kimi-for-coding
+talos add OWNER/REPO --comments
+talos add OWNER/REPO --approvals
+talos add OWNER/REPO --comments --approvals
+talos add OWNER/REPO --cache-mib 256 --cache-idle-days 14
+talos add OWNER/REPO --cache-mib 0
+```
+
+Talos discovers executables on PATH at registration. Set paths explicitly with `--git`, `--gh`, `--codex`, `--claude`, or `--kimi`. For example, `talos add OWNER/REPO --codex /absolute/path/to/codex`.
+
+`--comments` allows consolidated comment reviews. `--approvals` allows approval for a complete, clean review with passing checks, no merge conflicts, and no unresolved threads. The author must differ from the configured GitHub identity. A clean candidate can become a comment when only comments are enabled.
+
+### macOS build fallback
+
+If Zig 0.15.2 cannot link against your macOS SDK, build with an explicit deployment target.
 
 ```sh
 case "$(uname -m)" in
@@ -30,82 +72,79 @@ zig build-exe src/main.zig -lc -O ReleaseSafe \
 install -m 755 zig-out/bin/talos "$HOME/.local/bin/talos"
 ```
 
-Put `$HOME/.local/bin` on your PATH and sign in with `gh auth login` and the applicable provider CLI. Register repositories using the GitHub `OWNER/REPO` name. Talos fetches the source it needs directly from GitHub.
+## How it fits together
 
-```sh
-talos add OWNER/REPO --interval 180
-talos run-once OWNER/REPO 123
-talos install
-talos status
+```mermaid
+flowchart LR
+    User[Developer] -->|configure, preview, inspect| Talos
+    subgraph Machine[Developer machine]
+        Scheduler[launchd or Linux scheduler] -->|tick| Talos[Talos CLI]
+        Talos --> State[Queue, receipts, results]
+        Talos --> Git
+        Git --> Cache[Per-repo Git cache]
+        Talos --> GH[GitHub CLI]
+        Talos -->|source and review threads| Reviewer[Codex, Claude, or Kimi CLI]
+        Reviewer -->|structured review| Talos
+    end
+    Git -->|fetch commits and files| GitHub
+    GH -->|read PRs, publish allowed reviews| GitHub
+    Reviewer --> Provider[Model provider]
 ```
 
-`run-once` always prints a dry-run result and leaves the queue unchanged. With a PR number, it reviews an existing ready PR even if it was part of the baseline. Without a PR number, it scans and previews one eligible queued review per selected repository. `talos queue OWNER/REPO 123` instead asks the scheduler to review the current head under that repository's configured policy.
+Talos pins the PR head and base, computes their merge base, and sends bounded source and review threads to the reviewer. The context includes resolved threads and author replies. Repo content and GitHub discussion are untrusted input. The reviewer runs in a temporary directory with execution tools disabled. Codex also uses its read-only sandbox. Use provider accounts approved to receive that repo's source and discussion. Kimi Code may retain its own sessions.
 
-### Reviewer and publication settings
+Talos validates the result and checks inline locations against GitHub's diff. It checks the head, base, and threads before publication and verifies the review in GitHub afterward. GitHub binds the review to the head commit. Talos checks the base separately before submission. Partial coverage rules out automatic approval.
 
-```sh
-talos add OWNER/REPO --engine claude --model sonnet
-talos add OWNER/REPO --engine kimi --model kimi-code/kimi-for-coding
-talos add OWNER/REPO --comments --approvals
-```
+## Operate Talos
 
-Use `--engine codex` or omit the option for Codex. Pass `--model` to select a model your login can access. Use `--git`, `--gh`, `--codex`, `--claude`, and `--kimi` to override paths. Talos resolves executables on PATH at registration and records the selected paths. Re-running `add` updates settings and keeps the baseline and queue. Supply the full set of settings you want to keep. Omitting publication options returns the repo to dry-run.
-
-Publication is commit-bound and uses the GitHub identity from registration. `--comments` allows one consolidated comment review per commit. `--approvals` allows a clean approval when the review is complete, checks pass, the PR is mergeable without conflicts, there are no unresolved review threads, and the reviewer is not the author. With only comments enabled, an approval candidate can be posted as a comment. Talos never requests changes or merges PRs.
-
-Talos uses existing logins by default. For automation, GitHub CLI accepts `GH_TOKEN`, and Talos passes supported provider-specific environment variables to the corresponding reviewer. launchd does not source your shell startup files. Log in as the scheduled user or supply credentials through your environment or secret manager. Keep tokens out of command arguments, plists, Talos state, git, and logs. GitHub Actions secrets are appropriate for workflows that need credentials. Talos CI runs without provider credentials.
-
-### Status, scheduling, and removal
+The macOS job is `dev.talos.watcher`. It wakes every 15 seconds while the Mac and user session are available. Repos poll every 180 seconds by default. launchd uses the installation PATH and the scheduled user's login. Keep credentials in CLI logins, supported environment variables such as `GH_TOKEN`, or a secret manager. See [security](SECURITY.md).
 
 ```sh
-talos status OWNER/REPO
+launchctl print "gui/$(id -u)/dev.talos.watcher"
 talos status --json
-talos pause OWNER/REPO
-talos resume OWNER/REPO
-talos remove
 ```
 
-`install` creates a per-user launchd job, `dev.talos.watcher`. It wakes the watcher every 15 seconds; individual repositories default to a 180-second scan. The Mac must be awake with an active user session. Use `talos tick` from a scheduler on Linux. One process holds a filesystem lock per state directory, including manual dry runs, to prevent overlapping reviews. An explicit dry run with a PR number remains available while its repo is paused.
+The state directory is `~/.local/state/talos`. One process holds its lock at a time. `state.json` holds the baseline, queue, publication receipts, and recent errors. `repos/OWNER/REPO/results/` holds candidate reviews. Check `launchd.log` for scheduler errors.
 
-The state directory defaults to `~/.local/state/talos` and must be private. It contains `state.json`, the status ledger; `repos/OWNER/REPO/results/`, local candidate reviews; and `launchd.log`, scheduler errors. Scan and job errors appear in `status`. Recovery retries back off from 30 seconds to a cap of 16 minutes. After six failed attempts for a head, `queue` can retry it. If a POST might have reached GitHub, retries reconcile its receipt without submitting a second POST. An unresolved ambiguous publication stays visible as `uncertain` for manual investigation. Coordinate publication on one Talos instance per repo; GitHub's review API has no cross-machine idempotency key.
+Job retries back off from 30 seconds, with six attempts per head. Use `queue` to retry. If a POST may have reached GitHub, Talos retries the receipt lookup and leaves the head `uncertain` until it can confirm the result. Run one publisher per repo because GitHub has no cross-machine idempotency key for reviews.
 
-Use both `--home /absolute/private/path` and `--label dev.talos.test` to run a separate registration in launchd. Pass the same arguments to remove it. Removing the scheduler preserves state and results. To fully uninstall after removal, delete the installed binary and, if you no longer need its records, the Talos state directory.
+### Git cache
 
-## Git cache
+Each watched repo has a Talos-owned bare cache at `repos/OWNER/REPO/objects.git`. Talos fetches Git history directly from GitHub and downloads file contents as needed. V0 registrations carry forward automatically, and Talos discards caches from the old checkout-based workflow.
 
-Talos creates a private bare Git cache for each registered repository under `repos/OWNER/REPO/objects.git` in its state directory. It fetches commit and tree history first, then fetches file contents on demand. Talos can run on a machine with no existing checkout. On upgrade from v0, it discards old Talos caches that borrowed local Git objects. Existing registrations, queues, publication records, and result files carry forward. Scripts that still pass the v0 checkout argument continue to work.
+Talos checks the cache after source collection and every hour. It evicts the whole cache above **128 MiB** or after **seven idle days** by default. The next review rebuilds it. A fetch can temporarily exceed the retained limit. Set `--cache-mib 0` to discard the cache after every snapshot. `status` shows cache file sizes in bytes.
 
-Talos checks for eviction after source collection and hourly while the scheduler runs. The defaults retain up to 128 MiB of cache files per repo and expire the cache after seven idle days. Eviction deletes the bare cache, and the next review rebuilds it. A fetch in progress can temporarily exceed the retention limit. `status` reports the sum of cache file sizes in bytes.
+### Test a build alongside the installed watcher
 
 ```sh
-talos add OWNER/REPO --cache-mib 256 --cache-idle-days 14
-talos add OWNER/REPO --cache-mib 0
+test_state=$(mktemp -d /tmp/talos-check.XXXXXX)
+zig-out/bin/talos --home "$test_state" add OWNER/REPO
+zig-out/bin/talos --home "$test_state" run-once OWNER/REPO 123
+zig-out/bin/talos --home "$test_state" install --label dev.talos.test
+launchctl print "gui/$(id -u)/dev.talos.test"
+zig-out/bin/talos --home "$test_state" remove --label dev.talos.test
 ```
 
-Use zero MiB to discard the cache after each review snapshot. When updating a registration, include the reviewer and publication settings you want to keep.
+Use `talos remove` to stop the default scheduler and keep its data. For a full uninstall, remove the binary and the state directory after saving any records you need.
 
-## Review boundaries
+## Develop Talos
 
-Talos fetches and verifies the head and base in dedicated refs for the current review, then calculates their merge base. It builds bounded source context and passes both open and resolved threads with their replies as untrusted evidence. Reviewers run in an empty temporary working directory with execution tools disabled. Codex additionally runs in its read-only sandbox. Kimi Code CLI uses its configured provider profile and may save CLI sessions. Only use trusted local settings and providers approved to receive the repository's source and review discussion.
-
-Talos validates the structured result and checks each inline anchor against GitHub's diff. It refreshes threads and the head and base before sending any review, then reads the review back. The GitHub API binds the review to the head commit. The base check happens immediately before submission because the API has no expected-base field. Source context excludes common credential-file paths. A partial snapshot cannot produce an automatic approval.
-
-The review workflow draws on Paul's [comprehensive and exact-head review skills](https://github.com/paulbalaji/skills). The resolved-thread test covers the accepted reorg-polling tradeoff from [Hyperlane PR #10122](https://github.com/hyperlane-xyz/hyperlane-monorepo/pull/10122).
-
-## Develop
+| Change | Start here |
+| --- | --- |
+| CLI, scheduling, and status | `src/main.zig`, `src/launchd.zig` |
+| Discovery, retries, and publication policy | `src/core.zig`, `src/store.zig` |
+| Git snapshots, anchors, and cache eviction | `src/source.zig`, `src/cache.zig` |
+| GitHub and provider adapters | `src/github.zig`, `src/runner.zig`, `src/review-schema.json` |
 
 ```sh
 zig fmt --check build.zig src
 zig build test
 gitleaks git --redact --no-banner
+git config core.hooksPath .githooks      # Optional local checks with Gitleaks installed
 ```
 
-Use Conventional Commits for PR titles and commit subjects, for example `fix(cli): handle missing config`. CI checks the PR title and every non-merge commit. Squash merges use the PR title as the commit subject.
+Use Conventional Commits for commit subjects and PR titles. CI checks both and runs on macOS and Linux. Keep GitHub mutation in the Zig process, leave model tools disabled, and preserve exact-commit readback and deduplication. The resolved-thread regression is based on [Hyperlane PR #10122](https://github.com/hyperlane-xyz/hyperlane-monorepo/pull/10122).
 
-Install Gitleaks and enable the optional local hooks to check staged content and commit subjects before pushing. Autosquash local fixups before opening a PR.
+Write docs with commands, expected behavior, and the conditions that change what the reader should do. The review design and docs draw on Paul's [review skills](https://github.com/paulbalaji/skills) and [writing guide](https://github.com/paulbalaji/skills/tree/main/write-like-paul).
 
-```sh
-git config core.hooksPath .githooks
-```
-
-MIT licensed.
+[MIT license](LICENSE)
