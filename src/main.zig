@@ -30,6 +30,8 @@ const usage =
     \\  --engine ENGINE[,ENGINE...]         codex, claude, or kimi
     \\  --model MODEL                        Override the first reviewer's model
     \\  --reviewer-model ENGINE=MODEL        Override a specific reviewer's model, repeatable
+    \\  --reviewer-effort ENGINE=LEVEL       Override high effort, or use default for CLI settings
+    \\  --claude-advisor fable|off           Default fable
     \\  --git PATH --gh PATH --codex PATH --claude PATH --kimi PATH
     \\  --comments                           Publish comment reviews
     \\  --approvals                          Publish clean approvals
@@ -95,7 +97,7 @@ const Local = struct {
         };
     }
 
-    fn reviewerEnv(self: Local, engine: core.Engine, bin_path: []const u8) !std.process.EnvMap {
+    fn reviewerEnv(self: Local, engine: core.Engine, bin_path: []const u8, repo: core.Repo) !std.process.EnvMap {
         var env = try pick(self.a, self.env, &common_env);
         const key_names: []const []const u8 = switch (engine) {
             .codex => &.{ "CODEX_HOME", "OPENAI_API_KEY" },
@@ -105,6 +107,10 @@ const Local = struct {
         for (key_names) |key| {
             if (self.env.get(key)) |value| try env.put(key, value);
         }
+        if (engine == .kimi and repo.reviewer_efforts.kimi != .default)
+            try env.put("KIMI_MODEL_THINKING_EFFORT", @tagName(repo.reviewer_efforts.kimi));
+        if (engine == .claude and repo.claude_advisor == .off)
+            try env.put("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", "1");
         try env.put("PATH", try io.fmt(self.a, "{s}:{s}", .{
             std.fs.path.dirname(bin_path) orelse "/usr/bin", env.get("PATH") orelse "/usr/bin:/bin",
         }));
@@ -149,12 +155,14 @@ const Adapter = struct {
 
     pub fn review(self: *Adapter, engine: core.Engine, prompt: []const u8) ![]const u8 {
         const bin = try self.tools.bin(reviewerTool(engine));
-        const env = try self.tools.reviewerEnv(engine, bin);
+        const env = try self.tools.reviewerEnv(engine, bin, self.repo);
         const reviewer: runner.Runner = .{
             .cmd = self.tools.command(&env),
             .bin = bin,
             .engine = engine,
             .model = self.repo.modelFor(engine),
+            .effort = self.repo.reviewer_efforts.get(engine),
+            .claude_advisor = self.repo.claude_advisor,
         };
         return reviewer.review(prompt);
     }
@@ -215,6 +223,10 @@ const Main = struct {
             .name = name,
             .login = "",
         };
+        if (previous) |old| {
+            repo.reviewer_efforts = old.reviewer_efforts;
+            repo.claude_advisor = old.claude_advisor;
+        }
         var programs = self.local(previous).programs;
         var engines = if (previous) |old| try old.engines(self.a) else state.default_engines;
         var new_engines = false;
@@ -250,6 +262,16 @@ const Main = struct {
                     const split = std.mem.indexOfScalar(u8, value, '=') orelse return error.InvalidModel;
                     const engine = std.meta.stringToEnum(core.Engine, value[0..split]) orelse return error.UnknownReviewer;
                     models.set(engine, try modelName(value[split + 1 ..]));
+                } else if (eq(u8, opt, "--reviewer-effort")) {
+                    const split = std.mem.indexOfScalar(u8, value, '=') orelse return error.InvalidReviewerEffort;
+                    const engine = std.meta.stringToEnum(core.Engine, value[0..split]) orelse return error.UnknownReviewer;
+                    const effort = std.meta.stringToEnum(core.ReviewEffort, value[split + 1 ..]) orelse return error.InvalidReviewerEffort;
+                    if (engine == .kimi and (effort == .medium or effort == .xhigh)) return error.InvalidReviewerEffort;
+                    switch (engine) {
+                        inline else => |selected| @field(repo.reviewer_efforts, @tagName(selected)) = effort,
+                    }
+                } else if (eq(u8, opt, "--claude-advisor")) {
+                    repo.claude_advisor = std.meta.stringToEnum(core.ClaudeAdvisor, value) orelse return error.InvalidClaudeAdvisor;
                 } else if (std.mem.startsWith(u8, opt, "--")) {
                     const tool = std.meta.stringToEnum(Tool, opt[2..]) orelse return error.Usage;
                     switch (tool) {
@@ -678,9 +700,10 @@ test "each reviewer combination registers with only its selected executables" {
         try t.expectEqual(@as(u32, 240), configured.interval);
     }
     try app.dispatch(&.{
-        "add",              "example/models",   "--engine",         "claude,codex,kimi",
-        "--model",          "primary-model",    "--reviewer-model", "codex=second-model",
-        "--reviewer-model", "kimi=third-model",
+        "add",              "example/models",   "--engine",          "claude,codex,kimi",
+        "--model",          "primary-model",    "--reviewer-model",  "codex=second-model",
+        "--reviewer-model", "kimi=third-model", "--reviewer-effort", "kimi=max",
+        "--claude-advisor", "off",
     });
     try app.dispatch(&.{ "add", "example/models", "--reviewer-model", "kimi=new-third-model" });
     var state = try db.load();
@@ -688,6 +711,24 @@ test "each reviewer combination registers with only its selected executables" {
     try t.expectEqualStrings("primary-model", modeled.modelFor(.claude).?);
     try t.expectEqualStrings("second-model", modeled.modelFor(.codex).?);
     try t.expectEqualStrings("new-third-model", modeled.modelFor(.kimi).?);
+    try t.expectEqual(core.ReviewEffort.high, modeled.reviewer_efforts.get(.codex));
+    try t.expectEqual(core.ReviewEffort.max, modeled.reviewer_efforts.get(.kimi));
+    const tools = app.local(modeled);
+    const kimi_env = try tools.reviewerEnv(.kimi, modeled.kimi, modeled);
+    try t.expectEqualStrings("max", kimi_env.get("KIMI_MODEL_THINKING_EFFORT").?);
+    try t.expect(kimi_env.get("CLAUDE_CODE_DISABLE_ADVISOR_TOOL") == null);
+    const claude_env = try tools.reviewerEnv(.claude, modeled.claude, modeled);
+    try t.expectEqualStrings("1", claude_env.get("CLAUDE_CODE_DISABLE_ADVISOR_TOOL").?);
+    try t.expect(claude_env.get("KIMI_MODEL_THINKING_EFFORT") == null);
+    const default_kimi_env = try tools.reviewerEnv(.kimi, modeled.kimi, repo: {
+        var inherited = modeled;
+        inherited.reviewer_efforts = .{};
+        break :repo inherited;
+    });
+    try t.expectEqualStrings("high", default_kimi_env.get("KIMI_MODEL_THINKING_EFFORT").?);
+    try t.expectError(error.InvalidReviewerEffort, app.dispatch(&.{
+        "add", "example/models", "--reviewer-effort", "kimi=medium",
+    }));
     try t.expectError(error.ReviewerModelForUnselectedEngine, app.dispatch(&.{
         "add", "example/models", "--engine", "claude", "--reviewer-model", "kimi=model",
     }));

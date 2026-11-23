@@ -7,6 +7,8 @@ pub const Runner = struct {
     bin: []const u8,
     engine: core.Engine,
     model: ?[]const u8,
+    effort: core.ReviewEffort = .high,
+    claude_advisor: core.ClaudeAdvisor = .fable,
 
     pub fn review(self: Runner, prompt: []const u8) ![]const u8 {
         // Kimi currently accepts its print-mode prompt as one argument. Cap the
@@ -54,9 +56,7 @@ pub const Runner = struct {
                 try args.appendSlice(a, &.{ "--skills-dir", "skills", "--agent-file", "reviewer.md", "--output-format", "stream-json" });
             },
         }
-        if (self.model) |model| {
-            try args.appendSlice(a, &.{ if (self.engine == .claude) "--model" else "-m", model });
-        }
+        try self.appendProfile(&args);
         switch (self.engine) {
             .codex => try args.append(a, "-"),
             .claude => {},
@@ -75,6 +75,27 @@ pub const Runner = struct {
             .claude => claudeResult(a, output),
             .kimi => kimiResult(a, output),
         };
+    }
+
+    fn appendProfile(self: Runner, args: *std.ArrayList([]const u8)) !void {
+        const a = self.cmd.a;
+        const model = self.model orelse switch (self.engine) {
+            .codex => "gpt-6.2-sol",
+            .claude => "opus",
+            .kimi => "kimi-code/k3.1-pro",
+        };
+        try args.appendSlice(a, &.{ if (self.engine == .claude) "--model" else "-m", model });
+        switch (self.engine) {
+            .codex => if (self.effort != .default) {
+                const setting = try io.fmt(a, "model_reasoning_effort=\"{s}\"", .{@tagName(self.effort)});
+                try args.appendSlice(a, &.{ "-c", setting });
+            },
+            .claude => {
+                if (self.effort != .default) try args.appendSlice(a, &.{ "--effort", @tagName(self.effort) });
+                if (self.claude_advisor == .fable) try args.appendSlice(a, &.{ "--advisor", "fable" });
+            },
+            .kimi => {}, // Kimi takes its effort in the child environment.
+        }
     }
 };
 
@@ -111,4 +132,39 @@ test "reviewer envelope decoding preserves strict validation downstream" {
     defer arena.deinit();
     try std.testing.expectEqualStrings("{\"complete\":true}", try kimiResult(arena.allocator(), "{\"role\":\"assistant\",\"content\":\"{\\\"complete\\\":true}\"}\n{\"role\":\"meta\",\"type\":\"session.resume_hint\"}\n"));
     try std.testing.expectEqualStrings("{\"complete\":true}", try claudeResult(arena.allocator(), "{\"is_error\":false,\"structured_output\":{\"complete\":true}}"));
+}
+
+test "reviewer command profiles pin default models and preserve explicit overrides" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const env = std.process.EnvMap.init(a);
+    const cases = [_]struct {
+        engine: core.Engine,
+        model: ?[]const u8 = null,
+        effort: core.ReviewEffort = .high,
+        advisor: core.ClaudeAdvisor = .fable,
+        expected: []const []const u8,
+    }{
+        .{ .engine = .codex, .expected = &.{ "-m", "gpt-6.2-sol", "-c", "model_reasoning_effort=\"high\"" } },
+        .{ .engine = .claude, .expected = &.{ "--model", "opus", "--effort", "high", "--advisor", "fable" } },
+        .{ .engine = .kimi, .expected = &.{ "-m", "kimi-code/k3.1-pro" } },
+        .{ .engine = .codex, .model = "custom-model", .effort = .default, .expected = &.{ "-m", "custom-model" } },
+        .{ .engine = .claude, .model = "sonnet", .effort = .medium, .advisor = .off, .expected = &.{ "--model", "sonnet", "--effort", "medium" } },
+    };
+    for (cases) |case| {
+        const runner: Runner = .{
+            .cmd = .{ .a = a, .env = &env, .cwd = ".", .dir = std.fs.cwd() },
+            .bin = @tagName(case.engine),
+            .engine = case.engine,
+            .model = case.model,
+            .effort = case.effort,
+            .claude_advisor = case.advisor,
+        };
+        var args: std.ArrayList([]const u8) = .empty;
+        try runner.appendProfile(&args);
+        try t.expectEqual(case.expected.len, args.items.len);
+        for (case.expected, args.items) |expected, actual| try t.expectEqualStrings(expected, actual);
+    }
 }

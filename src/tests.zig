@@ -422,6 +422,8 @@ test "v0 registration upgrades without its checkout and preserves publication in
     try t.expectEqual(@as(u32, 128), state.entries[0].repo.cache_mib);
     try t.expectEqual(@as(u16, 7), state.entries[0].repo.cache_idle_days);
     try t.expect(state.entries[0].repo.comments and state.entries[0].repo.approvals);
+    try t.expectEqual(core.ReviewEffort.high, state.entries[0].repo.reviewer_efforts.get(.codex));
+    try t.expectEqual(core.ClaudeAdvisor.fable, state.entries[0].repo.claude_advisor);
     try db.save(&state);
     const upgraded = try db.load();
     try t.expectEqual(core.Phase.uncertain, upgraded.entries[0].jobs[0].phase);
