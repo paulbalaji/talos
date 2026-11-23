@@ -24,6 +24,18 @@ const RawThread = struct {
 
 pub const File = struct { filename: []const u8, patch: ?[]const u8 = null, status: []const u8 = "", previous_filename: ?[]const u8 = null, additions: ?u32 = null, deletions: ?u32 = null };
 
+const review_comment_page_size = 100;
+const ReviewComment = struct {
+    id: u64,
+    pull_request_review_id: u64,
+    in_reply_to_id: ?u64 = null,
+    path: []const u8,
+    original_commit_id: []const u8,
+    original_line: ?u32 = null,
+    original_start_line: ?u32 = null,
+    side: ?[]const u8 = null,
+};
+
 pub const Client = struct {
     cmd: io.Command,
     gh: []const u8,
@@ -285,6 +297,39 @@ pub const Client = struct {
         return io.parse(a, core.Prior, data);
     }
 
+    pub fn verifyReviewComments(self: Client, number: u32, id: u64, head: []const u8, expected: []const core.Inline) !void {
+        if (expected.len >= review_comment_page_size) return error.ReviewReadbackMismatch;
+        const a = self.cmd.a;
+        const target = try self.endpoint(try io.fmt(a, "pulls/{d}/reviews/{d}/comments?per_page={d}", .{ number, id, review_comment_page_size }));
+        const data = self.api(target, &.{}, "") catch |err| return transportFailure(err, error.GitHubReadbackFailed);
+        const listed = try io.parse(a, []const ReviewComment, data);
+        if (listed.len >= review_comment_page_size or listed.len != expected.len) return error.ReviewReadbackMismatch;
+
+        var matched = std.StaticBitSet(review_comment_page_size).initEmpty();
+        for (listed) |summary| {
+            if (summary.pull_request_review_id != id or summary.in_reply_to_id != null) return error.ReviewReadbackMismatch;
+            // GitHub's review-scoped list can omit the original line and side.
+            // Those fields are available on an individual review comment.
+            const comment_endpoint = try self.endpoint(try io.fmt(a, "pulls/comments/{d}", .{summary.id}));
+            const raw = self.api(comment_endpoint, &.{}, "") catch |err| return transportFailure(err, error.GitHubReadbackFailed);
+            const comment = try io.parse(a, ReviewComment, raw);
+            const index = try reviewCommentIndex(comment, summary.id, id, head, expected);
+            if (matched.isSet(index)) return error.ReviewReadbackMismatch;
+            matched.set(index);
+        }
+    }
+
+    fn reviewCommentIndex(comment: ReviewComment, comment_id: u64, review_id: u64, head: []const u8, expected: []const core.Inline) !usize {
+        if (comment.id != comment_id or comment.pull_request_review_id != review_id or comment.in_reply_to_id != null or
+            !eq(u8, comment.original_commit_id, head) or comment.original_start_line != null) return error.ReviewReadbackMismatch;
+        const line = comment.original_line orelse return error.ReviewReadbackMismatch;
+        const side = comment.side orelse return error.ReviewReadbackMismatch;
+        for (expected, 0..) |anchor, index| {
+            if (line == anchor.line and eq(u8, side, anchor.side) and eq(u8, comment.path, anchor.path)) return index;
+        }
+        return error.ReviewReadbackMismatch;
+    }
+
     fn graph(self: Client, comptime Data: type, query: []const u8, fields: []const []const u8, cursor: ?[]const u8) !Data {
         const a = self.cmd.a;
         var args: std.ArrayList([]const u8) = .empty;
@@ -464,4 +509,27 @@ test "a paginated scan rejects partial responses and preserves discovery order" 
     try std.testing.expectError(error.InvalidPagination, Client.decodeReady(a, "[" ++ page1 ++ "," ++ page1 ++ "]"));
     try std.testing.expectError(error.GitHubListFailed, Client.decodeReady(a, "[" ++ page1 ++ ",{\"errors\":[{}]}]"));
     try std.testing.expectError(error.GitHubRateLimited, Client.decodeReady(a, "[{\"errors\":[{\"type\":\"RATE_LIMITED\"}]}]"));
+}
+
+test "review readback matches original inline coordinates and rejects replies or foreign reviews" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const old = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const new = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const json =
+        \\{"id":5,"pull_request_review_id":101,"path":"src/core.zig","side":"RIGHT","original_line":77,"line":null,"original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+    ;
+    const expected = [_]core.Inline{.{ .path = "src/core.zig", .line = 77, .body = "" }};
+    const comment = try io.parse(arena.allocator(), ReviewComment, json);
+    try t.expectEqual(@as(usize, 0), try Client.reviewCommentIndex(comment, 5, 101, old, &expected));
+    try t.expectError(error.ReviewReadbackMismatch, Client.reviewCommentIndex(comment, 5, 101, new, &expected));
+    try t.expectError(error.ReviewReadbackMismatch, Client.reviewCommentIndex(comment, 5, 102, old, &expected));
+    try t.expectError(error.ReviewReadbackMismatch, Client.reviewCommentIndex(comment, 6, 101, old, &expected));
+    var altered = comment;
+    altered.side = "LEFT";
+    try t.expectError(error.ReviewReadbackMismatch, Client.reviewCommentIndex(altered, 5, 101, old, &expected));
+    altered = comment;
+    altered.in_reply_to_id = 4;
+    try t.expectError(error.ReviewReadbackMismatch, Client.reviewCommentIndex(altered, 5, 101, old, &expected));
 }

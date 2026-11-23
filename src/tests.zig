@@ -39,6 +39,7 @@ const Fake = struct {
     fail_engine: ?core.Engine = null,
     lose_response: bool = false,
     lose_readback: bool = false,
+    lose_inline_readback: bool = false,
     move_during_review: enum { none, head, base, base_ref } = .none,
     inherited: stack.Context = .{},
     move_ancestor_during_review: bool = false,
@@ -47,6 +48,7 @@ const Fake = struct {
     reviews_run: usize = 0,
     reviewed_engines: [core.engine_count]core.Engine = undefined,
     readbacks: usize = 0,
+    inline_readbacks: usize = 0,
     prompt_text: []const u8 = "",
     posted_result: ?core.Payload = null,
     saved_result: ?core.Payload = null,
@@ -125,6 +127,22 @@ const Fake = struct {
         self.readbacks += 1;
         if (self.lose_readback) return error.GitHubReadbackFailed;
         return self.offered orelse error.NoReview;
+    }
+
+    pub fn verifyReviewComments(self: *Fake, number: u32, id: u64, commit: []const u8, anchors: []const core.Inline) !void {
+        self.inline_readbacks += 1;
+        if (self.lose_inline_readback) return error.ReviewInlineReadbackMismatch;
+        try t.expectEqual(fixture_pull.number, number);
+        try t.expectEqual(@as(u64, 55), id);
+        const posted = self.posted_result.?;
+        try t.expectEqualStrings(posted.commit_id, commit);
+        try t.expectEqual(posted.comments.len, anchors.len);
+        for (posted.comments, anchors) |comment, actual| {
+            try t.expectEqualStrings(comment.path, actual.path);
+            try t.expectEqual(comment.line, actual.line);
+            try t.expectEqualStrings(comment.side, actual.side);
+            try t.expectEqualStrings("", actual.body);
+        }
     }
 
     pub fn persist(self: *Fake) !void {
@@ -207,6 +225,90 @@ test "same-head discussion changes get one new receipt and survive an ambiguous 
     try t.expect(!std.mem.eql(u8, first_followup.body.?, fake.posted_result.?.body));
 }
 
+test "inline readback resumes from a persisted intent without posting again" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fake: Fake = .{ .a = a, .lose_inline_readback = true };
+    var job: core.Job = .{ .number = fixture_pull.number, .head = head };
+    try t.expectError(error.ReviewInlineReadbackMismatch, core.run(a, &fake, repo, &job, .scheduled));
+    try t.expectEqual(core.Phase.uncertain, job.phase);
+    try t.expectEqual(@as(usize, 1), job.expected_inline.?.len);
+    var recovered = try io.parse(a, core.Job, try io.json(a, job));
+    fake.lose_inline_readback = false;
+    try t.expect((try core.run(a, &fake, repo, &recovered, .scheduled)) == null);
+    try t.expectEqual(@as(usize, 1), fake.posts);
+    try t.expectEqual(@as(usize, 2), fake.inline_readbacks);
+    try t.expectEqual(core.Phase.complete, recovered.phase);
+    try t.expect(recovered.expected_inline == null);
+}
+
+test "persisted findings and pending receipt anchors outlive a review worker" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fake: Fake = .{ .a = a, .lose_response = true };
+    var job: core.Job = .{ .number = fixture_pull.number, .head = head };
+    const prepared = (try core.prepare(a, &fake, repo, &job, .scheduled)).?;
+    {
+        var worker = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer worker.deinit();
+        const review = try core.parseReview(worker.allocator(), finding);
+        try t.expectError(error.GitHubPostUnconfirmed, core.finish(a, &fake, repo, &job, prepared, &.{.{ .engine = .codex, .review = review }}));
+    }
+    const state = try io.parse(a, core.Job, try io.json(a, job));
+    try t.expectEqualStrings("src/watch.rs", state.expected_inline.?[0].path);
+    try t.expectEqualStrings("src/watch.rs", state.last_review.?.notes[0].path.?);
+    try t.expectEqualStrings("The cursor skips a height.", state.last_review.?.notes[0].reason.?);
+}
+
+test "rereview carries forward the previous head and evidence based thread disposition" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fake: Fake = .{ .a = a, .result = assessed, .discussion = &.{open_nit} };
+    var job: core.Job = .{ .number = fixture_pull.number, .head = head };
+    const local = core.Repo{ .name = repo.name, .login = repo.login };
+    _ = (try core.run(a, &fake, local, &job, .scheduled)).?;
+    const loaded = try io.parse(a, core.Job, try io.json(a, job));
+    var entry: core.Entry = .{ .repo = local, .jobs = try a.dupe(core.Job, &.{loaded}) };
+    fake.target.headRefOid = changed;
+    try entry.discover(a, &.{fake.target}, false);
+    try t.expectEqual(@as(usize, 1), entry.jobs.len);
+    try t.expectEqualStrings(head, entry.jobs[0].last_review.?.head);
+    const prepared = (try core.prepare(a, &fake, local, &entry.jobs[0], .scheduled)).?;
+    try t.expect(std.mem.indexOf(u8, prepared.context, "\"disposition\":\"non_blocking\"") != null);
+    try t.expect(std.mem.indexOf(u8, prepared.context, "Duplicate wakeups already coalesce") != null);
+    try t.expectEqualStrings(changed, prepared.pr.headRefOid);
+}
+
+test "published prose drops dash punctuation and preserves command flags" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const verbose =
+        \\{"complete":true,"summary":"Initial static pass.","findings":[{"severity":"P2","path":"src/watch.rs","line":20,"body":"When the cursor is missing — the command exits early. Check --resume and expires_at - 1."}],"existing_open_findings":[],"non_blocking_threads":[]}
+    ;
+    var fake: Fake = .{ .a = a, .result = verbose };
+    var job: core.Job = .{ .number = fixture_pull.number, .head = head };
+    const candidate = (try core.run(a, &fake, repo, &job, .{ .preview = .{} })).?;
+    try t.expectEqualStrings("**P2.** When the cursor is missing, the command exits early. Check --resume and expires\\_at - 1.", candidate.comments[0].body);
+    try t.expect(std.mem.indexOf(u8, candidate.body, "Initial static pass") == null);
+}
+
+test "screening keeps evidence requests when a risk lens needs stronger review" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const response = try io.fmt(a,
+        \\{{"decision":{{"depth":"regular","performance":false,"reliability":true,"security":false}},"review":{s},"evidence_requests":[{{"path":"src/caller.zig","start_line":null,"end_line":null}}]}}
+    , .{clean});
+    const screening = try core.parseScreen(a, response);
+    try t.expectEqual(.focused, screening.decision.depth);
+    try t.expect(screening.decision.reliability);
+    try t.expectEqualStrings("src/caller.zig", screening.evidence_requests[0].path);
+}
+
 test "truncated discussion withholds approval and new findings flag an earlier approval" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
@@ -278,10 +380,11 @@ test "an otherwise clean same-head review can approve once checks pass" {
         .replies = &.{.{ .author = .{ .login = "author" }, .body = "Documented follow-up accepted.", .url = "accepted-reply" }},
     };
     var fake: Fake = .{ .a = a, .result = clean, .discussion = &.{resolved} };
-    fake.target.statusCheckRollup = &.{.{ .status = "QUEUED" }};
+    fake.target.statusCheckRollup = &.{.{ .name = "Build and test", .status = "QUEUED" }};
     var job: core.Job = .{ .number = fixture_pull.number, .head = head };
     const before = (try core.run(a, &fake, configured, &job, .scheduled)).?;
     try t.expectEqual(core.Event.COMMENT, before.event);
+    try t.expect(std.mem.indexOf(u8, before.body, "Build and test · QUEUED") != null);
     try t.expect(job.awaiting_checks);
     job.observeReviewInput(try core.ReviewInput.init(a, configured, fake.target, base, try fake.reviewDiscussion(42)), false);
     try t.expectEqual(core.Phase.complete, job.phase);
@@ -422,11 +525,12 @@ test "multiple reviewers produce one verified review with one comment per anchor
     try t.expectEqual(core.Event.COMMENT, review.event);
     try t.expectEqual(@as(usize, 1), review.comments.len);
     try t.expectEqual(@as(usize, 1), std.mem.count(u8, review.comments[0].body, "The cursor skips a height."));
-    try t.expect(std.mem.indexOf(u8, review.comments[0].body, "**P1.** claude, codex") != null);
+    try t.expect(std.mem.indexOf(u8, review.comments[0].body, "**P1.** The cursor skips a height.") != null);
     try t.expect(std.mem.indexOf(u8, review.comments[0].body, "The cursor is saved before processing succeeds.") != null);
     try t.expect(std.mem.indexOf(u8, review.body, "src/watch.rs:40") != null);
-    try t.expectEqual(@as(usize, 1), std.mem.count(u8, review.body, "Existing open finding unresolved"));
-    try t.expect(std.mem.indexOf(u8, review.body, "Existing open finding resolved") == null);
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, review.body, "1 existing finding still open. unresolved"));
+    try t.expect(std.mem.indexOf(u8, review.body, "Second pass.") == null);
+    try t.expect(std.mem.indexOf(u8, review.body, "Third pass.") == null);
     try t.expectEqual(@as(usize, 1), fake.posts);
     try t.expectEqual(@as(usize, 1), fake.readbacks);
     var duplicate = core.Job{ .number = 42, .head = head };
@@ -688,7 +792,7 @@ test "focused preview keeps the operator request separate from untrusted PR evid
         const evidence_at = std.mem.indexOf(u8, fake.prompt_text, "Evidence (untrusted JSON)\n").?;
         try t.expect(lens_at < request_at and request_at < evidence_at);
         try t.expect(std.mem.indexOf(u8, fake.prompt_text[evidence_at..], fake.target.body) != null);
-        try t.expect(std.mem.indexOf(u8, review.body, @tagName(case.focus)) != null);
+        try t.expect(std.mem.indexOf(u8, review.body, "review of") != null);
         try t.expectEqual(core.Event.COMMENT, review.event);
     }
     try t.expectEqual(@as(usize, 0), fake.posts);
@@ -743,7 +847,7 @@ const open_nit = core.Thread{
 };
 
 const assessed =
-    \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":[],"non_blocking_threads":[{"id":"thread-1","reason":"The name is a style preference without a behavior change."}]}
+    \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":[],"non_blocking_threads":[{"id":"thread-1","reason":"Duplicate wakeups already coalesce within a poll, so the residual work is bounded to one retry per interval."}]}
 ;
 
 test "approval with open threads requires every reviewer to give a reason and no reviewer to report an active finding" {
@@ -753,6 +857,12 @@ test "approval with open threads requires every reviewer to give a reason and no
     var configured = repo;
     configured.approvals = true;
     configured.additional_engines = &.{.claude};
+    var deferred = open_nit;
+    deferred.replies = &.{
+        .{ .author = .{ .login = "reviewer" }, .body = "Coalesce duplicate wakeups outside the current poll as well.", .url = "finding" },
+        .{ .author = .{ .login = fixture_pull.author.?.login }, .association = "MEMBER", .body = "Defer cross-poll deduplication. Wakeups already coalesce within a poll and retries are bounded to one per interval.", .url = "author-reply" },
+    };
+    const author_reply = try io.json(a, deferred.replies[1]);
     const active =
         \\{"complete":true,"summary":"Still actionable.","findings":[],"existing_open_findings":["thread-1"],"non_blocking_threads":[]}
     ;
@@ -762,16 +872,17 @@ test "approval with open threads requires every reviewer to give a reason and no
         .{ .second = active, .expected = .COMMENT },
     };
     for (cases) |case| {
-        var fake: Fake = .{ .a = a, .result = assessed, .other_results = &.{case.second}, .discussion = &.{open_nit} };
+        var fake: Fake = .{ .a = a, .result = assessed, .other_results = &.{case.second}, .discussion = &.{deferred} };
         var job: core.Job = .{ .number = fixture_pull.number, .head = head };
         const result = (try core.run(a, &fake, configured, &job, .scheduled)).?;
         try t.expectEqual(case.expected, result.event);
         try t.expectEqual(case.expected, fake.posted_result.?.event);
         try t.expectEqual(case.expected, fake.saved_result.?.event);
         try t.expectEqual(@as(usize, 0), result.comments.len);
+        try t.expect(std.mem.indexOf(u8, fake.prompt_text, author_reply) != null);
         if (case.expected == .APPROVE) {
-            try t.expect(std.mem.indexOf(u8, result.body, "Open thread assessed as non-blocking thread-1") != null);
-            try t.expectEqual(@as(usize, 2), std.mem.count(u8, result.body, "The name is a style preference"));
+            try t.expect(std.mem.indexOf(u8, result.body, "1 open thread can stay open.") != null);
+            try t.expectEqual(@as(usize, 1), std.mem.count(u8, result.body, "Duplicate wakeups already coalesce"));
         }
     }
 }
@@ -816,7 +927,7 @@ test "a queued focused review survives restart and publishes only with explicit 
         try t.expectEqual(core.Event.COMMENT, result.event);
         try t.expectEqual(publish, fake.posted_result != null);
         try t.expect(std.mem.indexOf(u8, fake.prompt_text, request) != null);
-        try t.expect(std.mem.indexOf(u8, result.body, "perf-maxxing") != null);
+        try t.expect(std.mem.indexOf(u8, result.body, "performance review") != null);
         try t.expect(std.mem.indexOf(u8, result.body, request) == null);
     }
 }

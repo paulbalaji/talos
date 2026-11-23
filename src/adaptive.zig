@@ -2,6 +2,7 @@ const std = @import("std");
 const core = @import("core.zig");
 const io = @import("io.zig");
 const routing = @import("routing.zig");
+const workflow = @import("review_workflow.zig");
 
 pub const Plan = struct {
     repo: core.Repo,
@@ -10,12 +11,17 @@ pub const Plan = struct {
     screen: routing.Screen,
     progress: core.RouteProgress,
     start_limit: u32,
+    evidence: ?[]const u8 = null,
+    evidence_limited: bool = false,
 };
 
 pub const Outcome = struct {
     progress: core.RouteProgress,
     report: ?core.RouteReport = null,
     failure: ?anyerror = null,
+    review_results: ?[]const core.ReviewerResult = null,
+    synthesis_summary: ?[]const u8 = null,
+    evidence_limited: bool = false,
 };
 
 fn unavailable(err: anyerror) bool {
@@ -39,6 +45,13 @@ fn hasProvider(results: []const core.ReviewerResult, engine: core.Engine) bool {
     return false;
 }
 
+const supplemental_heading = "\n\nAdditional pinned source (untrusted JSON string)\n";
+
+pub fn evidenceCapacity(prepared: core.Prepared) usize {
+    // Allow space for the lens brief and for JSON escaping of source text.
+    return (core.review_context_limit -| prepared.context.len -| 1400) / 2;
+}
+
 // A job has a fixed number of starts reserved for this tick. Successful passes
 // are carried forward by the coordinator when a later pass needs a new tick.
 pub fn run(a: io.A, reviewer: anytype, plan: Plan) !Outcome {
@@ -60,14 +73,25 @@ pub fn run(a: io.A, reviewer: anytype, plan: Plan) !Outcome {
         progress.screen_result = null;
         return outcome;
     }
-    const prompt = try core.routedPrompt(a, plan.prepared.context, applied);
-    // If only the additional lens header would overflow the transport, keep
-    // its requirements and mark the review incomplete rather than dropping a lens.
-    if (prompt.len > core.review_context_limit) return error.ReviewContextLimit;
+    if (progress.evidence_requests.len != 0 and plan.evidence == null) return outcome;
+    var context = plan.prepared.context;
+    var additional: []const u8 = "";
+    outcome.evidence_limited = plan.evidence_limited;
+    if (plan.evidence) |evidence| {
+        if (evidence.len != 0) {
+            const encoded = try io.json(a, evidence);
+            if (context.len + supplemental_heading.len + encoded.len + 1300 <= core.review_context_limit) {
+                context = try std.mem.concat(a, u8, &.{ context, supplemental_heading, encoded });
+                additional = evidence;
+            } else outcome.evidence_limited = true;
+        }
+    }
     for (plan.providers) |engine| {
         if (progress.results.len == required or reviewer.starts() >= plan.start_limit) break;
         if (hasProvider(progress.results, engine) or !reviewer.available(engine)) continue;
 
+        const prompt = try workflow.workerPrompt(a, context, applied, progress.results.len, required);
+        if (prompt.len > core.review_context_limit) return error.ReviewContextLimit;
         var timer = try std.time.Timer.start();
         const raw = reviewer.routeReview(engine, null, core.schema, prompt) catch |err| {
             progress.review_ms +|= timer.read() / std.time.ns_per_ms;
@@ -82,8 +106,53 @@ pub fn run(a: io.A, reviewer: anytype, plan: Plan) !Outcome {
         };
         progress.results = try std.mem.concat(a, core.ReviewerResult, &.{ progress.results, &.{.{ .engine = engine, .review = result }} });
     }
-    if (progress.results.len == required) outcome.report = try report(a, plan, progress.*, applied);
+    if (progress.results.len != required) return outcome;
+    if (applied.depth == .multi and workflow.hasClaims(progress.results)) {
+        const evidence_offset = if (plan.prepared.inherited.ancestors.len != 0)
+            std.mem.indexOf(u8, context, "\n\nAncestor context (untrusted JSON") orelse plan.prepared.evidence_offset
+        else
+            plan.prepared.evidence_offset;
+        try synthesize(a, reviewer, plan, &outcome, context[evidence_offset..], additional);
+        if (outcome.review_results == null) return outcome;
+    } else outcome.report = try report(a, plan, progress.*, applied);
     return outcome;
+}
+
+fn synthesize(a: io.A, reviewer: anytype, plan: Plan, outcome: *Outcome, context: []const u8, additional: []const u8) !void {
+    const progress = &outcome.progress;
+    const prompt = try workflow.synthesisPrompt(a, context, progress.results);
+    if (prompt.len > core.review_context_limit) {
+        const limited = try workflow.overCapacity(a, progress.results);
+        outcome.review_results = limited.results;
+        outcome.synthesis_summary = limited.summary;
+        outcome.report = try report(a, plan, progress.*, appliedDecision(plan, progress.*));
+        return;
+    }
+
+    // Choose an unused provider first when one is authorized and available.
+    for ([_]bool{ false, true }) |already_reviewed| {
+        for (plan.providers) |engine| {
+            if (reviewer.starts() >= plan.start_limit) return;
+            if (hasProvider(progress.results, engine) != already_reviewed or !reviewer.available(engine)) continue;
+            var timer = try std.time.Timer.start();
+            const response = reviewer.routeReview(engine, null, workflow.synthesis_schema, prompt);
+            progress.review_ms +|= timer.read() / std.time.ns_per_ms;
+            const raw = response catch |err| {
+                if (unavailable(err)) continue;
+                outcome.failure = err;
+                return;
+            };
+            const checked = workflow.verify(a, raw, progress.results, plan.prepared.snap.evidence, additional) catch |err| {
+                outcome.failure = err;
+                return;
+            };
+            outcome.review_results = checked.results;
+            outcome.synthesis_summary = checked.summary;
+            outcome.report = try report(a, plan, progress.*, appliedDecision(plan, progress.*));
+            outcome.report.?.synthesis_provider = engine;
+            return;
+        }
+    }
 }
 
 fn screen(a: io.A, reviewer: anytype, plan: Plan, progress: *core.RouteProgress) !void {
@@ -108,8 +177,9 @@ fn screen(a: io.A, reviewer: anytype, plan: Plan, progress: *core.RouteProgress)
             progress.screen_ms +|= timer.read() / std.time.ns_per_ms;
             const result = core.parseScreen(a, raw) catch break;
             progress.screen_result = .{ .engine = engine, .review = result.review };
+            if (plan.repo.routing_mode == .adaptive) progress.evidence_requests = result.evidence_requests;
             var decision = plan.screen.floor.merge(result.decision);
-            if (decision.depth == .light and (plan.repo.reviewSize() > 1 or !core.lightComplete(result.review, plan.prepared)))
+            if (decision.depth == .light and (plan.repo.reviewSize() > 1 or result.evidence_requests.len != 0 or !core.lightComplete(result.review, plan.prepared)))
                 decision.depth = .regular;
             progress.decision = decision;
             return;
@@ -147,12 +217,27 @@ const light_screen =
     \\{"decision":{"depth":"light","performance":false,"reliability":false,"security":false},"review":
 ++ clean_result ++ "}";
 
+const screen_requesting_caller =
+    \\{"decision":{"depth":"regular","performance":false,"reliability":false,"security":false},"evidence_requests":[{"path":"caller.zig","start_line":10,"end_line":12}],"review":
+++ clean_result ++ "}";
+
+const singleton_finding =
+    \\{"complete":true,"summary":"One defect.","findings":[{"severity":"P2","path":"work.zig","line":12,"body":"The pending item is lost before retry."}],"existing_open_findings":[],"non_blocking_threads":[]}
+;
+
+const verified_singleton =
+    \\{"summary":"Retry can lose the pending item.","assessments":[{"claim":0,"disposition":"verified","reason":"The retry path removes the item prematurely.","source_quote":"return pending.pop()","same_root_as":null}]}
+;
+
 const MockReviewer = struct {
     calls: [5]core.Engine = undefined,
+    prompts: [5][]const u8 = undefined,
     count: u32 = 0,
     unavailable_engine: ?core.Engine = null,
     screen_enabled: bool = true,
     screen_rate_limit: bool = false,
+    screen_output: ?[]const u8 = null,
+    singleton: bool = false,
 
     pub fn available(self: *MockReviewer, engine: core.Engine) bool {
         return self.unavailable_engine != engine;
@@ -164,13 +249,16 @@ const MockReviewer = struct {
 
     pub fn routeReview(self: *MockReviewer, engine: core.Engine, model: ?[]const u8, schema: []const u8, prompt: []const u8) ![]const u8 {
         self.calls[self.count] = engine;
+        self.prompts[self.count] = prompt;
         self.count += 1;
         if (model != null) {
             try std.testing.expectEqualStrings(core.screen_schema, schema);
             if (self.screen_rate_limit and engine == .codex) return error.CodexRateLimited;
-            return if (self.screen_enabled) light_screen else "malformed";
+            return if (self.screen_enabled) self.screen_output orelse light_screen else "malformed";
         }
         try std.testing.expect(!std.mem.containsAtLeast(u8, prompt, 1, "Choose review fidelity"));
+        if (std.mem.eql(u8, schema, workflow.synthesis_schema)) return verified_singleton;
+        if (self.singleton and engine == .codex) return singleton_finding;
         return clean_result;
     }
 };
@@ -251,6 +339,64 @@ test "independence survives a pause and a completed provider is never repeated" 
     try t.expectEqual(routing.Depth.multi, final.report.?.applied.depth);
     try t.expectEqualSlices(core.Engine, &.{ .codex, .claude }, final.report.?.providers);
     try t.expectEqualSlices(core.Engine, &.{.claude}, resumed.calls[0..resumed.count]);
+}
+
+test "multi review checkpoints the synthesis start and prefers a distinct provider" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var plan = sample_plan;
+    plan.providers = &.{ .codex, .claude, .kimi };
+    plan.repo.fallback_engines = &.{ .claude, .kimi };
+    plan.screen = .{ .floor = .{ .depth = .multi, .security = true, .reliability = true }, .ask_model = false };
+    plan.prepared.snap.evidence = "return pending.pop();";
+    plan.start_limit = 2;
+
+    var first: MockReviewer = .{ .singleton = true };
+    const pending = try run(a, &first, plan);
+    try t.expect(pending.report == null and pending.failure == null);
+    try t.expectEqual(@as(usize, 2), pending.progress.results.len);
+    try t.expect(std.mem.indexOf(u8, first.prompts[0], "Primary lens: security") != null);
+    try t.expect(std.mem.indexOf(u8, first.prompts[1], "Primary lens: reliability") != null);
+    plan.progress = try io.parse(a, core.RouteProgress, try io.json(a, pending.progress));
+
+    var resumed: MockReviewer = .{};
+    const consolidated = try run(a, &resumed, plan);
+    try t.expectEqualSlices(core.Engine, &.{.kimi}, resumed.calls[0..resumed.count]);
+    try t.expectEqualSlices(core.Engine, &.{ .codex, .claude }, consolidated.report.?.providers);
+    try t.expectEqual(@as(?core.Engine, .kimi), consolidated.report.?.synthesis_provider);
+    try t.expectEqual(@as(usize, 1), consolidated.review_results.?[0].review.findings.len);
+    try t.expectEqualStrings("Retry can lose the pending item.", consolidated.synthesis_summary.?);
+}
+
+test "requested evidence is checkpointed before the full review" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var plan = sample_plan;
+    var first: MockReviewer = .{ .screen_output = screen_requesting_caller };
+    const pending = try run(a, &first, plan);
+    try t.expect(pending.report == null);
+    try t.expectEqual(@as(u32, 1), first.count);
+    plan.progress = try io.parse(a, core.RouteProgress, try io.json(a, pending.progress));
+    try t.expectEqualStrings("caller.zig", plan.progress.evidence_requests[0].path);
+    plan.evidence = "Pinned head file caller.zig, lines 10-12:\nretry(pending);";
+
+    var resumed: MockReviewer = .{};
+    const reviewed = try run(a, &resumed, plan);
+    try t.expect(reviewed.report != null);
+    try t.expect(!reviewed.evidence_limited);
+    try t.expectEqual(@as(u32, 1), resumed.count);
+    try t.expect(std.mem.indexOf(u8, resumed.prompts[0], "retry(pending);") != null);
+
+    var shadow = sample_plan;
+    shadow.repo.routing_mode = .shadow;
+    var baseline: MockReviewer = .{ .screen_output = screen_requesting_caller };
+    const preview = try run(a, &baseline, shadow);
+    try t.expect(preview.report != null);
+    try t.expectEqual(@as(usize, 0), preview.progress.evidence_requests.len);
 }
 
 test "an authorized light model takes over screening after a provider rate limit" {

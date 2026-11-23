@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("core.zig");
 const usage = @import("usage.zig");
+const workflow = @import("review_workflow.zig");
 
 pub const jobs_per_repo = 3;
 pub const active_repos = 5;
@@ -99,14 +100,13 @@ pub const Budget = struct {
 
     fn reviewAt(self: Budget, repo: core.Repo, progress: ?core.RouteProgress, now: i64, limited: u8, current: usage.Snapshot) ?i64 {
         const can_make_progress = repo.routing_mode != .fixed or repo.fallback_engines.len != 0 or progress != null;
+        const completed = if (progress) |partial| if (workflow.waitsForSynthesis(repo, partial)) &.{} else partial.results else &.{};
         var result: ?i64 = if (can_make_progress) null else 0;
         providers: for (std.meta.tags(core.Engine)) |engine| {
             const primary = engine == repo.engine or std.mem.indexOfScalar(core.Engine, repo.additional_engines, engine) != null;
             if (!primary and std.mem.indexOfScalar(core.Engine, repo.fallback_engines, engine) == null) continue;
-            if (progress) |partial| {
-                for (partial.results) |pass| {
-                    if (pass.engine == engine) continue :providers;
-                }
+            for (completed) |pass| {
+                if (pass.engine == engine) continue :providers;
             }
             const at = self.engineAt(engine, now, limited, current);
             if (can_make_progress) {
@@ -347,4 +347,25 @@ test "a fixed ensemble can resume when its completed provider is at the daily ca
     };
     try t.expect(budget.canReview(repo, progress, now, 0, current));
     try t.expect(!budget.canReview(repo, progress, now, engineBit(.claude), current));
+}
+
+test "a completed adaptive ensemble can reuse a provider for synthesis" {
+    const t = std.testing;
+    const now = 10 * std.time.s_per_day;
+    const repo: core.Repo = .{ .name = "owner/repo", .login = "user", .routing_mode = .adaptive, .fallback_engines = &.{.claude} };
+    const review: core.Review = .{
+        .complete = true,
+        .summary = "Fixture",
+        .findings = &.{.{ .severity = .P2, .path = "retry.zig", .line = 5, .body = "Drops queued work on retry." }},
+        .existing_open_findings = &.{},
+    };
+    const progress: core.RouteProgress = .{
+        .fingerprint = @splat(0),
+        .decision = .{ .depth = .multi, .reliability = true },
+        .screen_waiting = false,
+        .results = &.{ .{ .engine = .codex, .review = review }, .{ .engine = .claude, .review = review } },
+    };
+    const budget: Budget = .{};
+    try t.expect(budget.canReview(repo, progress, now, engineBit(.codex), .{}));
+    try t.expect(!budget.canReview(repo, progress, now, engineBit(.codex) | engineBit(.claude), .{}));
 }
