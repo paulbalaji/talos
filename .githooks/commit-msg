@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+subject=
+IFS= read -r subject < "$1" || :
+case "$subject" in
+    'fixup! '*|'squash! '*|'amend! '*|'Merge '*) exit 0 ;;
+esac
+if ! "$(dirname "$0")/check-conventional" "$subject"; then
+    printf '%s\n' 'Use a Conventional Commit subject such as fix(cli): handle missing config.' >&2
+    exit 1
+fi

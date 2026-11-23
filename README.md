@@ -87,7 +87,9 @@ zig build test
 gitleaks git --redact --no-banner
 ```
 
-Use the optional staged secret scan before committing.
+Use Conventional Commits for PR titles and commit subjects, for example `fix(cli): handle missing config`. CI checks the PR title and every non-merge commit. Squash merges use the PR title as the commit subject.
+
+Install Gitleaks and enable the optional local hooks to check staged content and commit subjects before pushing. Autosquash local fixups before opening a PR.
 
 ```sh
 git config core.hooksPath .githooks

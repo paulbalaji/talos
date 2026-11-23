@@ -3,6 +3,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, reopened, synchronize, edited, ready_for_review]
   workflow_dispatch:
 permissions:
   contents: read
@@ -43,6 +44,51 @@ jobs:
         run: |
           zig build -Doptimize=ReleaseSafe
           zig-out/bin/talos --help
+
+  conventions:
+    name: Commit conventions
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check PR title and commit subjects
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          case "$GITHUB_EVENT_NAME" in
+            pull_request)
+              if ! .githooks/check-conventional "$PR_TITLE"; then
+                echo 'Use a Conventional Commit PR title such as feat(cli): add a status option.'
+                exit 1
+              fi
+              revisions=("$PR_BASE..$PR_HEAD")
+              ;;
+            push)
+              if [[ "$PUSH_BEFORE" =~ ^0+$ ]]; then
+                revisions=("$GITHUB_SHA")
+              else
+                revisions=("$PUSH_BEFORE..$GITHUB_SHA")
+              fi
+              ;;
+            *)
+              revisions=(-1 "$GITHUB_SHA")
+              ;;
+          esac
+          subjects="$RUNNER_TEMP/talos-commit-subjects"
+          git log --no-merges --format='%h %s' "${revisions[@]}" > "$subjects"
+          failed=0
+          while IFS= read -r entry; do
+            if ! .githooks/check-conventional "${entry#* }"; then
+              printf 'Commit %s needs a Conventional Commit subject.\n' "${entry%% *}"
+              failed=1
+            fi
+          done < "$subjects"
+          exit "$failed"
 
   secrets:
     name: Secret scan
