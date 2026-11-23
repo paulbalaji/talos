@@ -2,6 +2,7 @@ const std = @import("std");
 const core = @import("core.zig");
 const github = @import("github.zig");
 const io = @import("io.zig");
+const cache = @import("cache.zig");
 const A = io.A;
 const eq = io.eq;
 
@@ -40,17 +41,16 @@ pub const Git = struct {
     cmd: io.Command,
     bin: []const u8,
     gh: []const u8,
-    cache: []const u8,
-    repo: core.Repo,
+    object_cache: cache.Cache,
 
-    fn git(self: Git, args: []const []const u8) ![]const u8 {
+    fn git(self: Git, path: []const u8, args: []const []const u8) ![]const u8 {
         const a = self.cmd.a;
         var argv: std.ArrayList([]const u8) = .empty;
         const helper = try io.fmt(a, "credential.helper=!{s} auth git-credential", .{try shellQuote(a, self.gh)});
         try argv.appendSlice(a, &.{
             self.bin,
             "--no-replace-objects",
-            try io.fmt(a, "--git-dir={s}", .{self.cache}),
+            try io.fmt(a, "--git-dir={s}", .{path}),
             "-c",
             "core.hooksPath=/dev/null",
             "-c",
@@ -61,56 +61,68 @@ pub const Git = struct {
             "protocol.allow=never",
             "-c",
             "protocol.https.allow=always",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
         });
         try argv.appendSlice(a, args);
         return self.cmd.run(argv.items, "", 180);
     }
 
-    pub fn checkoutObjects(self: Git) ![]const u8 {
-        const path = io.trim(u8, self.cmd.run(&.{
-            self.bin, "-C", self.repo.checkout, "rev-parse", "--path-format=absolute", "--git-path", "objects",
-        }, "", 10) catch return error.InvalidCheckout, "\r\n");
-        if (!std.fs.path.isAbsolute(path) or std.mem.indexOfAny(u8, path, "\r\n") != null)
-            return error.InvalidCheckout;
-        var dir = std.fs.openDirAbsolute(path, .{}) catch return error.InvalidCheckout;
-        dir.close();
-        return path;
-    }
-
-    fn prepare(self: Git) !void {
-        std.fs.accessAbsolute(self.cache, .{}) catch |err| switch (err) {
-            error.FileNotFound => {
-                _ = self.cmd.run(&.{ self.bin, "init", "--bare", "--template=", self.cache }, "", 20) catch
-                    return error.GitCacheInitFailed;
-            },
-            else => return err,
-        };
-        const objects = try self.checkoutObjects();
-        var dir = try std.fs.openDirAbsolute(try std.fs.path.join(self.cmd.a, &.{ self.cache, "objects", "info" }), .{});
+    fn prepare(self: Git, repo_dir: std.fs.Dir, path: []const u8) !void {
+        if (try cache.openCache(repo_dir)) |existing| {
+            var dir = existing;
+            defer dir.close();
+            try cache.touch(self.cmd.a, dir, std.time.timestamp());
+            return;
+        }
+        _ = self.cmd.run(&.{ self.bin, "init", "--bare", "--template=", path }, "", 20) catch
+            return error.GitCacheInitFailed;
+        const remote = try io.fmt(self.cmd.a, "https://github.com/{s}.git", .{self.object_cache.repo.name});
+        _ = try self.git(path, &.{ "config", "--local", "remote.origin.url", remote });
+        _ = try self.git(path, &.{ "config", "--local", "remote.origin.promisor", "true" });
+        _ = try self.git(path, &.{ "config", "--local", "remote.origin.partialclonefilter", "blob:none" });
+        var dir = (try cache.openCache(repo_dir)) orelse return error.GitCacheInitFailed;
         defer dir.close();
-        try io.write(dir, "alternates", try io.fmt(self.cmd.a, "{s}\n", .{objects}));
+        try cache.touch(self.cmd.a, dir, std.time.timestamp());
     }
 
     pub fn snapshot(self: Git, pr: core.Pull, files: []const github.File) !core.Snapshot {
+        var repo_dir = (try self.object_cache.repoDir(true)) orelse return error.GitCacheInitFailed;
+        defer repo_dir.close();
+        const parent = try repo_dir.realpathAlloc(self.cmd.a, ".");
+        const path = try std.fs.path.join(self.cmd.a, &.{ parent, cache.directory });
+        try self.object_cache.evict(repo_dir, std.time.timestamp());
+        const result = self.readSnapshot(repo_dir, path, pr, files) catch |err| {
+            self.object_cache.evict(repo_dir, std.time.timestamp()) catch |cache_err|
+                std.log.warn("Git cache eviction failed for {s} ({s})", .{ self.object_cache.repo.name, @errorName(cache_err) });
+            return err;
+        };
+        try self.object_cache.evict(repo_dir, std.time.timestamp());
+        return result;
+    }
+
+    fn readSnapshot(self: Git, repo_dir: std.fs.Dir, path: []const u8, pr: core.Pull, files: []const github.File) !core.Snapshot {
         const a = self.cmd.a;
-        try self.prepare();
-        const head_ref = try io.fmt(a, "refs/talos/pulls/{d}/head", .{pr.number});
-        const base_ref = try io.fmt(a, "refs/talos/pulls/{d}/base", .{pr.number});
-        _ = self.git(&.{
-            "fetch",                                                        "--no-tags",                                                        "--no-write-fetch-head",                                 "--no-auto-maintenance", "--no-recurse-submodules",
-            try io.fmt(a, "https://github.com/{s}.git", .{self.repo.name}), try io.fmt(a, "+refs/pull/{d}/head:{s}", .{ pr.number, head_ref }), try io.fmt(a, "+{s}:{s}", .{ pr.baseRefOid, base_ref }),
+        try self.prepare(repo_dir, path);
+        const head_ref = "refs/talos/head";
+        const base_ref = "refs/talos/base";
+        _ = self.git(path, &.{
+            "fetch",  "--atomic",                                                         "--filter=blob:none",                                    "--no-tags", "--no-write-fetch-head", "--no-auto-maintenance", "--no-recurse-submodules",
+            "origin", try io.fmt(a, "+refs/pull/{d}/head:{s}", .{ pr.number, head_ref }), try io.fmt(a, "+{s}:{s}", .{ pr.baseRefOid, base_ref }),
         }) catch return error.GitFetchFailed;
-        const pins = io.trim(u8, try self.git(&.{ "rev-parse", head_ref, base_ref }), "\r\n");
+        const pins = io.trim(u8, try self.git(path, &.{ "rev-parse", head_ref, base_ref }), "\r\n");
         const expected = try io.fmt(a, "{s}\n{s}", .{ pr.headRefOid, pr.baseRefOid });
         if (!eq(u8, pins, expected)) return error.TargetChanged;
-        const merge_base = io.trim(u8, try self.git(&.{ "merge-base", pr.baseRefOid, pr.headRefOid }), "\r\n");
+        const merge_base = io.trim(u8, try self.git(path, &.{ "merge-base", pr.baseRefOid, pr.headRefOid }), "\r\n");
         if (!core.validOid(merge_base)) return error.InvalidMergeBase;
 
         const diff_args = [_][]const u8{
             "diff",     "--no-ext-diff", "--no-textconv", "--no-color", "--find-renames", "--unified=4",
             merge_base, pr.headRefOid,   "--",
         } ++ excluded_paths;
-        const diff = self.git(&diff_args) catch return error.GitDiffFailed;
+        const diff = self.git(path, &diff_args) catch return error.GitDiffFailed;
         const prefix = diff[0..core.safePrefix(diff, diff_limit)];
         if (!std.unicode.utf8ValidateSlice(prefix)) return error.NonUtf8Diff;
         var evidence: std.ArrayList(u8) = .empty;
@@ -125,10 +137,10 @@ pub const Git = struct {
             }
             if (remaining < 1024 or !core.validPath(file.filename)) continue;
             const object = try io.fmt(a, "{s}:{s}", .{ pr.headRefOid, file.filename });
-            const size_text = self.git(&.{ "cat-file", "-s", object }) catch continue;
+            const size_text = self.git(path, &.{ "cat-file", "-s", object }) catch continue;
             const size = std.fmt.parseInt(usize, io.trim(u8, size_text, "\r\n"), 10) catch continue;
             if (size > @min(remaining, 16 * 1024)) continue;
-            const blob = self.git(&.{ "cat-file", "blob", object }) catch continue;
+            const blob = self.git(path, &.{ "cat-file", "blob", object }) catch continue;
             if (!std.unicode.utf8ValidateSlice(blob) or std.mem.indexOfScalar(u8, blob, 0) != null) continue;
             try writer.print("\n\nHead file {s}:\n{s}", .{ file.filename, blob });
             remaining -= @min(remaining, blob.len + file.filename.len + 40);

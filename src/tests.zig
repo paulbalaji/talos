@@ -4,7 +4,7 @@ const io = @import("io.zig");
 const store = @import("store.zig");
 
 const t = std.testing;
-const repo = core.Repo{ .name = "example/repo", .checkout = "/checkout", .login = "reviewer", .comments = true };
+const repo = core.Repo{ .name = "example/repo", .login = "reviewer", .comments = true };
 const head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const base = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const changed = "cccccccccccccccccccccccccccccccccccccccc";
@@ -329,4 +329,27 @@ test "subprocesses return bounded output and time out" {
     const command: io.Command = .{ .a = a, .env = &env, .cwd = path, .dir = dir };
     try t.expectEqualStrings("prompt", try command.run(&.{"/bin/cat"}, "prompt", 2));
     try t.expectError(error.SubprocessTimeout, command.run(&.{ "/bin/sleep", "5" }, "", 1));
+}
+
+test "v0 registration upgrades without its checkout and preserves publication intent" {
+    var allocator = std.heap.ArenaAllocator.init(t.allocator);
+    defer allocator.deinit();
+    const a = allocator.allocator();
+    const path = try io.temp(a);
+    defer std.fs.deleteTreeAbsolute(path) catch {};
+    var db = try store.Store.open(a, path);
+    defer db.dir.close();
+    try io.write(db.dir, "state.json",
+        \\{"version":1,"entries":[{"repo":{"name":"example/repo","checkout":"/missing/v0/checkout","login":"reviewer","comments":true,"approvals":true},"jobs":[{"number":42,"head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","phase":"uncertain","event":"COMMENT","receipt":55}]}]}
+    );
+    const state = try db.load();
+    try t.expectEqual(@as(u32, 128), state.entries[0].repo.cache_mib);
+    try t.expectEqual(@as(u16, 7), state.entries[0].repo.cache_idle_days);
+    try t.expect(state.entries[0].repo.comments and state.entries[0].repo.approvals);
+    try db.save(&state);
+    const upgraded = try db.load();
+    try t.expectEqual(core.Phase.uncertain, upgraded.entries[0].jobs[0].phase);
+    try t.expectEqual(@as(?u64, 55), upgraded.entries[0].jobs[0].receipt);
+    const data = try db.dir.readFileAlloc(a, "state.json", 4096);
+    try t.expect(std.mem.indexOf(u8, data, "checkout") == null);
 }

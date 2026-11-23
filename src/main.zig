@@ -1,5 +1,6 @@
 const std = @import("std");
 const core = @import("core.zig");
+const cache = @import("cache.zig");
 const github = @import("github.zig");
 const source = @import("source.zig");
 const runner = @import("runner.zig");
@@ -13,7 +14,7 @@ const A = io.A;
 const usage =
     \\Talos tracks ready GitHub pull requests and reviews new commits.
     \\
-    \\talos [--home DIR] add OWNER/REPO CHECKOUT [options]
+    \\talos [--home DIR] add OWNER/REPO [options]
     \\talos [--home DIR] status [OWNER/REPO] [--json]
     \\talos [--home DIR] queue OWNER/REPO PR
     \\talos [--home DIR] run-once [OWNER/REPO [PR]]
@@ -23,6 +24,8 @@ const usage =
     \\
     \\Registration options
     \\  --interval SECONDS                  Default 180, minimum 15
+    \\  --cache-mib MIB                      Default 128, 0 for per-review disposal
+    \\  --cache-idle-days DAYS               Default 7
     \\  --engine codex|claude|kimi           Default codex
     \\  --model MODEL                        Override reviewer model
     \\  --git PATH --gh PATH --codex PATH --claude PATH --kimi PATH
@@ -86,8 +89,7 @@ const Local = struct {
             .cmd = self.command(env),
             .bin = try self.bin(.git),
             .gh = try self.bin(.gh),
-            .cache = try std.fs.path.join(self.a, &.{ db.path, try db.repoPath(repo.name, "objects.git") }),
-            .repo = repo,
+            .object_cache = .{ .a = self.a, .root = db.dir, .repo = repo },
         };
     }
 
@@ -190,16 +192,21 @@ const Main = struct {
         return result;
     }
 
+    fn objectCache(self: Main, repo: core.Repo) cache.Cache {
+        return .{ .a = self.a, .root = self.db.dir, .repo = repo };
+    }
+
     fn add(self: Main, state: *store.State, args: []const []const u8) !void {
-        if (args.len < 2) return error.Usage;
+        if (args.len == 0) return error.Usage;
         const name = try repoName(self.a, args[0]);
         var repo: core.Repo = .{
             .name = name,
-            .checkout = try std.fs.cwd().realpathAlloc(self.a, args[1]),
             .login = "",
         };
         var programs: Programs = .{};
-        var options = args[2..];
+        var options = args[1..];
+        // Preserve the v0 command line without opening the old checkout.
+        if (options.len != 0 and !std.mem.startsWith(u8, options[0], "--")) options = options[1..];
         while (options.len > 0) {
             const opt = options[0];
             options = options[1..];
@@ -214,6 +221,11 @@ const Main = struct {
                 if (eq(u8, opt, "--interval")) {
                     repo.interval = std.fmt.parseUnsigned(u32, value, 10) catch return error.InvalidInterval;
                     if (repo.interval < 15) return error.InvalidInterval;
+                } else if (eq(u8, opt, "--cache-mib")) {
+                    repo.cache_mib = std.fmt.parseUnsigned(u32, value, 10) catch return error.InvalidCacheSize;
+                } else if (eq(u8, opt, "--cache-idle-days")) {
+                    repo.cache_idle_days = std.fmt.parseUnsigned(u16, value, 10) catch return error.InvalidCacheAge;
+                    if (repo.cache_idle_days == 0) return error.InvalidCacheAge;
                 } else if (eq(u8, opt, "--engine")) {
                     repo.engine = std.meta.stringToEnum(core.Engine, value) orelse return error.UnknownReviewer;
                 } else if (eq(u8, opt, "--model")) {
@@ -237,19 +249,20 @@ const Main = struct {
         repo.claude = if (repo.engine == .claude) reviewer_bin else programs.claude;
         repo.kimi = if (repo.engine == .kimi) reviewer_bin else programs.kimi;
 
-        var gh_env = try tools.githubEnv();
+        const gh_env = try tools.githubEnv();
         const client = try tools.gh(&gh_env, name);
         repo.login = try client.identity();
-        _ = try (try tools.git(&gh_env, self.db, repo)).checkoutObjects();
         if (state.find(name)) |entry| {
             if (!std.ascii.eqlIgnoreCase(entry.repo.login, repo.login)) return error.GitHubIdentityChanged;
             entry.repo = repo;
             entry.next_scan = 0;
+            entry.next_cache_check = 0;
             try self.db.save(state);
             try io.out("Updated {s} as {s}\n", .{ name, repo.login });
         } else {
-            try self.db.dir.makePath(try self.db.repoPath(name, "results"));
             const pulls = try client.ready();
+            var repo_dir = (try self.objectCache(repo).repoDir(true)) orelse return error.RepositoryDirectoryMissing;
+            repo_dir.close();
             var entry: core.Entry = .{ .repo = repo };
             try entry.discover(self.a, pulls, true);
             entry.last_scan = std.time.timestamp();
@@ -287,17 +300,27 @@ const Main = struct {
     fn tick(self: Main, state: *store.State) !void {
         for (state.entries) |*entry| {
             const now = std.time.timestamp();
-            if (try self.db.paused(entry.repo.name) or entry.next_scan > now) continue;
-            if (self.scan(entry)) |_| {
-                entry.last_scan = std.time.timestamp();
-                entry.next_scan = entry.last_scan + entry.repo.interval;
-                entry.scan_attempts = 0;
-            } else |err| {
-                entry.scan_attempts +|= 1;
-                entry.next_scan = now + core.delay(entry.scan_attempts);
-                try entry.problem(self.a, now, null, @errorName(err));
+            var changed = false;
+            if (entry.next_cache_check <= now) {
+                self.objectCache(entry.repo).maintain(now) catch |err| {
+                    try entry.problem(self.a, now, null, try io.fmt(self.a, "Git cache: {s}", .{@errorName(err)}));
+                };
+                entry.next_cache_check = now + cache.check_interval;
+                changed = true;
             }
-            try self.db.save(state);
+            if (entry.next_scan <= now and !try self.db.paused(entry.repo.name)) {
+                if (self.scan(entry)) |_| {
+                    entry.last_scan = std.time.timestamp();
+                    entry.next_scan = entry.last_scan + entry.repo.interval;
+                    entry.scan_attempts = 0;
+                } else |err| {
+                    entry.scan_attempts +|= 1;
+                    entry.next_scan = now + core.delay(entry.scan_attempts);
+                    try entry.problem(self.a, now, null, @errorName(err));
+                }
+                changed = true;
+            }
+            if (changed) try self.db.save(state);
         }
         for (state.entries) |*entry| {
             const now = std.time.timestamp();
@@ -368,8 +391,11 @@ const Main = struct {
         for (state.entries) |entry| {
             if (repo != null and !std.ascii.eqlIgnoreCase(repo.?, entry.repo.name)) continue;
             const paused = try self.db.paused(entry.repo.name);
+            const measurement = self.objectCache(entry.repo).measure();
+            const retained: ?u64 = if (measurement) |bytes| bytes else |_| null;
+            const cache_error: ?[]const u8 = if (measurement) |_| null else |err| @errorName(err);
             if (json_output) {
-                try io.out("{s}{s}", .{ if (first) "" else ",", try io.json(self.a, .{ .paused = paused, .state = entry }) });
+                try io.out("{s}{s}", .{ if (first) "" else ",", try io.json(self.a, .{ .paused = paused, .state = entry, .cache_bytes = retained, .cache_error = cache_error }) });
                 first = false;
                 continue;
             }
@@ -380,6 +406,11 @@ const Main = struct {
             try io.out("  Last successful scan {s}  |  Next scan {s}  |  Ready PRs {d}\n", .{
                 try formatTime(self.a, entry.last_scan), try formatTime(self.a, entry.next_scan), entry.seen.len,
             });
+            if (retained) |bytes| {
+                try io.out("  Git cache {d} bytes / {d} MiB  |  Idle expiry {d}d\n", .{ bytes, entry.repo.cache_mib, entry.repo.cache_idle_days });
+            } else {
+                try io.out("  Git cache unavailable ({s})\n", .{cache_error.?});
+            }
             var queued: usize = 0;
             for (entry.jobs) |job| {
                 if (job.phase == .complete) continue;
@@ -440,16 +471,7 @@ const Main = struct {
 };
 
 fn repoName(a: A, name: []const u8) ![]const u8 {
-    if (name.len > 150) return error.InvalidRepository;
-    var parts = std.mem.splitScalar(u8, name, '/');
-    for (0..2) |_| {
-        const part = parts.next() orelse return error.InvalidRepository;
-        if (part.len == 0 or eq(u8, part, ".") or eq(u8, part, "..")) return error.InvalidRepository;
-        for (part) |byte| {
-            if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_' and byte != '.') return error.InvalidRepository;
-        }
-    }
-    if (parts.next() != null or std.ascii.endsWithIgnoreCase(name, ".git")) return error.InvalidRepository;
+    if (!core.validRepoName(name)) return error.InvalidRepository;
     return std.ascii.allocLowerString(a, name);
 }
 
@@ -506,6 +528,7 @@ pub fn main() void {
 }
 
 test {
+    _ = @import("cache.zig");
     _ = @import("source.zig");
     _ = @import("runner.zig");
     _ = @import("tests.zig");

@@ -7,9 +7,10 @@ pub const schema = @embedFile("review-schema.json");
 pub const Engine = enum { codex, claude, kimi };
 pub const Repo = struct {
     name: []const u8,
-    checkout: []const u8,
     login: []const u8,
     interval: u32 = 180,
+    cache_mib: u32 = 128,
+    cache_idle_days: u16 = 7,
     engine: Engine = .codex,
     model: ?[]const u8 = null,
     comments: bool = false,
@@ -95,6 +96,7 @@ pub const Entry = struct {
     jobs: []Job = &.{},
     last_scan: i64 = 0,
     next_scan: i64 = 0,
+    next_cache_check: i64 = 0,
     scan_attempts: u8 = 0,
     errors: []const Issue = &.{},
 
@@ -174,6 +176,19 @@ pub fn recordFailure(entry: *Entry, a: A, job: *Job, now: i64, err: anyerror) !v
 
 pub fn delay(attempts: u8) i64 {
     return @as(i64, 30) << @min(attempts -| 1, 5);
+}
+
+pub fn validRepoName(name: []const u8) bool {
+    if (name.len > 150 or std.ascii.endsWithIgnoreCase(name, ".git")) return false;
+    var parts = std.mem.splitScalar(u8, name, '/');
+    for (0..2) |_| {
+        const part = parts.next() orelse return false;
+        if (part.len == 0 or eq(u8, part, ".") or eq(u8, part, "..")) return false;
+        for (part) |byte| {
+            if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_' and byte != '.') return false;
+        }
+    }
+    return parts.next() == null;
 }
 
 pub fn validOid(oid: []const u8) bool {

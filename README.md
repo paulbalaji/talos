@@ -30,10 +30,10 @@ zig build-exe src/main.zig -lc -O ReleaseSafe \
 install -m 755 zig-out/bin/talos "$HOME/.local/bin/talos"
 ```
 
-Put `$HOME/.local/bin` on your PATH and sign in with `gh auth login` and the applicable provider CLI. Register repositories using the GitHub `OWNER/REPO` name and a local full clone.
+Put `$HOME/.local/bin` on your PATH and sign in with `gh auth login` and the applicable provider CLI. Register repositories using the GitHub `OWNER/REPO` name. Talos fetches the source it needs directly from GitHub.
 
 ```sh
-talos add OWNER/REPO "$HOME/work/repo" --interval 180
+talos add OWNER/REPO --interval 180
 talos run-once OWNER/REPO 123
 talos install
 talos status
@@ -44,9 +44,9 @@ talos status
 ### Reviewer and publication settings
 
 ```sh
-talos add OWNER/REPO "$HOME/work/repo" --engine claude --model sonnet
-talos add OWNER/REPO "$HOME/work/repo" --engine kimi --model kimi-code/kimi-for-coding
-talos add OWNER/REPO "$HOME/work/repo" --comments --approvals
+talos add OWNER/REPO --engine claude --model sonnet
+talos add OWNER/REPO --engine kimi --model kimi-code/kimi-for-coding
+talos add OWNER/REPO --comments --approvals
 ```
 
 Use `--engine codex` or omit the option for Codex. Pass `--model` to select a model your login can access. Use `--git`, `--gh`, `--codex`, `--claude`, and `--kimi` to override paths. Talos resolves executables on PATH at registration and records the selected paths. Re-running `add` updates settings and keeps the baseline and queue. Supply the full set of settings you want to keep. Omitting publication options returns the repo to dry-run.
@@ -71,9 +71,22 @@ The state directory defaults to `~/.local/state/talos` and must be private. It c
 
 Use both `--home /absolute/private/path` and `--label dev.talos.test` to run a separate registration in launchd. Pass the same arguments to remove it. Removing the scheduler preserves state and results. To fully uninstall after removal, delete the installed binary and, if you no longer need its records, the Talos state directory.
 
+## Git cache
+
+Talos creates a private bare Git cache for each registered repository under `repos/OWNER/REPO/objects.git` in its state directory. It fetches commit and tree history first, then fetches file contents on demand. Talos can run on a machine with no existing checkout. On upgrade from v0, it discards old Talos caches that borrowed local Git objects. Existing registrations, queues, publication records, and result files carry forward. Scripts that still pass the v0 checkout argument continue to work.
+
+Talos checks for eviction after source collection and hourly while the scheduler runs. The defaults retain up to 128 MiB of cache files per repo and expire the cache after seven idle days. Eviction deletes the bare cache, and the next review rebuilds it. A fetch in progress can temporarily exceed the retention limit. `status` reports the sum of cache file sizes in bytes.
+
+```sh
+talos add OWNER/REPO --cache-mib 256 --cache-idle-days 14
+talos add OWNER/REPO --cache-mib 0
+```
+
+Use zero MiB to discard the cache after each review snapshot. When updating a registration, include the reviewer and publication settings you want to keep.
+
 ## Review boundaries
 
-Talos fetches verified head and base commits into its own bare object cache under dedicated refs. It borrows existing objects from the configured checkout. Talos computes the merge base without moving the checkout's branch or writing any tracked files. It builds bounded source context and passes both open and resolved threads with their replies as untrusted evidence. Reviewers run in an empty temporary working directory with execution tools disabled. Codex additionally runs in its read-only sandbox. Kimi Code CLI uses its configured provider profile and may save CLI sessions. Only use trusted local settings and providers approved to receive the repository's source and review discussion.
+Talos fetches and verifies the head and base in dedicated refs for the current review, then calculates their merge base. It builds bounded source context and passes both open and resolved threads with their replies as untrusted evidence. Reviewers run in an empty temporary working directory with execution tools disabled. Codex additionally runs in its read-only sandbox. Kimi Code CLI uses its configured provider profile and may save CLI sessions. Only use trusted local settings and providers approved to receive the repository's source and review discussion.
 
 Talos validates the structured result and checks each inline anchor against GitHub's diff. It refreshes threads and the head and base before sending any review, then reads the review back. The GitHub API binds the review to the head commit. The base check happens immediately before submission because the API has no expected-base field. Source context excludes common credential-file paths. A partial snapshot cannot produce an automatic approval.
 
