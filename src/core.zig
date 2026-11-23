@@ -258,6 +258,20 @@ pub const Job = struct {
         return (self.phase == .pending or self.phase == .uncertain) and self.attempts < max_attempts;
     }
 
+    pub fn legacyDiscussionChanged(self: Job, login: []const u8, discussion: Discussion, reviews: []const Prior) bool {
+        const receipt_id = self.receipt orelse return false;
+        var baseline: []const u8 = "";
+        for (reviews) |review| {
+            if (!eq(u8, review.commit_id, self.head)) continue;
+            const own_approval = eq(u8, review.state, "APPROVED") and
+                if (review.user) |user| std.ascii.eqlIgnoreCase(user.login, login) else false;
+            if (review.id != receipt_id and !own_approval) continue;
+            const timestamp = review.submitted_at orelse continue;
+            if (std.mem.order(u8, timestamp, baseline) == .gt) baseline = timestamp;
+        }
+        return baseline.len > 0 and discussion.changedAfter(login, baseline);
+    }
+
     pub fn observeReviewInput(self: *Job, current: ReviewInput, legacy_changed: bool) void {
         if (self.phase != .complete) return;
         const discussion_or_diff = if (self.review_input) |old| !old.same(current) else legacy_changed;

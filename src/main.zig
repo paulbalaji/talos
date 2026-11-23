@@ -565,14 +565,8 @@ const Main = struct {
         else
             try client.mergeBase(pull.baseRefOid, pull.headRefOid);
         const current = try core.ReviewInput.init(self.a, repo, target, merge_base, discussion);
-        var legacy_changed = false;
-        if (saved == null) {
-            if (job.receipt) |id| {
-                const prior = try client.readReview(pull.number, id);
-                if (prior.id != id or !eq(u8, prior.commit_id, pull.headRefOid)) return error.ReviewReadbackMismatch;
-                if (prior.submitted_at) |timestamp| legacy_changed = discussion.changedAfter(repo.login, timestamp);
-            }
-        }
+        const legacy_changed = saved == null and job.receipt != null and
+            job.legacyDiscussionChanged(repo.login, discussion, try client.reviews(pull.number));
         job.observeReviewInput(current, legacy_changed);
     }
 

@@ -203,6 +203,14 @@ test "effective diff changes and human conversation comments trigger review" {
     try t.expect(discussion.changedAfter(repo.login, "2026-11-23T14:30:00Z"));
     try t.expect(!discussion.changedAfter(repo.login, "2026-11-23T15:30:00Z"));
     try t.expect(!(core.Discussion{ .comments = &.{own} }).changedAfter(repo.login, "2026-11-23T14:30:00Z"));
+
+    const job: core.Job = .{ .number = fixture_pull.number, .head = head, .receipt = 55, .phase = .complete };
+    const earlier = core.Prior{ .id = 55, .commit_id = head, .state = "COMMENTED", .user = .{ .login = repo.login }, .body = "", .submitted_at = "2026-11-23T14:30:00Z" };
+    var manual = core.Prior{ .id = 56, .commit_id = head, .state = "APPROVED", .user = .{ .login = repo.login }, .body = "", .submitted_at = "2026-11-23T15:30:00Z" };
+    try t.expect(job.legacyDiscussionChanged(repo.login, discussion, &.{earlier}));
+    try t.expect(!job.legacyDiscussionChanged(repo.login, discussion, &.{ earlier, manual }));
+    manual.commit_id = changed;
+    try t.expect(job.legacyDiscussionChanged(repo.login, discussion, &.{ earlier, manual }));
 }
 
 test "an otherwise clean same-head review can approve once checks pass" {
