@@ -10,6 +10,9 @@ const launchd = @import("launchd.zig");
 const io = @import("io.zig");
 const repo_config = @import("repo_config.zig");
 const queue = @import("queue.zig");
+const routing = @import("routing.zig");
+const adaptive = @import("adaptive.zig");
+const usage_meter = @import("usage.zig");
 
 const eq = io.eq;
 const A = io.A;
@@ -21,6 +24,7 @@ const usage =
     \\talos [--home DIR] status [OWNER/REPO] [--json]
     \\talos [--home DIR] result OWNER/REPO PR
     \\talos [--home DIR] queue-budget [STARTS]
+    \\talos [--home DIR] usage [ENGINE DAILY_STARTS]
     \\talos [--home DIR] queue OWNER/REPO PR [--mode MODE] [--prompt TEXT [--publish]]
     \\talos [--home DIR] stack OWNER/REPO STACK_NUMBER
     \\talos [--home DIR] stack OWNER/REPO NAME PR PR [PR ...]
@@ -42,6 +46,9 @@ const usage =
     \\  --reviewer-model ENGINE=MODEL        Override a specific reviewer's model, repeatable
     \\  --reviewer-effort ENGINE=LEVEL       Override high effort, or use default for CLI settings
     \\  --claude-advisor fable|off           Default fable
+    \\  --routing fixed|shadow|adaptive     Default fixed
+    \\  --fallback ENGINE[,ENGINE...]|off   Ordered, authorized replacement providers
+    \\  --light-model ENGINE=MODEL|off      Lightweight screening model, repeatable
     \\  --git PATH --gh PATH --codex PATH --claude PATH --kimi PATH
     \\  --comments                           Publish comment reviews
     \\  --approvals                          Publish clean approvals
@@ -67,6 +74,7 @@ const Local = struct {
     scratch_dir: std.fs.Dir,
     programs: Programs,
     counts: ?*queue.TickCounts = null,
+    meter: ?*usage_meter.Ledger = null,
 
     fn command(self: Local, env: *const std.process.EnvMap) io.Command {
         return .{ .a = self.a, .env = env, .cwd = self.scratch, .dir = self.scratch_dir };
@@ -267,14 +275,19 @@ const Adapter = struct {
 };
 
 fn runReviewer(tools: Local, repo: core.Repo, engine: core.Engine, prompt: []const u8) ![]const u8 {
+    return invokeReviewer(tools, engine, reviewerProfile(repo, engine), core.schema, prompt);
+}
+
+fn invokeReviewer(tools: Local, engine: core.Engine, profile: runner.Profile, schema: []const u8, prompt: []const u8) ![]const u8 {
     const bin = try tools.bin(reviewerTool(engine));
-    const profile = reviewerProfile(repo, engine);
     const env = try tools.reviewerEnv(engine, bin, profile);
     const reviewer: runner.Runner = .{
         .cmd = tools.command(&env),
         .bin = bin,
         .engine = engine,
         .profile = profile,
+        .schema = schema,
+        .meter = tools.meter,
         .starts = if (tools.counts) |counts| &counts.reviewer_starts else null,
     };
     return reviewer.review(prompt);
@@ -283,12 +296,17 @@ fn runReviewer(tools: Local, repo: core.Repo, engine: core.Engine, prompt: []con
 const ReviewBatch = struct {
     starts_left: u32,
     receipts_left: u32,
+    meter: ?*usage_meter.Ledger = null,
     deferred_repo: ?usize = null,
     workers: [queue.parallel_jobs]*ReviewWorker = undefined,
     len: usize = 0,
     pending: usize = 0,
     completed: std.Thread.Semaphore = .{},
     limited: std.atomic.Value(u8) = .init(0),
+
+    fn usageSnapshot(self: *const ReviewBatch) usage_meter.Snapshot {
+        return if (self.meter) |meter| meter.snapshot() else .{};
+    }
 
     fn deinit(self: *ReviewBatch) void {
         for (self.workers[0..self.len]) |work| {
@@ -316,6 +334,42 @@ const ReviewWorker = struct {
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = .init(false),
     result: anyerror!core.ReviewResults = undefined,
+    plan: ?adaptive.Plan = null,
+    route_outcome: ?adaptive.Outcome = null,
+    policy: queue.Budget = .{},
+    rate_limits: u8 = 0,
+
+    pub fn available(self: *ReviewWorker, engine: core.Engine) bool {
+        const now = std.time.timestamp();
+        const at = self.policy.engineAt(engine, now, self.batch.limited.load(.monotonic), self.batch.usageSnapshot()) orelse return false;
+        return at <= now;
+    }
+
+    pub fn starts(self: *const ReviewWorker) u32 {
+        return self.counts.reviewer_starts;
+    }
+
+    pub fn routeReview(self: *ReviewWorker, engine: core.Engine, model: ?[]const u8, schema: []const u8, prompt: []const u8) ![]const u8 {
+        const profile = if (model) |light|
+            runner.Profile{ .model = light, .effort = .default }
+        else
+            reviewerProfile(self.adapter.repo, engine);
+        return invokeReviewer(self.tools, engine, profile, schema, prompt) catch |err| {
+            self.noteRateLimit(engine, err);
+            return err;
+        };
+    }
+
+    fn noteRateLimit(self: *ReviewWorker, engine: core.Engine, err: anyerror) void {
+        switch (err) {
+            error.CodexRateLimited, error.ClaudeRateLimited, error.KimiRateLimited => {
+                const bit = queue.engineBit(engine);
+                self.rate_limits |= bit;
+                _ = self.batch.limited.fetchOr(bit, .monotonic);
+            },
+            else => {},
+        }
+    }
 
     fn remainingLimited(engines: []const core.Engine, current: core.Engine, limited: u8) bool {
         const offset = std.mem.indexOfScalar(core.Engine, engines, current).?;
@@ -329,10 +383,7 @@ const ReviewWorker = struct {
         if (remainingLimited(self.prepared.engines, engine, self.batch.limited.load(.monotonic)))
             return error.ReviewerCoolingDown;
         return runReviewer(self.tools, self.adapter.repo, engine, prompt) catch |err| {
-            switch (err) {
-                error.CodexRateLimited, error.ClaudeRateLimited, error.KimiRateLimited => _ = self.batch.limited.fetchOr(queue.engineBit(engine), .monotonic),
-                else => {},
-            }
+            self.noteRateLimit(engine, err);
             return err;
         };
     }
@@ -356,7 +407,12 @@ const ReviewWorker = struct {
             .scratch_dir = dir,
             .programs = self.adapter.tools.programs,
             .counts = &self.counts,
+            .meter = self.batch.meter,
         };
+        if (self.plan) |plan| {
+            self.route_outcome = try adaptive.run(a, self, plan);
+            return undefined;
+        }
         return core.analyze(a, self, self.prepared.engines, self.prepared.context);
     }
 };
@@ -370,13 +426,14 @@ const Main = struct {
     scratch_dir: std.fs.Dir,
     output: std.fs.File = std.fs.File.stdout(),
     counts: ?*queue.TickCounts = null,
+    meter: ?*usage_meter.Ledger = null,
 
     fn out(self: Main, comptime pattern: []const u8, args: anytype) !void {
         return io.print(self.output, pattern, args);
     }
 
     fn local(self: Main, entry: ?core.Repo) Local {
-        return .{ .a = self.a, .env = self.env, .scratch = self.scratch, .scratch_dir = self.scratch_dir, .programs = Programs.fromRepo(entry), .counts = self.counts };
+        return .{ .a = self.a, .env = self.env, .scratch = self.scratch, .scratch_dir = self.scratch_dir, .programs = Programs.fromRepo(entry), .counts = self.counts, .meter = self.meter };
     }
 
     fn objectCache(self: Main, repo: core.Repo) cache.Cache {
@@ -395,7 +452,7 @@ const Main = struct {
         tools.programs = programs;
         repo.git = try tools.bin(.git);
         repo.gh = try tools.bin(.gh);
-        for (try repo.engines(self.a)) |engine| {
+        for (try repo.providers(self.a)) |engine| {
             const tool = reviewerTool(engine);
             const bin = try tools.bin(tool);
             switch (tool) {
@@ -411,6 +468,12 @@ const Main = struct {
         repo.login = try client.identity();
         if (state.find(name)) |entry| {
             if (!std.ascii.eqlIgnoreCase(entry.repo.login, repo.login)) return error.GitHubIdentityChanged;
+            if (!eq(u8, try io.json(self.a, entry.repo), try io.json(self.a, repo))) {
+                for (entry.jobs) |*job| {
+                    job.route_progress = null;
+                    job.analysis = null;
+                }
+            }
             entry.repo = repo;
             entry.next_scan = 0;
             entry.next_cache_check = 0;
@@ -534,7 +597,7 @@ const Main = struct {
 
     fn reviewBatch(self: Main, state: *store.State, counts: *queue.TickCounts) !void {
         const limit = state.queue_budget.limit;
-        var batch: ReviewBatch = .{ .starts_left = limit, .receipts_left = limit };
+        var batch: ReviewBatch = .{ .starts_left = limit, .receipts_left = limit, .meter = self.meter };
         defer batch.deinit();
 
         var repos: [queue.active_repos]queue.RepoJobs = undefined;
@@ -567,10 +630,10 @@ const Main = struct {
             work.thread = null;
             batch.pending -= 1;
             counts.reviewer_starts += work.counts.reviewer_starts;
+            if (work.plan) |plan| batch.starts_left += plan.start_limit - work.counts.reviewer_starts;
             self.finishJob(state, work) catch |err| switch (err) {
-                error.ReviewerCoolingDown => {
-                    const reserved: u32 = @intCast(work.prepared.engines.len);
-                    batch.starts_left += reserved - work.counts.reviewer_starts;
+                error.ReviewerCoolingDown, error.ProviderBudgetReached => {
+                    if (work.plan == null) batch.starts_left += queue.reviewerCost(work.adapter.repo) - work.counts.reviewer_starts;
                 },
                 else => try self.jobFailed(state, work.adapter.entry, work.job, err),
             };
@@ -582,7 +645,8 @@ const Main = struct {
         try self.finishReady(state, counts, batch);
         const entry = &state.entries[lane.index];
         if (try self.db.paused(entry.repo.name)) return false;
-        const decision = state.queue_budget.pick(entry, std.time.timestamp(), batch.starts_left, batch.receipts_left, lane.selected(), batch.limited.load(.monotonic));
+        const allow_fresh_routed = retainedCount(state) + batch.pending < queue.parallel_jobs;
+        const decision = state.queue_budget.pick(entry, std.time.timestamp(), batch.starts_left, batch.receipts_left, lane.selected(), batch.limited.load(.monotonic), batch.usageSnapshot(), allow_fresh_routed);
         if (decision.budget_deferred or (!has_slot and decision.job != null)) batch.deferRepo(lane.index);
         const job = decision.job orelse return false;
         if (!has_slot) return false;
@@ -616,6 +680,7 @@ const Main = struct {
         if (job.analysis) |saved| {
             if (try saved.matches(self.a, entry.repo, work.prepared)) {
                 if (try self.db.paused(entry.repo.name)) return;
+                work.prepared.route_depth = saved.route_depth;
                 _ = try core.finish(self.a, &work.adapter, entry.repo, job, work.prepared, saved.results);
                 return;
             }
@@ -623,7 +688,36 @@ const Main = struct {
             // Persist the invalidation even if the provider holds this job.
             try self.db.save(state);
         }
-        if (!state.queue_budget.canReview(entry.repo, std.time.timestamp(), batch.limited.load(.monotonic))) return error.ReviewerCoolingDown;
+        work.policy = state.queue_budget;
+        if (entry.repo.usesRouting()) {
+            const fingerprint = try core.SavedAnalysis.key(self.a, entry.repo, work.prepared);
+            var progress: core.RouteProgress = .{ .fingerprint = fingerprint, .base = .fromPull(work.prepared.pr) };
+            if (job.route_progress) |saved| {
+                if (eq(u8, &saved.fingerprint, &fingerprint)) {
+                    progress = saved;
+                    progress.base = .fromPull(work.prepared.pr);
+                } else job.route_progress = null;
+            }
+            const automatically_routed = entry.repo.routing_mode != .fixed and work.prepared.options.allowRouting();
+            var screen: routing.Screen = if (automatically_routed)
+                routing.inspect(work.adapter.files, work.prepared.snap.limited)
+            else
+                .{ .floor = .{}, .ask_model = false };
+            if (automatically_routed and work.prepared.inherited.pins.len > 1) {
+                screen.floor = screen.floor.merge(.{ .depth = .focused, .reliability = true });
+                screen.ask_model = false;
+            }
+            work.plan = .{
+                .repo = entry.repo,
+                .providers = try entry.repo.providers(self.a),
+                .prepared = work.prepared,
+                .screen = screen,
+                .progress = progress,
+                .start_limit = queue.reviewerCost(entry.repo),
+            };
+        }
+        if (!state.queue_budget.canReview(entry.repo, job.route_progress, std.time.timestamp(), batch.limited.load(.monotonic), batch.usageSnapshot()))
+            return error.ReviewerCoolingDown;
         work.thread = try std.Thread.spawn(.{}, ReviewWorker.analyze, .{work});
         batch.pending += 1;
         batch.workers[batch.len] = work;
@@ -632,7 +726,33 @@ const Main = struct {
 
     fn finishJob(self: Main, state: *store.State, work: *ReviewWorker) !void {
         const results = try work.result;
-        const reviews = results[0..work.prepared.engines.len];
+        if (work.route_outcome) |outcome| {
+            for (std.meta.tags(core.Engine)) |engine| {
+                if (work.rate_limits & queue.engineBit(engine) != 0) {
+                    const err = switch (engine) {
+                        .codex => error.CodexRateLimited,
+                        .claude => error.ClaudeRateLimited,
+                        .kimi => error.KimiRateLimited,
+                    };
+                    state.queue_budget.noteFailure(std.time.timestamp(), err);
+                }
+            }
+            if (outcome.report) |report| {
+                work.prepared.route_depth = report.applied.depth;
+                work.job.route_report = report;
+                work.job.route_report.?.providers = try self.a.dupe(core.Engine, report.providers);
+                work.job.route_progress = null;
+                return self.finishReviews(state, work, outcome.progress.results);
+            }
+            work.job.route_progress = try io.parse(self.a, core.RouteProgress, try io.json(self.a, outcome.progress));
+            if (outcome.failure) |err| return err;
+            try self.db.save(state);
+            return;
+        }
+        return self.finishReviews(state, work, results[0..work.prepared.engines.len]);
+    }
+
+    fn finishReviews(self: Main, state: *store.State, work: *ReviewWorker, reviews: []const core.ReviewerResult) !void {
         if (try self.db.paused(work.adapter.repo.name)) return;
         if (!state.queue_budget.canScan(std.time.timestamp())) {
             try self.keepAnalysis(state, work, reviews);
@@ -646,13 +766,20 @@ const Main = struct {
         };
     }
 
-    fn keepAnalysis(self: Main, state: *store.State, work: *ReviewWorker, reviews: []const core.ReviewerResult) !void {
-        // Bound transient checkpoints to one full batch, even after repeated rate limits.
+    fn retainedCount(state: *const store.State) usize {
         var retained: usize = 0;
         for (state.entries) |entry| {
-            for (entry.jobs) |job| retained += @intFromBool(job.analysis != null);
+            for (entry.jobs) |job| {
+                const has_checkpoint = if (job.route_progress) |progress| !progress.needsAnotherProvider(entry.repo) else false;
+                retained += @intFromBool(job.analysis != null or has_checkpoint);
+            }
         }
-        if (retained >= queue.parallel_jobs) return;
+        return retained;
+    }
+
+    fn keepAnalysis(self: Main, state: *store.State, work: *ReviewWorker, reviews: []const core.ReviewerResult) !void {
+        // Bound transient checkpoints to one full batch, even after repeated rate limits.
+        if (retainedCount(state) >= queue.parallel_jobs) return;
         work.job.analysis = try core.SavedAnalysis.save(self.a, work.adapter.repo, work.prepared, reviews);
     }
 
@@ -662,7 +789,10 @@ const Main = struct {
         const now = std.time.timestamp();
         state.queue_budget.noteFailure(now, err);
         try core.recordFailure(entry, self.a, job, now, err);
-        if (!job.schedulable()) job.analysis = null;
+        if (!job.schedulable()) {
+            job.analysis = null;
+            job.route_progress = null;
+        }
         try self.db.save(state);
     }
 
@@ -703,7 +833,6 @@ const Main = struct {
 
     fn reviewOptions(args: []const []const u8, allow_publish: bool) !core.ReviewOptions {
         var options: core.ReviewOptions = .{};
-        var has_mode = false;
         var index: usize = 0;
         while (index < args.len) {
             const flag = args[index];
@@ -715,9 +844,9 @@ const Main = struct {
             if (index == args.len) return error.Usage;
             const value = args[index];
             index += 1;
-            if (eq(u8, flag, "--mode") and !has_mode) {
+            if (eq(u8, flag, "--mode") and !options.explicit_mode) {
                 options.focus = std.meta.stringToEnum(core.ReviewFocus, value) orelse return error.InvalidReviewMode;
-                has_mode = true;
+                options.explicit_mode = true;
             } else if (eq(u8, flag, "--prompt") and options.request == null) {
                 try core.validateReviewRequest(value);
                 options.request = value;
@@ -770,6 +899,7 @@ const Main = struct {
         if (state.entries.len == 0 and !json_output) try self.out("No repositories registered\n", .{});
         if (json_output) try self.out("[", .{});
         const now = std.time.timestamp();
+        const provider_usage = try usage_meter.load(self.a, self.db.dir, now);
         var first = true;
         for (state.entries) |entry| {
             if (repo != null and !std.ascii.eqlIgnoreCase(repo.?, entry.repo.name)) continue;
@@ -778,14 +908,23 @@ const Main = struct {
             const retained: ?u64 = if (measurement) |bytes| bytes else |_| null;
             const cache_error: ?[]const u8 = if (measurement) |_| null else |err| @errorName(err);
             const stacks = try stack.statuses(self.a, entry);
-            const next = if (paused) null else state.queue_budget.nextEligible(entry, now);
+            const next = if (paused) null else state.queue_budget.nextEligible(entry, now, provider_usage);
             if (json_output) {
                 var summary = entry;
                 // Show pins and scheduling separately without echoing stored PR text.
                 summary.stacks = &.{};
                 summary.jobs = try self.a.dupe(core.Job, entry.jobs);
+                const PendingRoute = struct { number: u32, head: []const u8, decision: ?routing.Decision, completed_passes: usize };
+                var pending: std.ArrayList(PendingRoute) = .empty;
                 for (summary.jobs) |*job| {
+                    if (job.route_progress) |progress| try pending.append(self.a, .{
+                        .number = job.number,
+                        .head = job.head,
+                        .decision = progress.decision,
+                        .completed_passes = progress.results.len,
+                    });
                     job.analysis = null;
+                    job.route_progress = null;
                     if (job.options.request != null) job.options.request = "(set)";
                 }
                 try self.out("{s}{s}", .{ if (first) "" else ",", try io.json(self.a, .{
@@ -795,6 +934,8 @@ const Main = struct {
                     .cache_bytes = retained,
                     .cache_error = cache_error,
                     .queue_budget = state.queue_budget,
+                    .provider_usage = provider_usage,
+                    .pending_routes = pending.items,
                     .next_eligible = next,
                 }) });
                 first = false;
@@ -804,6 +945,11 @@ const Main = struct {
                 entry.repo.name,     if (paused) "paused" else "active",       try engineNames(self.a, try entry.repo.engines(self.a)),
                 entry.repo.interval, if (entry.repo.comments) "on" else "off", if (entry.repo.approvals) "on" else "off",
             });
+            if (entry.repo.usesRouting()) {
+                try self.out("  Routing {s}  |  Providers {s}\n", .{
+                    @tagName(entry.repo.routing_mode), try engineNames(self.a, try entry.repo.providers(self.a)),
+                });
+            }
             if (next) |item| {
                 try self.out("  Next eligible PR #{d} at {s}  |  Reviewer slots {d}\n", .{
                     item.number, try formatTime(self.a, item.at), item.reviewer_starts,
@@ -825,6 +971,10 @@ const Main = struct {
                     job.number,                       job.head[0..@min(job.head.len, 10)], @tagName(job.phase), job.attempts,
                     try formatTime(self.a, job.next),
                 });
+                if (job.route_progress) |progress| {
+                    const depth = if (progress.decision) |decision| @tagName(decision.depth) else "screening";
+                    try self.out("    Route {s}, {d} completed independent passes\n", .{ depth, progress.results.len });
+                }
             }
             if (queued == 0) try self.out("  Queue empty\n", .{});
             var completed: usize = 0;
@@ -836,6 +986,9 @@ const Main = struct {
                 completed += 1;
                 try self.out("  #{d} {s} complete — {s}", .{
                     job.number, job.head[0..@min(job.head.len, 10)], job.outcome orelse "review finished",
+                });
+                if (job.route_report) |report| try self.out("  {s} via {s}", .{
+                    @tagName(report.applied.depth), try engineNames(self.a, report.providers),
                 });
                 if (job.receipt) |id| try self.out("  https://github.com/{s}/pull/{d}#pullrequestreview-{d}", .{
                     entry.repo.name, job.number, id,
@@ -864,6 +1017,19 @@ const Main = struct {
         if (json_output) try self.out("]\n", .{});
     }
 
+    fn showUsage(self: Main, state: *const store.State, current: usage_meter.Snapshot) !void {
+        const now = std.time.timestamp();
+        var data = current;
+        for (std.meta.tags(core.Engine)) |engine| {
+            const count = data.get(engine);
+            const cap = if (count.limit == 0) "unlimited" else try io.fmt(self.a, "{d}", .{count.limit});
+            const cooldown = state.queue_budget.providerRetry(engine);
+            try self.out("{s}  {d}/{s} starts today (UTC)  |  {d} tracked total  |  cooldown {s}\n", .{
+                @tagName(engine), count.starts, cap, count.total_starts, try formatTime(self.a, if (cooldown > now) cooldown else 0),
+            });
+        }
+    }
+
     fn dispatch(self: Main, args: []const []const u8) !void {
         const cmd = args[0];
         const params = args[1..];
@@ -877,6 +1043,10 @@ const Main = struct {
             const entry = state.find(params[0]) orelse return error.UnknownRepository;
             const candidate = try self.db.readResult(entry.repo.name, try prNumber(params[1]));
             return self.out("{s}\n", .{candidate});
+        }
+        if (eq(u8, cmd, "usage") and params.len == 0) {
+            const state = try self.db.load();
+            return self.showUsage(&state, try usage_meter.load(self.a, self.db.dir, std.time.timestamp()));
         }
         if (eq(u8, cmd, "defaults") and params.len == 0) {
             var state = try self.db.load();
@@ -908,8 +1078,22 @@ const Main = struct {
         if (eq(u8, cmd, "add")) return self.add(&state, params);
         if (eq(u8, cmd, "defaults")) return self.defaults(&state, params);
         if (eq(u8, cmd, "queue-budget")) return self.setQueueBudget(&state, params);
-        if (eq(u8, cmd, "tick") and params.len == 0) return self.tick(&state);
-        if (eq(u8, cmd, "run-once")) return self.dry(&state, params);
+        if (eq(u8, cmd, "usage") and params.len == 2) {
+            const engine = std.meta.stringToEnum(core.Engine, params[0]) orelse return error.UnknownReviewer;
+            var current = try usage_meter.load(self.a, self.db.dir, std.time.timestamp());
+            current.get(engine).limit = std.fmt.parseUnsigned(u32, params[1], 10) catch return error.InvalidProviderBudget;
+            try usage_meter.save(self.db.dir, current);
+            return self.showUsage(&state, current);
+        }
+        if ((eq(u8, cmd, "tick") and params.len == 0) or eq(u8, cmd, "run-once")) {
+            var metered = self;
+            var ledger: usage_meter.Ledger = .{
+                .dir = self.db.dir,
+                .data = try usage_meter.load(self.a, self.db.dir, std.time.timestamp()),
+            };
+            metered.meter = &ledger;
+            return if (eq(u8, cmd, "tick")) metered.tick(&state) else metered.dry(&state, params);
+        }
         if (eq(u8, cmd, "stack")) return self.registerStack(&state, params);
         if (eq(u8, cmd, "unstack") and params.len == 2) {
             const entry = state.find(params[0]) orelse return error.UnknownRepository;

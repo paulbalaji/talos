@@ -5,6 +5,7 @@ const codex = @import("reviewers/codex.zig");
 const claude = @import("reviewers/claude.zig");
 const kimi = @import("reviewers/kimi.zig");
 const shared = @import("reviewers/shared.zig");
+const usage = @import("usage.zig");
 pub const Profile = shared.Profile;
 
 fn adapter(comptime engine: core.Engine) type {
@@ -33,6 +34,8 @@ pub const Runner = struct {
     engine: core.Engine,
     profile: Profile,
     starts: ?*u32 = null,
+    meter: ?*usage.Ledger = null,
+    schema: []const u8 = core.schema,
 
     pub fn review(self: Runner, prompt: []const u8) ![]const u8 {
         if (self.profile.model) |model| try shared.requireStandardModel(model);
@@ -42,9 +45,10 @@ pub const Runner = struct {
         switch (self.engine) {
             inline else => |engine| {
                 const reviewer = adapter(engine);
-                const invocation = try reviewer.prepare(self.cmd, self.bin, self.profile, prompt);
+                const invocation = try reviewer.prepare(self.cmd, self.bin, self.profile, prompt, self.schema);
                 var cmd = self.cmd;
                 cmd.transport = @field(io.Transport, @tagName(engine));
+                if (self.meter) |meter| try meter.start(engine, std.time.timestamp());
                 if (self.starts) |count| count.* +|= 1;
                 const output = cmd.run(invocation.args, invocation.stdin, 900) catch |err| return switch (err) {
                     error.SubprocessTimeout => error.ReviewerTimedOut,
@@ -91,7 +95,7 @@ test "reviewer command profiles pin default models and preserve explicit overrid
         .{ .engine = .claude, .profile = .{ .model = "sonnet", .effort = .medium }, .expected_tail = &.{ "--model", "sonnet", "--effort", "medium" } },
     };
     inline for (cases) |case| {
-        const invocation = try adapter(case.engine).prepare(cmd, @tagName(case.engine), case.profile, "prompt");
+        const invocation = try adapter(case.engine).prepare(cmd, @tagName(case.engine), case.profile, "prompt", core.schema);
         try t.expectEqualStrings(case.stdin, invocation.stdin);
         try t.expect(invocation.args.len >= case.expected_tail.len);
         const tail = invocation.args[invocation.args.len - case.expected_tail.len ..];

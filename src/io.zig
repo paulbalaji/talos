@@ -191,6 +191,18 @@ pub const Transport = enum {
     }
 };
 
+// Only inspect the CLI's terminal envelope. A model response containing
+// the text "429" is still ordinary review data.
+pub fn claudeRateLimit(a: A, output: []const u8) bool {
+    const envelope = std.json.parseFromSlice(struct {
+        type: []const u8,
+        is_error: bool,
+        api_error_status: ?u16 = null,
+    }, a, output, .{ .ignore_unknown_fields = true }) catch return false;
+    defer envelope.deinit();
+    return eq(u8, envelope.value.type, "result") and envelope.value.is_error and envelope.value.api_error_status == 429;
+}
+
 pub const Command = struct {
     a: A,
     env: *const std.process.EnvMap,
@@ -280,6 +292,12 @@ pub const Command = struct {
                 const offset = size -| tail.len;
                 const count = stderr.preadAll(&tail, offset) catch 0;
                 if (transport.rateLimit(tail[0..count])) |err| return err;
+                if (transport == .claude and (stdout.getEndPos() catch 0) <= 256 * 1024) {
+                    try stdout.seekTo(0);
+                    const output = try stdout.readToEndAlloc(a, 256 * 1024);
+                    defer a.free(output);
+                    if (claudeRateLimit(a, output)) return error.ClaudeRateLimited;
+                }
             }
             return error.SubprocessFailed;
         }
@@ -299,4 +317,22 @@ test "transport rate limits use terminal diagnostics and preserve generic failur
     try t.expect(Transport.github.rateLimit("gh: Permission denied (HTTP 403)\n") == null);
     try t.expect(Transport.kimi.rateLimit("note: provider.rate_limit_error: 429\n") == null);
     try t.expect(Transport.codex.rateLimit("review output: unexpected status 429 Too Many Requests:\n") == null);
+}
+
+test "only a terminal Claude API error is a provider rate limit" {
+    const t = std.testing;
+    const limited = "{\"type\":\"result\",\"is_error\":true,\"api_error_status\":429}";
+    try t.expect(claudeRateLimit(t.allocator, limited));
+    try t.expect(!claudeRateLimit(t.allocator, "{\"type\":\"result\",\"is_error\":false,\"api_error_status\":429}"));
+    try t.expect(!claudeRateLimit(t.allocator, "{\"type\":\"result\",\"is_error\":true,\"result\":\"HTTP 429\"}"));
+
+    var scratch = t.tmpDir(.{});
+    defer scratch.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = try a.dupeZ(u8, try scratch.dir.realpathAlloc(a, "."));
+    const env = std.process.EnvMap.init(a);
+    const command: Command = .{ .a = a, .env = &env, .cwd = cwd, .dir = scratch.dir, .transport = .claude };
+    try t.expectError(error.ClaudeRateLimited, command.run(&.{ "/bin/sh", "-c", "/bin/cat; exit 1" }, limited, 2));
 }

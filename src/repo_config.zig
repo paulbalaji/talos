@@ -1,5 +1,6 @@
 const std = @import("std");
 const core = @import("core.zig");
+const routing = @import("routing.zig");
 const reviewer_profile = @import("reviewers/shared.zig");
 const A = std.mem.Allocator;
 const eq = std.mem.eql;
@@ -33,6 +34,13 @@ pub fn parse(a: A, name: []const u8, previous: ?core.Repo, default_engines: []co
     var engines = if (previous) |old| try old.engines(a) else default_engines;
     var new_engines = false;
     var models = std.EnumArray(core.Engine, ?[]const u8).initFill(null);
+    var light = std.EnumArray(core.Engine, ?[]const u8).initFill(null);
+    var explicit_light: std.EnumSet(core.Engine) = .initEmpty();
+    if (previous) |old| {
+        repo.routing_mode = old.routing_mode;
+        repo.fallback_engines = old.fallback_engines;
+        for (old.light_models) |model| light.set(model.engine, model.model);
+    }
     var options = args;
     // Preserve the v0 command line without opening the old checkout.
     if (options.len != 0 and !std.mem.startsWith(u8, options[0], "--")) options = options[1..];
@@ -64,6 +72,15 @@ pub fn parse(a: A, name: []const u8, previous: ?core.Repo, default_engines: []co
                 const split = std.mem.indexOfScalar(u8, value, '=') orelse return error.InvalidModel;
                 const engine = std.meta.stringToEnum(core.Engine, value[0..split]) orelse return error.UnknownReviewer;
                 models.set(engine, try modelName(value[split + 1 ..]));
+            } else if (eq(u8, opt, "--routing")) {
+                repo.routing_mode = std.meta.stringToEnum(routing.Mode, value) orelse return error.InvalidRoutingMode;
+            } else if (eq(u8, opt, "--fallback")) {
+                repo.fallback_engines = if (eq(u8, value, "off")) &.{} else try parseEngines(a, value);
+            } else if (eq(u8, opt, "--light-model")) {
+                const split = std.mem.indexOfScalar(u8, value, '=') orelse return error.InvalidModel;
+                const engine = std.meta.stringToEnum(core.Engine, value[0..split]) orelse return error.UnknownReviewer;
+                explicit_light.insert(engine);
+                light.set(engine, if (eq(u8, value[split + 1 ..], "off")) null else try modelName(value[split + 1 ..]));
             } else if (eq(u8, opt, "--reviewer-effort")) {
                 const split = std.mem.indexOfScalar(u8, value, '=') orelse return error.InvalidReviewerEffort;
                 const engine = std.meta.stringToEnum(core.Engine, value[0..split]) orelse return error.UnknownReviewer;
@@ -85,9 +102,23 @@ pub fn parse(a: A, name: []const u8, previous: ?core.Repo, default_engines: []co
     try core.validateEngines(engines);
     repo.engine = engines[0];
     repo.additional_engines = engines[1..];
+    const pool = try repo.providers(a);
+    try core.validateEngines(pool);
+    var lightweight: std.ArrayList(core.ReviewerModel) = .empty;
+    var light_options = light.iterator();
+    while (light_options.next()) |option| {
+        if (option.value.*) |model| {
+            if (std.mem.indexOfScalar(core.Engine, pool, option.key) == null) {
+                if (explicit_light.contains(option.key)) return error.ReviewerModelForUnselectedEngine;
+                continue;
+            }
+            try lightweight.append(a, .{ .engine = option.key, .model = model });
+        }
+    }
+    repo.light_models = lightweight.items;
     var model_options = models.iterator();
     while (model_options.next()) |option| {
-        if (option.value.* != null and std.mem.indexOfScalar(core.Engine, engines, option.key) == null)
+        if (option.value.* != null and std.mem.indexOfScalar(core.Engine, pool, option.key) == null)
             return error.ReviewerModelForUnselectedEngine;
     }
     const retained = if (new_engines) null else previous;
@@ -97,7 +128,7 @@ pub fn parse(a: A, name: []const u8, previous: ?core.Repo, default_engines: []co
         if (retained) |old| repo.model = old.modelFor(repo.engine);
     }
     var additional_models: std.ArrayList(core.ReviewerModel) = .empty;
-    for (repo.additional_engines) |engine| {
+    for (pool[1..]) |engine| {
         const model = models.get(engine) orelse if (retained) |old| old.modelFor(engine) else null;
         if (model) |value| try additional_models.append(a, .{ .engine = engine, .model = value });
     }
@@ -167,4 +198,21 @@ test "registration options preserve overrides and reset publication unless selec
     try t.expectError(error.PremiumSpeedModelDisabled, parse(a, saved.name, saved, &.{.kimi}, &.{
         "--engine", "kimi", "--reviewer-model", "kimi=kimi-code/kimi-for-coding-highspeed",
     }));
+}
+
+test "adaptive settings resolve the explicit provider pool and retain model overrides" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const first = try parse(a, "example/repo", null, &.{.codex}, &.{
+        "--routing", "adaptive", "--fallback", "claude,kimi", "--light-model", "claude=haiku", "--reviewer-model", "kimi=custom",
+    });
+    try std.testing.expectEqualSlices(core.Engine, &.{ .codex, .claude, .kimi }, try first.repo.providers(a));
+    const retained = try parse(a, "example/repo", first.repo, &.{.codex}, &.{"--comments"});
+    try std.testing.expectEqual(routing.Mode.adaptive, retained.repo.routing_mode);
+    try std.testing.expectEqualStrings("haiku", retained.repo.lightModel(.claude).?);
+    try std.testing.expectEqualStrings("custom", retained.repo.modelFor(.kimi).?);
+    const removed = try parse(a, "example/repo", first.repo, &.{.codex}, &.{ "--routing", "fixed", "--fallback", "off" });
+    try std.testing.expectEqual(@as(usize, 0), removed.repo.light_models.len);
+    try std.testing.expectError(error.ReviewerModelForUnselectedEngine, parse(a, "example/repo", null, &.{.codex}, &.{ "--light-model", "claude=haiku" }));
 }

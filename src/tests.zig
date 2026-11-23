@@ -38,7 +38,7 @@ const Fake = struct {
     fail_engine: ?core.Engine = null,
     lose_response: bool = false,
     lose_readback: bool = false,
-    move_during_review: enum { none, head, base } = .none,
+    move_during_review: enum { none, head, base, base_ref } = .none,
     inherited: stack.Context = .{},
     move_ancestor_during_review: bool = false,
     join_native_before_post: bool = false,
@@ -97,6 +97,7 @@ const Fake = struct {
             .none => {},
             .head => self.target.headRefOid = changed,
             .base => self.target.baseRefOid = changed,
+            .base_ref => self.target.baseRefName = "release",
         }
         if (engine == self.fail_engine) return error.ClaudeFailed;
         const extra = self.reviews_run -| 2;
@@ -320,7 +321,7 @@ test "head and base changes during analysis prevent any publication" {
     var allocator = std.heap.ArenaAllocator.init(t.allocator);
     defer allocator.deinit();
     const a = allocator.allocator();
-    for ([_]@FieldType(Fake, "move_during_review"){ .head, .base }) |move| {
+    for ([_]@FieldType(Fake, "move_during_review"){ .head, .base, .base_ref }) |move| {
         var fake: Fake = .{ .a = a, .move_during_review = move };
         var work: core.Job = .{ .number = fixture_pull.number, .head = head };
         try t.expectError(error.TargetChanged, core.run(a, &fake, repo, &work, .scheduled));
@@ -668,4 +669,19 @@ test "non-blocking thread assessments need a reason and unique IDs" {
     try t.expectError(error.InvalidReview, core.parseReview(a,
         \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":[],"non_blocking_threads":[{"id":"thread-1","reason":"A"},{"id":"thread-1","reason":"B"}]}
     ));
+}
+
+test "a clean lightweight result publishes a comment under an approval policy" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var configured = repo;
+    configured.approvals = true;
+    var fake: Fake = .{ .a = a, .result = clean };
+    var job: core.Job = .{ .number = fixture_pull.number, .head = head };
+    var prepared = (try core.prepare(a, &fake, configured, &job, .scheduled)).?;
+    prepared.route_depth = .light;
+    const candidate = core.ReviewerResult{ .engine = .codex, .review = try core.parseReview(a, clean) };
+    _ = (try core.finish(a, &fake, configured, &job, prepared, &.{candidate})).?;
+    try t.expectEqual(core.Event.COMMENT, fake.posted_result.?.event);
 }
