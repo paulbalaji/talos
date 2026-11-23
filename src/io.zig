@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @cImport({
     @cInclude("unistd.h");
     @cInclude("stdlib.h");
@@ -11,6 +12,49 @@ pub const A = std.mem.Allocator;
 pub const eq = std.mem.eql;
 pub const trim = std.mem.trim;
 const output_limit = 32 * 1024 * 1024;
+const output_check_ns = 50 * std.time.ns_per_ms;
+
+// Wake on child exit while still checking output growth and the deadline
+// on a timer. Kernels without exit notification use the regular poll loop.
+const ExitWatch = struct {
+    fd: std.posix.fd_t,
+
+    fn open(pid: c_int) ?ExitWatch {
+        switch (builtin.os.tag) {
+            .macos => {
+                const fd = std.posix.kqueue() catch return null;
+                const event: std.posix.Kevent = .{
+                    .ident = @intCast(pid),
+                    .filter = std.c.EVFILT.PROC,
+                    .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
+                    .fflags = std.c.NOTE.EXIT,
+                    .data = 0,
+                    .udata = 0,
+                };
+                _ = std.posix.kevent(fd, &.{event}, &.{}, null) catch {
+                    std.posix.close(fd);
+                    return null;
+                };
+                return .{ .fd = fd };
+            },
+            .linux => {
+                const result = std.os.linux.pidfd_open(pid, 0);
+                if (std.os.linux.E.init(result) != .SUCCESS) return null;
+                return .{ .fd = @intCast(result) };
+            },
+            else => return null,
+        }
+    }
+
+    fn wait(self: ExitWatch, ns: u64) void {
+        // Both kqueue descriptors and pidfds are readable when the child exits.
+        var fds = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ms = (ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
+        _ = std.posix.poll(&fds, @intCast(ms)) catch {
+            std.Thread.sleep(ns);
+        };
+    }
+};
 
 pub fn fmt(a: A, comptime pattern: []const u8, args: anytype) ![]const u8 {
     return std.fmt.allocPrint(a, pattern, args);
@@ -107,13 +151,17 @@ pub const Command = struct {
         const pid = c.fork();
         if (pid < 0) return error.SpawnFailed;
         if (pid == 0) {
-            if (c.setpgid(0, 0) != 0 or c.chdir(self.cwd) != 0 or
+            // The parent can establish this group first. On macOS the
+            // child's redundant setpgid can then return EPERM.
+            if ((c.setpgid(0, 0) != 0 and c.getpgrp() != c.getpid()) or c.chdir(self.cwd) != 0 or
                 c.dup2(stdin.handle, 0) < 0 or c.dup2(stdout.handle, 1) < 0 or
                 c.dup2(stderr.handle, 2) < 0) c._exit(126);
             _ = c.execve(argv[0].?, @ptrCast(argv.ptr), @ptrCast(envp.ptr));
             c._exit(127);
         }
         _ = c.setpgid(pid, pid);
+        const watch = ExitWatch.open(pid);
+        defer if (watch) |event| std.posix.close(event.fd);
         var status: c_int = 0;
         var reaped = false;
         defer {
@@ -123,6 +171,7 @@ pub const Command = struct {
                 while (c.waitpid(pid, &status, 0) < 0 and std.posix.errno(-1) == .INTR) {}
             }
         }
+        const deadline = @as(u64, seconds) * std.time.ns_per_s;
         while (true) {
             const result = c.waitpid(pid, &status, c.WNOHANG);
             if (result == pid) {
@@ -130,10 +179,12 @@ pub const Command = struct {
                 break;
             }
             if (result < 0 and std.posix.errno(-1) != .INTR) return error.WaitFailed;
-            if (timer.read() >= @as(u64, seconds) * std.time.ns_per_s) return error.SubprocessTimeout;
+            const elapsed = timer.read();
+            if (elapsed >= deadline) return error.SubprocessTimeout;
             if (try stdout.getEndPos() > output_limit or try stderr.getEndPos() > output_limit)
                 return error.SubprocessOutputLimit;
-            std.Thread.sleep(50 * std.time.ns_per_ms);
+            const duration = @min(output_check_ns, deadline - elapsed);
+            if (watch) |event| event.wait(duration) else std.Thread.sleep(duration);
         }
         // The wrappers identify the failed step. Child diagnostics can contain credentials or PR text.
         if (status != 0) return error.SubprocessFailed;

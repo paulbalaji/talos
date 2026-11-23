@@ -137,7 +137,7 @@ test "publishes one commit-bound comment, verifies it, and deduplicates a second
     const a = allocator.allocator();
     var fake: Fake = .{ .a = a };
     var work: core.Job = .{ .number = fixture_pull.number, .head = head };
-    _ = try core.run(a, &fake, repo, &work, false);
+    _ = try core.run(a, &fake, repo, &work, .scheduled);
     try t.expectEqual(.complete, work.phase);
     try t.expectEqual(@as(?u64, 55), work.receipt);
     try t.expectEqual(@as(usize, 1), fake.posts);
@@ -148,7 +148,7 @@ test "publishes one commit-bound comment, verifies it, and deduplicates a second
     try t.expectEqual(@as(u32, 20), payload.comments[0].line);
 
     work = .{ .number = fixture_pull.number, .head = head };
-    try t.expectEqual(@as(?core.Payload, null), try core.run(a, &fake, repo, &work, false));
+    try t.expectEqual(@as(?core.Payload, null), try core.run(a, &fake, repo, &work, .scheduled));
     try t.expectEqual(@as(usize, 1), fake.posts);
     try t.expectEqual(@as(usize, 1), fake.reviews_run);
 }
@@ -162,13 +162,13 @@ test "dry runs never post and comments and approvals are independent" {
     permissions.comments = false;
     permissions.approvals = true;
     var work: core.Job = .{ .number = fixture_pull.number, .head = head };
-    _ = try core.run(a, &fake, repo, &work, true);
+    _ = try core.run(a, &fake, repo, &work, .{ .preview = null });
     try t.expectEqual(.pending, work.phase);
-    _ = try core.run(a, &fake, permissions, &work, false);
+    _ = try core.run(a, &fake, permissions, &work, .scheduled);
     try t.expectEqual(@as(usize, 0), fake.posts);
     work = .{ .number = fixture_pull.number, .head = head };
     fake.result = clean;
-    _ = try core.run(a, &fake, permissions, &work, false);
+    _ = try core.run(a, &fake, permissions, &work, .scheduled);
     try t.expectEqual(core.Event.APPROVE, fake.posted_result.?.event);
 }
 
@@ -179,7 +179,7 @@ test "head and base changes during analysis prevent any publication" {
     for ([_]@FieldType(Fake, "move_during_review"){ .head, .base }) |move| {
         var fake: Fake = .{ .a = a, .move_during_review = move };
         var work: core.Job = .{ .number = fixture_pull.number, .head = head };
-        try t.expectError(error.TargetChanged, core.run(a, &fake, repo, &work, false));
+        try t.expectError(error.TargetChanged, core.run(a, &fake, repo, &work, .scheduled));
         try t.expectEqual(@as(usize, 0), fake.posts);
         try t.expectEqual(.pending, work.phase);
     }
@@ -207,7 +207,7 @@ test "restart reconciles an ambiguous post or failed readback without sending a 
             .lose_readback = !lose_response,
         };
         const err = if (lose_response) error.GitHubPostUnconfirmed else error.GitHubReadbackFailed;
-        try t.expectError(err, core.run(a, &remote, repo, &state.entries[0].jobs[0], false));
+        try t.expectError(err, core.run(a, &remote, repo, &state.entries[0].jobs[0], .scheduled));
 
         var restart = try db.load();
         remote.state = &restart;
@@ -216,7 +216,7 @@ test "restart reconciles an ambiguous post or failed readback without sending a 
         const job = &restart.entries[0].jobs[0];
         try t.expectEqual(.uncertain, job.phase);
         try t.expectEqual(if (lose_response) @as(?u64, null) else 55, job.receipt);
-        _ = try core.run(a, &remote, repo, job, false);
+        _ = try core.run(a, &remote, repo, job, .scheduled);
         try t.expectEqual(@as(usize, 1), remote.posts);
         try t.expectEqual(.complete, (try db.load()).entries[0].jobs[0].phase);
     }
@@ -234,7 +234,7 @@ test "no visible receipt leaves the intent uncertain and backs off" {
     job.event = .COMMENT;
     for (0..6) |attempt| {
         const now: i64 = @intCast(attempt * 1000);
-        try t.expectError(error.PublicationUnconfirmed, core.run(a, &fake, repo, job, false));
+        try t.expectError(error.PublicationUnconfirmed, core.run(a, &fake, repo, job, .scheduled));
         try core.recordFailure(&entry, a, job, now, error.PublicationUnconfirmed);
         try t.expect(entry.due(now) == null);
     }
@@ -282,7 +282,7 @@ test "Hyperlane PR 10122 resolved reorg acceptance reaches the model without res
         ,
     };
     var work: core.Job = .{ .number = fixture.number, .head = head };
-    const payload = (try core.run(a, &fake, fixture_repo, &work, true)).?;
+    const payload = (try core.run(a, &fake, fixture_repo, &work, .{ .preview = null })).?;
     try t.expect(std.mem.indexOf(u8, fake.prompt_text, "The polling tradeoff is intentional and accepted.") != null);
     try t.expect(std.mem.indexOf(u8, fake.prompt_text, "\"isResolved\":true") != null);
     try t.expect(std.mem.indexOf(u8, payload.body, "open-different-finding") != null);
@@ -328,6 +328,7 @@ test "subprocesses return bounded output and time out" {
     var env = std.process.EnvMap.init(a);
     const command: io.Command = .{ .a = a, .env = &env, .cwd = path, .dir = dir };
     try t.expectEqualStrings("prompt", try command.run(&.{"/bin/cat"}, "prompt", 2));
+    _ = try command.run(&.{ "/bin/sh", "-c", "test \"$$\" -eq \"$(/bin/ps -o pgid= -p \"$$\")\"" }, "", 2);
     try t.expectError(error.SubprocessTimeout, command.run(&.{ "/bin/sleep", "5" }, "", 1));
 }
 

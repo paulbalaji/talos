@@ -403,23 +403,34 @@ fn completeJob(a: A, adapter: anytype, repo: Repo, job: *Job, review: Prior) !vo
     try adapter.persist();
 }
 
+pub const RunMode = union(enum) {
+    scheduled,
+    preview: ?Pull,
+};
+
 // The same workflow runs against the CLI adapter and deterministic fakes.
-pub fn run(a: A, adapter: anytype, repo: Repo, job: *Job, dry: bool) !?Payload {
+pub fn run(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?Payload {
+    const dry = mode == .preview;
     const can_publish = !dry and (repo.comments or repo.approvals);
-    if (job.phase == .uncertain or can_publish) {
+    const earlier_reviews = if (job.phase == .uncertain or can_publish) earlier: {
         try adapter.checkIdentity();
-        if (try receipt(a, repo, job.*, try adapter.reviews(job.number))) |prior| {
+        const existing = try adapter.reviews(job.number);
+        if (try receipt(a, repo, job.*, existing)) |prior| {
             try completeJob(a, adapter, repo, job, prior);
             return null;
         }
         if (job.phase == .uncertain) return error.PublicationUnconfirmed;
-    }
-    const pr = try adapter.pull(job.number);
-    if (!isReady(pr) or !eq(u8, pr.headRefOid, job.head)) return error.TargetChanged;
+        break :earlier existing;
+    } else null;
+    const pr = switch (mode) {
+        .scheduled => try adapter.pull(job.number),
+        .preview => |initial| initial orelse try adapter.pull(job.number),
+    };
+    if (pr.number != job.number or !isReady(pr) or !eq(u8, pr.headRefOid, job.head)) return error.TargetChanged;
     if (!validOid(pr.headRefOid) or !validOid(pr.baseRefOid)) return error.InvalidCommit;
     const snap = try adapter.snapshot(pr);
     const threads = try adapter.threads(pr.number);
-    const previous = previousCommit(try adapter.reviews(pr.number), repo.login);
+    const previous = previousCommit(earlier_reviews orelse try adapter.reviews(pr.number), repo.login);
     const raw = try adapter.review(try prompt(a, repo, pr, snap, threads, previous));
     const review = try parseReview(a, raw);
     if (!std.mem.eql(u8, try io.json(a, threads), try io.json(a, try adapter.threads(pr.number))))
