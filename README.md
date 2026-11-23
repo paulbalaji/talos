@@ -150,7 +150,10 @@ Use `talos remove` to stop the default scheduler and keep its data. For a full u
 | CLI, scheduling, and status | `src/main.zig`, `src/launchd.zig` |
 | Discovery, retries, and publication policy | `src/core.zig`, `src/store.zig` |
 | Git snapshots, anchors, and cache eviction | `src/source.zig`, `src/cache.zig` |
-| GitHub and provider adapters | `src/github.zig`, `src/runner.zig`, `src/review-schema.json` |
+| GitHub API | `src/github.zig` |
+| Reviewer adapters and result schema | `src/reviewers/`, `src/runner.zig`, `src/review-schema.json` |
+
+Each reviewer adapter sets its allowed environment, builds the CLI invocation, and extracts the result. Register new adapters in `src/runner.zig` and add the corresponding engine and executable to the CLI. The shared pipeline validates findings and handles GitHub publication.
 
 ```sh
 zig fmt --check build.zig src
