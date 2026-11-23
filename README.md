@@ -61,6 +61,8 @@ Performance covers hot paths and scaling. Reliability covers partial failure, re
 
 After a review, Talos checks for new human conversation and inline replies, thread resolution or reopening, and changes to the base branch or merge base. A base-branch commit that leaves the merge base unchanged does not trigger a review. Talos skips discussion edits from bots and the account it reviews as. It checks up to four completed PRs per repo per scan and rotates through them in order. GitHub receipts distinguish a same-head rereview from the original review, so restarting after a lost response does not post it twice.
 
+When approvals are enabled and CI is the only reason Talos withheld approval, passing checks trigger a rereview on the same head. The new review rechecks the current source and discussion before approving.
+
 `talos status OWNER/REPO` shows up to five completed jobs still tracked and links to verified GitHub reviews. `talos result OWNER/REPO 123` prints the last saved local candidate, including its reviewed commit. A review reconciled from GitHub can have a receipt without a local candidate.
 
 ### Review a PR stack

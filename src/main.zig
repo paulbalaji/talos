@@ -555,13 +555,16 @@ const Main = struct {
     }
 
     fn refreshReviewInput(self: Main, repo: core.Repo, client: github.Client, job: *core.Job, pull: core.Pull) !void {
+        const target = if (job.awaiting_checks and repo.approvals) try client.pull(pull.number) else pull;
+        if (!core.isReady(target) or !eq(u8, pull.headRefOid, target.headRefOid) or
+            !eq(u8, pull.baseRefOid, target.baseRefOid) or !eq(u8, pull.baseRefName, target.baseRefName)) return;
         const discussion = try client.discussion(pull.number);
         const saved = job.review_input;
         const merge_base = if (saved != null and eq(u8, saved.?.base.oid, pull.baseRefOid))
             saved.?.merge_base
         else
             try client.mergeBase(pull.baseRefOid, pull.headRefOid);
-        const current = try core.ReviewInput.init(self.a, repo, pull, merge_base, discussion);
+        const current = try core.ReviewInput.init(self.a, repo, target, merge_base, discussion);
         var legacy_changed = false;
         if (saved == null) {
             if (job.receipt) |id| {

@@ -205,6 +205,41 @@ test "effective diff changes and human conversation comments trigger review" {
     try t.expect(!(core.Discussion{ .comments = &.{own} }).changedAfter(repo.login, "2026-11-23T14:30:00Z"));
 }
 
+test "an otherwise clean same-head review can approve once checks pass" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var configured = repo;
+    configured.approvals = true;
+    const resolved = core.Thread{
+        .id = "accepted",
+        .isResolved = true,
+        .isOutdated = false,
+        .path = "src/watch.rs",
+        .line = 20,
+        .replies = &.{.{ .author = .{ .login = "author" }, .body = "Documented follow-up accepted.", .url = "accepted-reply" }},
+    };
+    var fake: Fake = .{ .a = a, .result = clean, .discussion = &.{resolved} };
+    fake.target.statusCheckRollup = &.{.{ .status = "QUEUED" }};
+    var job: core.Job = .{ .number = fixture_pull.number, .head = head };
+    const before = (try core.run(a, &fake, configured, &job, .scheduled)).?;
+    try t.expectEqual(core.Event.COMMENT, before.event);
+    try t.expect(job.awaiting_checks);
+    job.observeReviewInput(try core.ReviewInput.init(a, configured, fake.target, base, try fake.reviewDiscussion(42)), false);
+    try t.expectEqual(core.Phase.complete, job.phase);
+
+    fake.target.statusCheckRollup = &.{.{ .status = "COMPLETED", .conclusion = "SUCCESS" }};
+    job.observeReviewInput(try core.ReviewInput.init(a, configured, fake.target, base, try fake.reviewDiscussion(42)), false);
+    try t.expectEqual(core.Phase.pending, job.phase);
+    const after = (try core.run(a, &fake, configured, &job, .scheduled)).?;
+    try t.expectEqual(core.Event.APPROVE, after.event);
+    try t.expectEqualStrings(head, after.commit_id);
+    try t.expect(!job.awaiting_checks);
+    try t.expectEqual(@as(usize, 2), fake.posts);
+    job.observeReviewInput(try core.ReviewInput.init(a, configured, fake.target, base, try fake.reviewDiscussion(42)), false);
+    try t.expectEqual(core.Phase.complete, job.phase);
+}
+
 test "a changed stack ancestor prevents publication and prompt distinguishes inherited evidence" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();

@@ -301,12 +301,12 @@ pub const Client = struct {
         \\query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
         \\  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
         \\    comments(first: 50) { pageInfo { hasNextPage endCursor }
-        \\      nodes { author { login kind: __typename } body url updatedAt }
+        \\      nodes { author { login kind: __typename } body url updatedAt association: authorAssociation }
         \\    }
         \\    reviewThreads(first: 50, after: $cursor) { pageInfo { hasNextPage endCursor }
         \\      nodes { id isResolved isOutdated path line
         \\        comments(first: 50) { pageInfo { hasNextPage endCursor }
-        \\          nodes { author { login kind: __typename } body url updatedAt }
+        \\          nodes { author { login kind: __typename } body url updatedAt association: authorAssociation }
         \\        }
         \\      }
         \\    }
@@ -317,7 +317,7 @@ pub const Client = struct {
         \\query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
         \\  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
         \\    comments(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor }
-        \\      nodes { author { login kind: __typename } body url updatedAt }
+        \\      nodes { author { login kind: __typename } body url updatedAt association: authorAssociation }
         \\    }
         \\  } }
         \\}
@@ -326,7 +326,7 @@ pub const Client = struct {
         \\query($id: ID!, $cursor: String) {
         \\  node(id: $id) { ... on PullRequestReviewThread {
         \\    comments(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor }
-        \\      nodes { author { login kind: __typename } body url updatedAt }
+        \\      nodes { author { login kind: __typename } body url updatedAt association: authorAssociation }
         \\    }
         \\  } }
         \\}
