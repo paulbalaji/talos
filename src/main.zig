@@ -691,10 +691,11 @@ const Main = struct {
         work.policy = state.queue_budget;
         if (entry.repo.usesRouting()) {
             const fingerprint = try core.SavedAnalysis.key(self.a, entry.repo, work.prepared);
-            var progress: core.RouteProgress = .{ .fingerprint = fingerprint, .base = work.prepared.pr.baseRefOid };
+            var progress: core.RouteProgress = .{ .fingerprint = fingerprint, .base = .fromPull(work.prepared.pr) };
             if (job.route_progress) |saved| {
                 if (eq(u8, &saved.fingerprint, &fingerprint)) {
                     progress = saved;
+                    progress.base = .fromPull(work.prepared.pr);
                 } else job.route_progress = null;
             }
             const automatically_routed = entry.repo.routing_mode != .fixed and work.prepared.options.allowRouting();

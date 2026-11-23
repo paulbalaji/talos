@@ -104,8 +104,8 @@ pub const Client = struct {
         const a = self.cmd.a;
         const repository = try io.fmt(a, "github.com/{s}", .{self.repo});
         const input = self.invoke(&.{
-            self.gh,                                                                                           "pr", "view", try io.fmt(a, "{d}", .{number}), "-R", repository, "--json",
-            "number,headRefOid,baseRefOid,isDraft,state,title,body,author,statusCheckRollup,mergeStateStatus",
+            self.gh,                                                                                                       "pr", "view", try io.fmt(a, "{d}", .{number}), "-R", repository, "--json",
+            "number,headRefOid,baseRefOid,baseRefName,isDraft,state,title,body,author,statusCheckRollup,mergeStateStatus",
         }, "") catch |err| return transportFailure(err, error.GitHubPullFailed);
         const result = try io.parse(a, core.Pull, input);
         if (result.number != number) return error.GitHubTargetMismatch;

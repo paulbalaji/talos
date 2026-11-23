@@ -154,7 +154,11 @@ pub const Budget = struct {
             const at = self.eligibleAt(entry.*, job.*, now, limited, current) orelse continue;
             if (at > now or std.mem.indexOfScalar(u32, selected, job.number) != null) continue;
             if (!allow_fresh_routed and entry.repo.usesRouting() and
-                job.phase == .pending and job.route_progress == null and job.analysis == null) continue;
+                job.phase == .pending and job.route_progress == null and job.analysis == null)
+            {
+                result.budget_deferred = true;
+                continue;
+            }
             if (jobCost(entry.repo, job.*) > remaining or (job.phase == .uncertain and receipts == 0)) {
                 result.budget_deferred = true;
                 continue;
@@ -234,7 +238,9 @@ test "checkpoint saturation leaves saved passes and receipts selectable" {
     };
     const budget: Budget = .{};
     try t.expectEqual(@as(u32, 1), budget.pick(&entry, 100, 2, 2, &.{}, 0, .{}, true).job.?.number);
-    try t.expectEqual(@as(u32, 2), budget.pick(&entry, 100, 2, 2, &.{}, 0, .{}, false).job.?.number);
+    const saturated = budget.pick(&entry, 100, 2, 2, &.{}, 0, .{}, false);
+    try t.expect(saturated.budget_deferred);
+    try t.expectEqual(@as(u32, 2), saturated.job.?.number);
     try t.expectEqual(@as(u32, 3), budget.pick(&entry, 100, 2, 2, &.{2}, 0, .{}, false).job.?.number);
 }
 
@@ -247,22 +253,29 @@ test "a retargeted head can leave a route waiting for more providers" {
         .number = 1,
         .headRefOid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         .baseRefOid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .baseRefName = "main",
         .isDraft = false,
     };
     var entry: core.Entry = .{ .repo = .{ .name = "owner/repo", .login = "user", .routing_mode = .adaptive } };
     try entry.queue(a, pull, null);
-    entry.jobs[0].route_progress = .{
-        .base = pull.baseRefOid,
-        .fingerprint = @splat(0),
-        .decision = .{ .depth = .multi, .security = true },
-    };
     const budget: Budget = .{};
-    try entry.discover(a, &.{pull}, false);
-    try t.expect(budget.nextEligible(entry, 100, .{}) == null);
-    pull.baseRefOid = "cccccccccccccccccccccccccccccccccccccccc";
-    try entry.discover(a, &.{pull}, false);
-    try t.expectEqual(@as(usize, 1), entry.jobs.len);
-    try t.expectEqual(@as(u32, 1), budget.nextEligible(entry, 100, .{}).?.number);
+    for ([_]core.ReviewBase{
+        .{ .oid = pull.baseRefOid, .ref = "release" },
+        .{ .oid = "cccccccccccccccccccccccccccccccccccccccc", .ref = "release" },
+    }) |retargeted| {
+        entry.jobs[0].route_progress = .{
+            .base = .fromPull(pull),
+            .fingerprint = @splat(0),
+            .decision = .{ .depth = .multi, .security = true },
+        };
+        try entry.discover(a, &.{pull}, false);
+        try t.expect(budget.nextEligible(entry, 100, .{}) == null);
+        pull.baseRefOid = retargeted.oid;
+        pull.baseRefName = retargeted.ref;
+        try entry.discover(a, &.{pull}, false);
+        try t.expectEqual(@as(usize, 1), entry.jobs.len);
+        try t.expectEqual(@as(u32, 1), budget.nextEligible(entry, 100, .{}).?.number);
+    }
 }
 
 test "transport cooldowns block only affected starts and stay bounded" {

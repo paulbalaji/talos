@@ -177,10 +177,23 @@ pub const Job = struct {
     }
 };
 pub const Seen = struct { number: u32, head: []const u8 };
+pub const ReviewBase = struct {
+    oid: []const u8,
+    ref: []const u8,
+
+    pub fn fromPull(pr: Pull) ReviewBase {
+        return .{ .oid = pr.baseRefOid, .ref = pr.baseRefName };
+    }
+
+    fn same(self: ReviewBase, other: ReviewBase) bool {
+        return eq(u8, self.oid, other.oid) and eq(u8, self.ref, other.ref);
+    }
+};
+
 const Discovery = struct {
     observed: bool = false,
     queued: bool = false,
-    ready_base: ?[]const u8 = null,
+    ready_base: ?ReviewBase = null,
 };
 pub const SeenContext = struct {
     pub fn hash(_: SeenContext, key: Seen) u64 {
@@ -254,7 +267,7 @@ pub const Entry = struct {
             try ready.append(a, seen);
             const slot = try index.getOrPut(a, seen);
             if (!slot.found_existing) slot.value_ptr.* = .{};
-            slot.value_ptr.ready_base = pr.baseRefOid;
+            slot.value_ptr.ready_base = .fromPull(pr);
         }
         var retained: std.ArrayList(Job) = .empty;
         errdefer retained.deinit(a);
@@ -264,7 +277,9 @@ pub const Entry = struct {
             const base = index.get(.{ .number = job.number, .head = job.head }).?.ready_base;
             if (job.phase == .pending and base != null) {
                 if (job.route_progress) |progress| {
-                    if (!eq(u8, progress.base, base.?)) current.route_progress = null;
+                    if (progress.base) |previous| {
+                        if (!previous.same(base.?)) current.route_progress = null;
+                    }
                 }
             }
             if (job.phase == .uncertain or base != null) retained.appendAssumeCapacity(current);
@@ -334,7 +349,7 @@ pub fn isReady(pr: Pull) bool {
 
 fn sameTarget(before: Pull, after: Pull) bool {
     return isReady(after) and before.number == after.number and
-        eq(u8, before.headRefOid, after.headRefOid) and eq(u8, before.baseRefOid, after.baseRefOid);
+        eq(u8, before.headRefOid, after.headRefOid) and ReviewBase.fromPull(before).same(.fromPull(after));
 }
 
 const instructions =
@@ -401,6 +416,7 @@ fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, threads: []const Thr
         .description = pr.body[0..@min(pr.body.len, safePrefix(pr.body, 4000))],
         .head = pr.headRefOid,
         .base = pr.baseRefOid,
+        .base_ref = pr.baseRefName,
         .merge_base = snap.merge_base,
         .previous_review_commit = previous,
         .coverage_limited = snap.limited,
@@ -732,7 +748,7 @@ pub const Prepared = struct {
 
 pub const RouteProgress = struct {
     fingerprint: [32]u8,
-    base: []const u8 = "",
+    base: ?ReviewBase = null,
     decision: ?routing.Decision = null,
     screen_waiting: bool = true,
     screen_result: ?ReviewerResult = null,
