@@ -75,20 +75,16 @@ install -m 755 zig-out/bin/talos "$HOME/.local/bin/talos"
 ## How it fits together
 
 ```mermaid
-flowchart LR
-    User[Developer] -->|configure, preview, inspect| Talos
+flowchart TD
+    User[Developer] -->|commands| Talos
     subgraph Machine[Developer machine]
-        Scheduler[launchd or Linux scheduler] -->|tick| Talos[Talos CLI]
-        Talos --> State[Queue, receipts, results]
-        Talos --> Git
-        Git --> Cache[Per-repo Git cache]
-        Talos --> GH[GitHub CLI]
-        Talos -->|source and review threads| Reviewer[Codex, Claude, or Kimi CLI]
-        Reviewer -->|structured review| Talos
+        Scheduler[launchd or Linux scheduler] -->|tick| Talos[Talos]
+        Talos --> State[State and Git cache]
+        Talos --> Tools[Git and GitHub CLI]
+        Talos <-->|context and findings| Reviewer[Reviewer CLI]
     end
-    Git -->|fetch commits and files| GitHub
-    GH -->|read PRs, publish allowed reviews| GitHub
-    Reviewer --> Provider[Model provider]
+    Tools <-->|source and PRs| GitHub
+    Reviewer <--> Provider[Model provider]
 ```
 
 Talos pins the PR head and base, computes their merge base, and sends bounded source and review threads to the reviewer. The context includes resolved threads and author replies. Repo content and GitHub discussion are untrusted input. The reviewer runs in a temporary directory with execution tools disabled. Codex also uses its read-only sandbox. Use provider accounts approved to receive that repo's source and discussion. Kimi Code may retain its own sessions.
