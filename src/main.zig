@@ -183,6 +183,11 @@ const Main = struct {
     db: store.Store,
     scratch: [:0]const u8,
     scratch_dir: std.fs.Dir,
+    output: std.fs.File = std.fs.File.stdout(),
+
+    fn out(self: Main, comptime pattern: []const u8, args: anytype) !void {
+        return io.print(self.output, pattern, args);
+    }
 
     fn local(self: Main, entry: ?core.Repo) Local {
         var result: Local = .{ .a = self.a, .env = self.env, .scratch = self.scratch, .scratch_dir = self.scratch_dir, .programs = .{} };
@@ -296,7 +301,7 @@ const Main = struct {
             entry.next_scan = 0;
             entry.next_cache_check = 0;
             try self.db.save(state);
-            try io.out("Updated {s} as {s}\n", .{ name, repo.login });
+            try self.out("Updated {s} as {s}\n", .{ name, repo.login });
         } else {
             const pulls = try client.ready();
             var repo_dir = (try self.objectCache(repo).repoDir(true)) orelse return error.RepositoryDirectoryMissing;
@@ -307,7 +312,7 @@ const Main = struct {
             entry.next_scan = entry.last_scan + repo.interval;
             try state.add(self.a, entry);
             try self.db.save(state);
-            try io.out("Added {s} as {s} with {d} ready PRs baselined\n", .{ name, repo.login, entry.seen.len });
+            try self.out("Added {s} as {s} with {d} ready PRs baselined\n", .{ name, repo.login, entry.seen.len });
         }
     }
 
@@ -317,7 +322,7 @@ const Main = struct {
             state.default_engines = try parseEngines(self.a, args[1]);
             try self.db.save(state);
         }
-        try io.out("Default reviewers for new repos {s}\n", .{try engineNames(self.a, state.default_engines)});
+        try self.out("Default reviewers for new repos {s}\n", .{try engineNames(self.a, state.default_engines)});
     }
 
     fn adapter(self: Main, entry: *core.Entry, state: *const store.State, gh_env: *std.process.EnvMap) !Adapter {
@@ -415,7 +420,7 @@ const Main = struct {
             var gh_env: std.process.EnvMap = undefined;
             var live = try self.adapter(entry, state, &gh_env);
             const payload = (try core.run(self.a, &live, entry.repo, &job, .{ .preview = initial })).?;
-            try io.out("{s}\n", .{try io.json(self.a, .{ .repo = entry.repo.name, .pr = job.number, .review = payload })});
+            try self.out("{s}\n", .{try io.json(self.a, .{ .repo = entry.repo.name, .pr = job.number, .review = payload })});
         }
     }
 
@@ -430,8 +435,8 @@ const Main = struct {
             } else return error.Usage;
         }
         if (repo) |name| if (state.find(name) == null) return error.UnknownRepository;
-        if (state.entries.len == 0 and !json_output) try io.out("No repositories registered\n", .{});
-        if (json_output) try io.out("[", .{});
+        if (state.entries.len == 0 and !json_output) try self.out("No repositories registered\n", .{});
+        if (json_output) try self.out("[", .{});
         var first = true;
         for (state.entries) |entry| {
             if (repo != null and !std.ascii.eqlIgnoreCase(repo.?, entry.repo.name)) continue;
@@ -440,39 +445,39 @@ const Main = struct {
             const retained: ?u64 = if (measurement) |bytes| bytes else |_| null;
             const cache_error: ?[]const u8 = if (measurement) |_| null else |err| @errorName(err);
             if (json_output) {
-                try io.out("{s}{s}", .{ if (first) "" else ",", try io.json(self.a, .{ .paused = paused, .state = entry, .cache_bytes = retained, .cache_error = cache_error }) });
+                try self.out("{s}{s}", .{ if (first) "" else ",", try io.json(self.a, .{ .paused = paused, .state = entry, .cache_bytes = retained, .cache_error = cache_error }) });
                 first = false;
                 continue;
             }
-            try io.out("{s}  {s}  {s}  interval {d}s  comments {s}  approvals {s}\n", .{
+            try self.out("{s}  {s}  {s}  interval {d}s  comments {s}  approvals {s}\n", .{
                 entry.repo.name,     if (paused) "paused" else "active",       try engineNames(self.a, try entry.repo.engines(self.a)),
                 entry.repo.interval, if (entry.repo.comments) "on" else "off", if (entry.repo.approvals) "on" else "off",
             });
-            try io.out("  Last successful scan {s}  |  Next scan {s}  |  Ready PRs {d}\n", .{
+            try self.out("  Last successful scan {s}  |  Next scan {s}  |  Ready PRs {d}\n", .{
                 try formatTime(self.a, entry.last_scan), try formatTime(self.a, entry.next_scan), entry.seen.len,
             });
             if (retained) |bytes| {
-                try io.out("  Git cache {d} bytes / {d} MiB  |  Idle expiry {d}d\n", .{ bytes, entry.repo.cache_mib, entry.repo.cache_idle_days });
+                try self.out("  Git cache {d} bytes / {d} MiB  |  Idle expiry {d}d\n", .{ bytes, entry.repo.cache_mib, entry.repo.cache_idle_days });
             } else {
-                try io.out("  Git cache unavailable ({s})\n", .{cache_error.?});
+                try self.out("  Git cache unavailable ({s})\n", .{cache_error.?});
             }
             var queued: usize = 0;
             for (entry.jobs) |job| {
                 if (job.phase == .complete) continue;
                 queued += 1;
-                try io.out("  #{d} {s} {s}, attempts {d}, next {s}\n", .{
+                try self.out("  #{d} {s} {s}, attempts {d}, next {s}\n", .{
                     job.number,                       job.head[0..@min(job.head.len, 10)], @tagName(job.phase), job.attempts,
                     try formatTime(self.a, job.next),
                 });
             }
-            if (queued == 0) try io.out("  Queue empty\n", .{});
+            if (queued == 0) try self.out("  Queue empty\n", .{});
             for (entry.errors) |issue| {
-                try io.out("  {s}  {s}", .{ try formatTime(self.a, issue.at), issue.detail });
-                if (issue.number) |number| try io.out("  PR #{d}", .{number});
-                try io.out("\n", .{});
+                try self.out("  {s}  {s}", .{ try formatTime(self.a, issue.at), issue.detail });
+                if (issue.number) |number| try self.out("  PR #{d}", .{number});
+                try self.out("\n", .{});
             }
         }
-        if (json_output) try io.out("]\n", .{});
+        if (json_output) try self.out("]\n", .{});
     }
 
     fn dispatch(self: Main, args: []const []const u8) !void {
@@ -492,7 +497,7 @@ const Main = struct {
             const entry = state.find(params[0]) orelse return error.UnknownRepository;
             const pause = eq(u8, cmd, "pause");
             try self.db.setPaused(entry.repo.name, pause);
-            return io.out("{s} {s}\n", .{ if (pause) "Paused" else "Resumed", entry.repo.name });
+            return self.out("{s} {s}\n", .{ if (pause) "Paused" else "Resumed", entry.repo.name });
         }
         if (eq(u8, cmd, "install") or eq(u8, cmd, "remove")) {
             const label = if (params.len == 0) launchd.default_label else if (params.len == 2 and eq(u8, params[0], "--label")) params[1] else return error.Usage;
@@ -514,7 +519,7 @@ const Main = struct {
             const pull = try self.choose(entry, try prNumber(params[1]));
             try entry.queue(self.a, pull, true);
             try self.db.save(&state);
-            return io.out("Selected {s} #{d} at {s}\n", .{ entry.repo.name, pull.number, pull.headRefOid });
+            return self.out("Selected {s} #{d} at {s}\n", .{ entry.repo.name, pull.number, pull.headRefOid });
         }
         return error.Usage;
     }
@@ -635,7 +640,9 @@ test "each reviewer combination registers with only its selected executables" {
         .{ .flag = "kimi,codex,claude", .engines = &.{ .kimi, .codex, .claude } },
     };
     var env = std.process.EnvMap.init(a);
-    const app: Main = .{ .a = a, .db = db, .env = &env, .home = path, .scratch = path, .scratch_dir = db.dir };
+    const output = try db.dir.createFile("output", .{});
+    defer output.close();
+    const app: Main = .{ .a = a, .db = db, .env = &env, .home = path, .scratch = path, .scratch_dir = db.dir, .output = output };
     for (cases, 0..) |case, index| {
         const bin_name = try io.fmt(a, "bin-{d}", .{index});
         try db.dir.makeDir(bin_name);
