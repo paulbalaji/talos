@@ -1,6 +1,6 @@
 # Talos
 
-Talos reviews GitHub pull requests from your machine using Codex, Claude Code, or Kimi Code. It records the ready PRs that already exist, then picks up new ready PRs, drafts that become ready, and new heads. Reviews stay local by default. Each repo can opt into comments and approvals separately.
+Talos reviews GitHub pull requests from your machine using Codex, Claude Code, or Kimi Code. It records the ready PRs that already exist, then picks up new ready PRs, drafts that become ready, and new heads. It also rereviews heads it has reviewed when the discussion or effective diff changes. Reviews stay local by default. Each repo can opt into comments and approvals separately.
 
 ## Use Talos
 
@@ -57,7 +57,9 @@ talos run-once OWNER/REPO 123 --mode reliability-maxxing
 talos run-once OWNER/REPO 123 --mode security-maxxing
 ```
 
-Performance covers hot paths and scaling. Reliability covers partial failure, retries, and recovery. Security checks trust boundaries and mitigations from static source. With no mode, Talos runs the general review. Talos saves queued prompts locally and sends them to the configured reviewers. Keep credentials out of them. A review with a custom prompt stays local by default. Add `--publish` to allow its result to appear on GitHub when the repo allows comments. Review modes without a custom prompt follow the repo’s comment policy. Focused reviews publish as comments. Queue the same head again with no flags to retry with its saved options. A verified GitHub review already recorded for that head is deduplicated.
+Performance covers hot paths and scaling. Reliability covers partial failure, retries, and recovery. Security checks trust boundaries and mitigations from static source. With no mode, Talos runs the general review. Talos saves queued prompts locally and sends them to the configured reviewers. Keep credentials out of them. A review with a custom prompt stays local by default. Add `--publish` to allow its result to appear on GitHub when the repo allows comments. Review modes without a custom prompt follow the repo’s comment policy. Focused reviews publish as comments. Queue the same head again with no flags to retry with its saved options.
+
+After a review, Talos checks for new human conversation and inline replies, thread resolution or reopening, and changes to the base branch or merge base. A base-branch commit that leaves the merge base unchanged does not trigger a review. Talos skips discussion edits from bots and the account it reviews as. It checks up to four completed PRs per repo per scan and rotates through them in order. GitHub receipts distinguish a same-head rereview from the original review, so restarting after a lost response does not post it twice.
 
 `talos status OWNER/REPO` shows up to five completed jobs still tracked and links to verified GitHub reviews. `talos result OWNER/REPO 123` prints the last saved local candidate, including its reviewed commit. A review reconciled from GitHub can have a receipt without a local candidate.
 

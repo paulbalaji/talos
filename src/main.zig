@@ -148,8 +148,8 @@ const Adapter = struct {
         return self.github_client.reviews(number);
     }
 
-    pub fn threads(self: *Adapter, number: u32) ![]const core.Thread {
-        return self.github_client.threads(number);
+    pub fn reviewDiscussion(self: *Adapter, number: u32) !core.Discussion {
+        return self.github_client.discussion(number);
     }
 
     pub fn snapshot(self: *Adapter, pr: core.Pull) !core.Snapshot {
@@ -532,6 +532,45 @@ const Main = struct {
         try stack.refresh(entry, self.a, pins);
         try stack.syncNative(entry, self.a, natives);
         try stack.autogroup(entry, self.a, pulls);
+        try self.scanReviewInputs(entry, client, pulls);
+    }
+
+    fn scanReviewInputs(self: Main, entry: *core.Entry, client: github.Client, pulls: []const core.Pull) !void {
+        if (entry.jobs.len == 0) return;
+        var checked: usize = 0;
+        for (0..entry.jobs.len) |_| {
+            const index = entry.discussion_cursor % entry.jobs.len;
+            entry.discussion_cursor = (index + 1) % entry.jobs.len;
+            const job = &entry.jobs[index];
+            if (job.phase != .complete) continue;
+            for (pulls) |pull| {
+                if (pull.number != job.number or !core.isReady(pull) or !eq(u8, pull.headRefOid, job.head)) continue;
+                try self.refreshReviewInput(entry.repo, client, job, pull);
+                checked += 1;
+                break;
+            }
+            // Rotate the starting point so busy repos cannot starve older PRs.
+            if (checked == 4) break;
+        }
+    }
+
+    fn refreshReviewInput(self: Main, repo: core.Repo, client: github.Client, job: *core.Job, pull: core.Pull) !void {
+        const discussion = try client.discussion(pull.number);
+        const saved = job.review_input;
+        const merge_base = if (saved != null and eq(u8, saved.?.base.oid, pull.baseRefOid))
+            saved.?.merge_base
+        else
+            try client.mergeBase(pull.baseRefOid, pull.headRefOid);
+        const current = try core.ReviewInput.init(self.a, repo, pull, merge_base, discussion);
+        var legacy_changed = false;
+        if (saved == null) {
+            if (job.receipt) |id| {
+                const prior = try client.readReview(pull.number, id);
+                if (prior.id != id or !eq(u8, prior.commit_id, pull.headRefOid)) return error.ReviewReadbackMismatch;
+                if (prior.submitted_at) |timestamp| legacy_changed = discussion.changedAfter(repo.login, timestamp);
+            }
+        }
+        job.observeReviewInput(current, legacy_changed);
     }
 
     fn tick(self: Main, state: *store.State) !void {

@@ -32,6 +32,7 @@ const Fake = struct {
     offered: ?core.Prior = null,
     discussion: []const core.Thread = &.{},
     late_discussion: ?[]const core.Thread = null,
+    comments: []const core.Reply = &.{},
     thread_reads: usize = 0,
     result: []const u8 = finding,
     other_results: []const []const u8 = &.{},
@@ -60,10 +61,12 @@ const Fake = struct {
         return if (self.offered != null) @as(*const [1]core.Prior, @ptrCast(&self.offered.?)) else &.{};
     }
 
-    pub fn threads(self: *Fake, _: u32) ![]const core.Thread {
+    pub fn reviewDiscussion(self: *Fake, _: u32) !core.Discussion {
         self.thread_reads += 1;
-        if (self.thread_reads >= 3) return self.late_discussion orelse self.discussion;
-        return self.discussion;
+        return .{
+            .threads = if (self.thread_reads >= 3) self.late_discussion orelse self.discussion else self.discussion,
+            .comments = self.comments,
+        };
     }
 
     pub fn snapshot(_: *Fake, _: core.Pull) !core.Snapshot {
@@ -132,6 +135,75 @@ const Fake = struct {
         self.saved_result = result;
     }
 };
+
+test "same-head discussion changes get one new receipt and survive an ambiguous post" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const own = core.Reply{ .author = .{ .login = repo.login }, .body = "Talos found a problem.", .url = "own" };
+    const bot = core.Reply{ .author = .{ .login = "coverage[bot]" }, .body = "Coverage changed.", .url = "bot" };
+    const author = core.Reply{ .author = .{ .login = "author" }, .body = "Accepted this tradeoff.", .url = "reply" };
+    var thread: core.Thread = .{ .id = "thread", .isResolved = false, .isOutdated = false, .path = "src/watch.rs", .line = 20, .replies = &.{own} };
+    var fake: Fake = .{ .a = a };
+    var job: core.Job = .{ .number = fixture_pull.number, .head = head };
+    _ = (try core.run(a, &fake, repo, &job, .scheduled)).?;
+    try t.expectEqual(core.Phase.complete, job.phase);
+    try t.expectEqual(@as(usize, 1), fake.posts);
+    try t.expect(std.mem.indexOf(u8, fake.posted_result.?.body, "talos:review:v1:") != null);
+
+    fake.discussion = &.{thread};
+    fake.comments = &.{bot};
+    job.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false);
+    try t.expectEqual(core.Phase.complete, job.phase);
+
+    thread.isResolved = true;
+    thread.replies = &.{ own, author };
+    fake.discussion = &.{thread};
+    job.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false);
+    try t.expectEqual(core.Phase.pending, job.phase);
+    fake.lose_response = true;
+    fake.result = clean;
+    try t.expectError(error.GitHubPostUnconfirmed, core.run(a, &fake, repo, &job, .scheduled));
+    try t.expectEqual(core.Phase.uncertain, job.phase);
+    try t.expectEqual(@as(usize, 2), fake.posts);
+    try t.expect(std.mem.indexOf(u8, fake.posted_result.?.body, "talos:review:v2:") != null);
+    try t.expect(std.mem.indexOf(u8, fake.prompt_text, "Accepted this tradeoff.") != null);
+
+    var recovered = try io.parse(a, core.Job, try io.json(a, job));
+    fake.lose_response = false;
+    try t.expect((try core.run(a, &fake, repo, &recovered, .scheduled)) == null);
+    try t.expectEqual(core.Phase.complete, recovered.phase);
+    try t.expectEqual(@as(usize, 2), fake.posts);
+    recovered.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false);
+    try t.expectEqual(core.Phase.complete, recovered.phase);
+
+    thread.isResolved = false;
+    fake.discussion = &.{thread};
+    recovered.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false);
+    try t.expectEqual(core.Phase.pending, recovered.phase);
+}
+
+test "effective diff changes and human conversation comments trigger review" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const first = try core.ReviewInput.init(a, repo, fixture_pull, base, .{});
+    var moved = fixture_pull;
+    moved.baseRefOid = changed;
+    const advanced = try core.ReviewInput.init(a, repo, moved, base, .{});
+    try t.expect(first.same(advanced));
+    try t.expect(!first.same(try core.ReviewInput.init(a, repo, moved, changed, .{})));
+    moved.baseRefName = "release";
+    try t.expect(!first.same(try core.ReviewInput.init(a, repo, moved, base, .{})));
+
+    const human = core.Reply{ .author = .{ .login = "author" }, .body = "New rollout information.", .url = "note", .updatedAt = "2026-11-23T15:00:00Z" };
+    const own = core.Reply{ .author = .{ .login = repo.login }, .body = "Review", .url = "review", .updatedAt = "2026-11-23T15:00:00Z" };
+    const discussion = core.Discussion{ .comments = &.{human} };
+    try t.expect(!first.same(try core.ReviewInput.init(a, repo, fixture_pull, base, discussion)));
+    try t.expect(discussion.changedAfter(repo.login, "2026-11-23T14:30:00Z"));
+    try t.expect(!discussion.changedAfter(repo.login, "2026-11-23T15:30:00Z"));
+    try t.expect(!(core.Discussion{ .comments = &.{own} }).changedAfter(repo.login, "2026-11-23T14:30:00Z"));
+}
 
 test "a changed stack ancestor prevents publication and prompt distinguishes inherited evidence" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
