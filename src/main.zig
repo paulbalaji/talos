@@ -285,6 +285,7 @@ const ReviewBatch = struct {
     deferred_repo: ?usize = null,
     workers: [queue.parallel_jobs]*ReviewWorker = undefined,
     len: usize = 0,
+    pending: usize = 0,
     completed: std.Thread.Semaphore = .{},
     limited: std.atomic.Value(u8) = .init(0),
 
@@ -315,17 +316,14 @@ const ReviewWorker = struct {
     done: std.atomic.Value(bool) = .init(false),
     result: anyerror!core.ReviewResults = undefined,
 
-    fn engineBit(engine: core.Engine) u8 {
-        return @as(u8, 1) << @intCast(@intFromEnum(engine));
-    }
-
     pub fn review(self: *ReviewWorker, engine: core.Engine, prompt: []const u8) ![]const u8 {
+        const limited = self.batch.limited.load(.monotonic);
         for (self.prepared.engines) |selected| {
-            if (self.batch.limited.load(.monotonic) & engineBit(selected) != 0) return error.ReviewerCoolingDown;
+            if (limited & queue.engineBit(selected) != 0) return error.ReviewerCoolingDown;
         }
         return runReviewer(self.tools, self.adapter.repo, engine, prompt) catch |err| {
             switch (err) {
-                error.CodexRateLimited, error.ClaudeRateLimited, error.KimiRateLimited => _ = self.batch.limited.fetchOr(engineBit(engine), .monotonic),
+                error.CodexRateLimited, error.ClaudeRateLimited, error.KimiRateLimited => _ = self.batch.limited.fetchOr(queue.engineBit(engine), .monotonic),
                 else => {},
             }
             return err;
@@ -548,26 +546,30 @@ const Main = struct {
         }
         if (batch.deferred_repo) |index| state.queue_budget.next_repo = index;
 
-        // Save a finished PR promptly even while another reviewer is still running.
-        var remaining = batch.len;
-        while (remaining != 0) {
+        while (batch.pending != 0) {
             batch.completed.wait();
-            for (batch.workers[0..batch.len]) |work| {
-                const thread = work.thread orelse continue;
-                if (!work.done.load(.acquire)) continue;
-                thread.join();
-                work.thread = null;
-                remaining -= 1;
-                counts.reviewer_starts += work.counts.reviewer_starts;
-                self.finishJob(state, work) catch |err| try self.jobFailed(state, work.adapter.entry, work.job, err);
-            }
+            try self.finishReady(state, counts, &batch);
+        }
+    }
+
+    fn finishReady(self: Main, state: *store.State, counts: *queue.TickCounts, batch: *ReviewBatch) !void {
+        for (batch.workers[0..batch.len]) |work| {
+            const thread = work.thread orelse continue;
+            if (!work.done.load(.acquire)) continue;
+            thread.join();
+            work.thread = null;
+            batch.pending -= 1;
+            counts.reviewer_starts += work.counts.reviewer_starts;
+            self.finishJob(state, work) catch |err| try self.jobFailed(state, work.adapter.entry, work.job, err);
         }
     }
 
     fn admit(self: Main, state: *store.State, counts: *queue.TickCounts, batch: *ReviewBatch, lane: *queue.RepoJobs, has_slot: bool) !bool {
+        // Reconcile finished jobs and cooldowns before reserving more work.
+        try self.finishReady(state, counts, batch);
         const entry = &state.entries[lane.index];
         if (try self.db.paused(entry.repo.name)) return false;
-        const decision = state.queue_budget.pick(entry, std.time.timestamp(), batch.starts_left, batch.receipts_left, lane.selected());
+        const decision = state.queue_budget.pick(entry, std.time.timestamp(), batch.starts_left, batch.receipts_left, lane.selected(), batch.limited.load(.monotonic));
         if (decision.budget_deferred or (!has_slot and decision.job != null)) batch.deferRepo(lane.index);
         const job = decision.job orelse return false;
         if (!has_slot) return false;
@@ -587,31 +589,64 @@ const Main = struct {
         return true;
     }
 
-    fn startJob(self: Main, state: *const store.State, entry: *core.Entry, job: *core.Job, batch: *ReviewBatch) !void {
+    fn startJob(self: Main, state: *store.State, entry: *core.Entry, job: *core.Job, batch: *ReviewBatch) !void {
         // Each adapter keeps its own file anchors. Only the coordinator uses
         // Git and GitHub, so snapshots may share the per-repo cache and refs.
         const work = try self.a.create(ReviewWorker);
         work.* = .{ .job = job, .batch = batch };
         work.adapter = try self.adapter(entry, state, &work.gh_env);
         work.prepared = (try core.prepare(self.a, &work.adapter, entry.repo, job, .scheduled)) orelse return;
+        if (job.analysis) |saved| {
+            if (try saved.matches(self.a, entry.repo, work.prepared)) {
+                if (try self.db.paused(entry.repo.name)) return;
+                _ = try core.finish(self.a, &work.adapter, entry.repo, job, work.prepared, saved.results);
+                return;
+            }
+            job.analysis = null;
+            // Persist the invalidation even if the provider holds this job.
+            try self.db.save(state);
+        }
+        if (!state.queue_budget.canReview(entry.repo, std.time.timestamp(), batch.limited.load(.monotonic))) return;
         work.thread = try std.Thread.spawn(.{}, ReviewWorker.analyze, .{work});
+        batch.pending += 1;
         batch.workers[batch.len] = work;
         batch.len += 1;
     }
 
-    fn finishJob(self: Main, state: *const store.State, work: *ReviewWorker) !void {
+    fn finishJob(self: Main, state: *store.State, work: *ReviewWorker) !void {
         const results = try work.result;
-        if (!state.queue_budget.canScan(std.time.timestamp())) return;
+        const reviews = results[0..work.prepared.engines.len];
         if (try self.db.paused(work.adapter.repo.name)) return;
-        _ = try core.finish(self.a, &work.adapter, work.adapter.repo, work.job, work.prepared, &results);
+        if (!state.queue_budget.canScan(std.time.timestamp())) {
+            try self.keepAnalysis(state, work, reviews);
+            try self.db.save(state);
+            return;
+        }
+        _ = core.finish(self.a, &work.adapter, work.adapter.repo, work.job, work.prepared, reviews) catch |err| {
+            // An uncertain publication may only be reconciled by its receipt.
+            if (err == error.GitHubRateLimited and work.job.phase == .pending) try self.keepAnalysis(state, work, reviews);
+            return err;
+        };
+    }
+
+    fn keepAnalysis(self: Main, state: *store.State, work: *ReviewWorker, reviews: []const core.ReviewerResult) !void {
+        // Bound transient checkpoints to one full batch, even after repeated rate limits.
+        var retained: usize = 0;
+        for (state.entries) |entry| {
+            for (entry.jobs) |job| retained += @intFromBool(job.analysis != null);
+        }
+        if (retained >= queue.parallel_jobs) return;
+        work.job.analysis = try core.SavedAnalysis.save(self.a, work.adapter.repo, work.prepared, reviews);
     }
 
     fn jobFailed(self: Main, state: *store.State, entry: *core.Entry, job: *core.Job, err: anyerror) !void {
         if (err == error.ReviewerCoolingDown) return;
+        if (err != error.GitHubRateLimited) job.analysis = null;
         if (err == error.StackChanged or err == error.GitHubStackChanged) entry.next_scan = 0;
         const now = std.time.timestamp();
         state.queue_budget.noteFailure(now, err);
         try core.recordFailure(entry, self.a, job, now, err);
+        if (!job.schedulable()) job.analysis = null;
         try self.db.save(state);
     }
 
@@ -723,6 +758,8 @@ const Main = struct {
                 var summary = entry;
                 // Show pins and scheduling separately without echoing stored PR text.
                 summary.stacks = &.{};
+                summary.jobs = try self.a.dupe(core.Job, entry.jobs);
+                for (summary.jobs) |*job| job.analysis = null;
                 try self.out("{s}{s}", .{ if (first) "" else ",", try io.json(self.a, .{
                     .paused = paused,
                     .state = summary,

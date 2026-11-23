@@ -92,10 +92,16 @@ pub const Budget = struct {
         };
     }
 
+    pub fn canReview(self: Budget, repo: core.Repo, now: i64, limited: u8) bool {
+        if (usesLimitedEngine(repo, limited) or self.providerRetry(repo.engine) > now) return false;
+        for (repo.additional_engines) |engine| if (self.providerRetry(engine) > now) return false;
+        return true;
+    }
+
     fn eligibleAt(self: Budget, entry: core.Entry, job: core.Job) ?i64 {
         if (!job.schedulable() or entry.stackBlocked(job)) return null;
         var at = @max(job.next, self.github.until);
-        if (job.phase != .uncertain) {
+        if (job.phase != .uncertain and job.analysis == null) {
             at = @max(at, self.providerRetry(entry.repo.engine));
             for (entry.repo.additional_engines) |engine| at = @max(at, self.providerRetry(engine));
         }
@@ -114,10 +120,12 @@ pub const Budget = struct {
         return next;
     }
 
-    pub fn pick(self: Budget, entry: *core.Entry, now: i64, remaining: u32, receipts: u32, selected: []const u32) Pick {
+    pub fn pick(self: Budget, entry: *core.Entry, now: i64, remaining: u32, receipts: u32, selected: []const u32, limited: u8) Pick {
         var result: Pick = .{};
+        const provider_limited = usesLimitedEngine(entry.repo, limited);
         for (entry.jobs) |*job| {
             const at = self.eligibleAt(entry.*, job.*) orelse continue;
+            if (provider_limited and job.phase != .uncertain and job.analysis == null) continue;
             if (at > now or std.mem.indexOfScalar(u32, selected, job.number) != null) continue;
             if (jobCost(entry.repo, job.*) > remaining or (job.phase == .uncertain and receipts == 0)) {
                 result.budget_deferred = true;
@@ -129,6 +137,16 @@ pub const Budget = struct {
         return result;
     }
 };
+
+pub fn engineBit(engine: core.Engine) u8 {
+    return @as(u8, 1) << @intCast(@intFromEnum(engine));
+}
+
+fn usesLimitedEngine(repo: core.Repo, limited: u8) bool {
+    if (engineBit(repo.engine) & limited != 0) return true;
+    for (repo.additional_engines) |engine| if (engineBit(engine) & limited != 0) return true;
+    return false;
+}
 
 pub fn reviewerCost(repo: core.Repo) u32 {
     return @intCast(1 + repo.additional_engines.len);
@@ -149,11 +167,15 @@ test "queue selection accounts for reviewer count and leaves receipt lookup elig
     var entry: core.Entry = .{ .repo = .{ .name = "owner/repo", .login = "user", .additional_engines = &.{ .claude, .kimi } }, .jobs = &jobs };
     const budget: Budget = .{};
     try t.expectError(error.ReviewBudgetTooSmall, (Budget{ .limit = 2 }).validate(&.{entry}));
-    const receipt = budget.pick(&entry, 100, 0, budget.limit, &.{});
+    const limited = engineBit(.claude);
+    const cooled = budget.pick(&entry, 100, budget.limit, budget.limit, &.{}, limited);
+    try t.expect(!cooled.budget_deferred);
+    try t.expectEqual(@as(u32, 2), cooled.job.?.number);
+    const receipt = budget.pick(&entry, 100, 0, budget.limit, &.{}, 0);
     try t.expect(receipt.budget_deferred);
     try t.expectEqual(@as(u32, 2), receipt.job.?.number);
-    try t.expect(budget.pick(&entry, 100, 0, 0, &.{}).job == null);
-    const next = budget.pick(&entry, 100, budget.limit, budget.limit, &.{});
+    try t.expect(budget.pick(&entry, 100, 0, 0, &.{}, 0).job == null);
+    const next = budget.pick(&entry, 100, budget.limit, budget.limit, &.{}, 0);
     try t.expect(!next.budget_deferred);
     try t.expectEqual(@as(u32, 1), next.job.?.number);
     try t.expectEqual(@as(u32, 3), budget.nextEligible(entry, 100).?.reviewer_starts);
@@ -168,10 +190,10 @@ test "a batch excludes multiple heads of the same PR" {
     var entry: core.Entry = .{ .repo = .{ .name = "owner/repo", .login = "user" }, .jobs = &jobs };
     var lane: RepoJobs = .{ .index = 0 };
     const budget: Budget = .{};
-    const first = budget.pick(&entry, 100, 3, 3, lane.selected()).job.?;
+    const first = budget.pick(&entry, 100, 3, 3, lane.selected(), 0).job.?;
     try std.testing.expectEqualStrings("old", first.head);
     lane.add(first.number);
-    const next = budget.pick(&entry, 100, 3, 3, lane.selected()).job.?;
+    const next = budget.pick(&entry, 100, 3, 3, lane.selected(), 0).job.?;
     try std.testing.expectEqual(@as(u32, 2), next.number);
 }
 
@@ -187,14 +209,14 @@ test "transport cooldowns block only affected starts and stay bounded" {
         .{ .number = 1, .head = "next", .attempts = 1, .next = 130 },
     };
     var entry: core.Entry = .{ .repo = .{ .name = "owner/repo", .login = "user", .additional_engines = &.{.claude} }, .jobs = &jobs };
-    try t.expect(budget.pick(&entry, 130, 2, 2, &.{}).job == null);
+    try t.expect(budget.pick(&entry, 130, 2, 2, &.{}, 0).job == null);
     try t.expectEqual(@as(i64, 160), budget.nextEligible(entry, 130).?.at);
-    try t.expect(budget.pick(&entry, 160, 2, 2, &.{}).job != null);
+    try t.expect(budget.pick(&entry, 160, 2, 2, &.{}, 0).job != null);
     entry.jobs[0].phase = .uncertain;
-    try t.expect(budget.pick(&entry, 130, 0, 2, &.{}).job != null);
+    try t.expect(budget.pick(&entry, 130, 0, 2, &.{}, 0).job != null);
     budget.noteFailure(130, error.GitHubRateLimited);
     try t.expect(!budget.canScan(131));
-    try t.expect(budget.pick(&entry, 131, 0, 2, &.{}).job == null);
+    try t.expect(budget.pick(&entry, 131, 0, 2, &.{}, 0).job == null);
     for (0..15) |_| budget.noteFailure(budget.github.until, error.GitHubRateLimited);
     try t.expectEqual(@as(u8, 5), budget.github.attempts);
 }

@@ -521,3 +521,41 @@ test "focused preview keeps the operator request separate from untrusted PR evid
     try t.expectEqual(@as(usize, 0), fake.posts);
     try t.expectEqual(core.Phase.pending, job.phase);
 }
+
+test "a saved analysis survives restart and requires the same prompt and reviewer setup" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try io.temp(a);
+    defer std.fs.deleteTreeAbsolute(path) catch {};
+    var db = try store.Store.open(a, path);
+    defer db.dir.close();
+
+    var fake: Fake = .{ .a = a };
+    var jobs = [_]core.Job{.{ .number = fixture_pull.number, .head = head }};
+    var entries = [_]core.Entry{.{ .repo = repo, .jobs = &jobs }};
+    const prepared = (try core.prepare(a, &fake, repo, &jobs[0], .scheduled)).?;
+    const results = try core.analyze(a, &fake, prepared.engines, prepared.context);
+    jobs[0].analysis = try core.SavedAnalysis.save(a, repo, prepared, results[0..prepared.engines.len]);
+    try db.save(&.{ .entries = &entries });
+
+    const reopened = try db.load();
+    const job = &reopened.entries[0].jobs[0];
+    const saved = job.analysis.?;
+    const same = (try core.prepare(a, &fake, repo, job, .scheduled)).?;
+    try t.expect(try saved.matches(a, repo, same));
+
+    fake.target.body = "Changed PR description";
+    const changed_input = (try core.prepare(a, &fake, repo, job, .scheduled)).?;
+    try t.expect(!try saved.matches(a, repo, changed_input));
+    var changed_repo = repo;
+    changed_repo.model = "different-model";
+    try t.expect(!try saved.matches(a, changed_repo, same));
+
+    fake.target = fixture_pull;
+    _ = (try core.finish(a, &fake, repo, job, same, saved.results)).?;
+    try t.expectEqual(@as(usize, 1), fake.reviews_run);
+    try t.expectEqual(@as(usize, 1), fake.posts);
+    try t.expectEqual(core.Phase.complete, job.phase);
+    try t.expect(job.analysis == null);
+}

@@ -122,7 +122,7 @@ pub const Review = struct {
     findings: []const Finding,
     existing_open_findings: []const []const u8,
 };
-const ReviewerResult = struct { engine: Engine, review: Review };
+pub const ReviewerResult = struct { engine: Engine, review: Review };
 pub const Event = enum { COMMENT, APPROVE };
 
 pub const Inline = struct { path: []const u8, line: u32, side: []const u8 = "RIGHT", body: []const u8 };
@@ -138,6 +138,7 @@ pub const Job = struct {
     event: ?Event = null,
     receipt: ?u64 = null,
     outcome: ?[]const u8 = null,
+    analysis: ?SavedAnalysis = null,
 
     pub fn schedulable(self: Job) bool {
         return (self.phase == .pending or self.phase == .uncertain) and self.attempts < max_attempts;
@@ -610,6 +611,7 @@ fn completeJob(a: A, adapter: anytype, repo: Repo, job: *Job, id: u64) !void {
     if (readback.id != id or try receipt(a, repo, job.*, &.{readback}) == null)
         return error.ReviewReadbackMismatch;
     job.receipt = id;
+    job.analysis = null;
     job.phase = .complete;
     job.outcome = "verified GitHub review";
     try adapter.persist();
@@ -632,11 +634,42 @@ pub const Prepared = struct {
 
 pub const ReviewResults = [engine_count]ReviewerResult;
 
+pub const SavedAnalysis = struct {
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+
+    fingerprint: [Sha256.digest_length]u8,
+    results: []const ReviewerResult,
+
+    fn key(a: A, repo: Repo, prepared: Prepared) ![Sha256.digest_length]u8 {
+        var hash = Sha256.init(.{});
+        hash.update(try io.json(a, repo));
+        hash.update(&.{0});
+        hash.update(try io.json(a, prepared.inherited.pins));
+        hash.update(&.{0});
+        hash.update(prepared.context);
+        return hash.finalResult();
+    }
+
+    pub fn matches(self: SavedAnalysis, a: A, repo: Repo, prepared: Prepared) !bool {
+        if (self.results.len != prepared.engines.len) return false;
+        for (self.results, prepared.engines) |result, engine| if (result.engine != engine) return false;
+        return eq(u8, &self.fingerprint, &(try key(a, repo, prepared)));
+    }
+
+    pub fn save(a: A, repo: Repo, prepared: Prepared, results: []const ReviewerResult) !SavedAnalysis {
+        return .{
+            .fingerprint = try key(a, repo, prepared),
+            // Clone into the coordinator's arena before the worker is freed.
+            .results = try io.parse(a, []const ReviewerResult, try io.json(a, results)),
+        };
+    }
+};
+
 // The same workflow runs against the CLI adapter and deterministic fakes.
 pub fn run(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?Payload {
     const prepared = (try prepare(a, adapter, repo, job, mode)) orelse return null;
     const results = try analyze(a, adapter, prepared.engines, prepared.context);
-    return finish(a, adapter, repo, job, prepared, &results);
+    return finish(a, adapter, repo, job, prepared, results[0..prepared.engines.len]);
 }
 
 pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?Prepared {
@@ -693,7 +726,7 @@ pub fn analyze(a: A, reviewer: anytype, engines: []const Engine, context: []cons
     return results;
 }
 
-pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared, results: *const ReviewResults) !?Payload {
+pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared, results: []const ReviewerResult) !?Payload {
     const supports_stacks = @hasDecl(std.meta.Child(@TypeOf(adapter)), "stackContext");
     const pr = prepared.pr;
     const threads = prepared.threads;
@@ -704,7 +737,7 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
     const latest = try adapter.pull(job.number);
     if (!sameTarget(pr, latest)) return error.TargetChanged;
     if (supports_stacks) try adapter.checkStack(inherited);
-    var result = try payload(a, adapter, repo, latest, snap, results[0..prepared.engines.len], threads, prepared.preview orelse .{});
+    var result = try payload(a, adapter, repo, latest, snap, results, threads, prepared.preview orelse .{});
     if (prepared.preview != null) return result;
     try adapter.saveResult(job.number, result);
     if (supports_stacks) try adapter.saveStackContext(pr, snap, result);
@@ -723,6 +756,7 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
         if (result.event == .APPROVE and !checksPassed(final)) return error.ChecksChanged;
         // Persist intent before making a network call. A restart can only reconcile this intent.
         job.phase = .uncertain;
+        job.analysis = null;
         job.event = result.event;
         try adapter.persist();
         const id = try adapter.post(pr.number, result);
@@ -731,6 +765,7 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
         try completeJob(a, adapter, repo, job, id);
         return result;
     }
+    job.analysis = null;
     job.outcome = "saved local review";
     job.phase = .complete;
     try adapter.persist();
