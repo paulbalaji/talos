@@ -26,6 +26,7 @@ talos status                          # See scans, queue, errors, and cache size
 
 | Do this | Run |
 | --- | --- |
+| Preview a specific PR with a review mode | `talos run-once OWNER/REPO 123 --mode perf-maxxing` |
 | Preview the next eligible reviews | `talos run-once` |
 | Preview the next review in one repo | `talos run-once OWNER/REPO` |
 | Show or set the reviewer default for new repos | `talos defaults` or `talos defaults --engine claude` |
@@ -41,6 +42,18 @@ talos status                          # See scans, queue, errors, and cache size
 | List flags and commands | `talos --help` |
 
 `run-once` always previews. `tick` uses the configured publication policy. A numbered preview also works while its repo is paused.
+
+### Focus a review
+
+Use a review mode on a numbered preview. Add `--prompt` to give the configured reviewers specific context or a question.
+
+```sh
+talos run-once OWNER/REPO 123 --mode perf-maxxing --prompt 'Check allocations on the request path.'
+talos run-once OWNER/REPO 123 --mode reliability-maxxing
+talos run-once OWNER/REPO 123 --mode security-maxxing
+```
+
+Performance covers hot paths and scaling. Reliability covers partial failure, retries, and recovery. Security checks trust boundaries and mitigations from static source. With no mode, Talos runs the general review. The prompt is sent to your configured reviewers, so keep credentials out of it.
 
 ### Review a PR stack
 
@@ -142,11 +155,11 @@ launchctl print "gui/$(id -u)/dev.talos.watcher"
 talos status --json
 ```
 
-The state directory is `~/.local/state/talos`. One process holds its lock at a time. Each tick takes at most one due PR per repo and runs the work serially. `state.json` holds reviewer defaults, the baseline, queue, stacks, publication receipts, and recent errors. `repos/OWNER/REPO/results/` holds candidate reviews. Check `launchd.log` for scheduler errors.
+The state directory is `~/.local/state/talos`. One process holds its lock at a time. Each tick admits up to three independent PRs per repo across five repos. Model reviews run in parallel. One coordinator collects source, updates state, and handles GitHub publication. PRs in a stack still wait for queued ancestors. `state.json` holds reviewer defaults, the baseline, queue, stacks, publication receipts, and recent errors. `repos/OWNER/REPO/results/` holds candidate reviews. Check `launchd.log` for scheduler errors.
 
-The default machine budget is three reviewer starts per tick. A PR with two configured reviewers reserves two starts. The same limit applies separately to receipt lookups, which use GitHub calls and zero reviewer starts. Set it with `talos queue-budget 3`. It must fit the largest configured reviewer list. Unserved work stays queued, and Talos rotates between repos across restarts. `status` shows the next eligible PR and the last active tick's review starts and GitHub CLI calls. Each repo keeps its own scan interval and Git cache limits.
+The machine budget defaults to 15 reviewer starts per tick for new installs. Existing installs keep their saved limit. A PR with two configured reviewers reserves two starts. The same limit applies separately to receipt lookups, which use GitHub calls and zero reviewer starts. Set it with `talos queue-budget 15`. It must fit the largest configured reviewer list. Unserved work stays queued, and Talos rotates between repos across restarts. `status` shows the next eligible PR and the last active tick's review starts and GitHub CLI calls. Each repo keeps its own scan interval and Git cache limits.
 
-A recognized GitHub rate limit holds scans and review jobs. A recognized reviewer rate limit holds jobs that use that reviewer. Talos saves these cooldowns across restarts and backs off from 60 seconds up to 16 minutes.
+A recognized GitHub rate limit holds scans and review jobs. A recognized reviewer rate limit holds jobs that use that reviewer. Talos saves these cooldowns across restarts and backs off from 60 seconds up to 16 minutes. During a GitHub cooldown it can hold up to 15 finished analyses for reuse. Reuse requires the same review inputs and fresh checks before publishing.
 
 Job retries back off from 30 seconds, with six attempts per head. Use `queue` to retry. If a POST may have reached GitHub, Talos retries the receipt lookup and leaves the head `uncertain` until it can confirm the result. Run one publisher per repo because GitHub has no cross-machine idempotency key for reviews.
 
