@@ -4,7 +4,8 @@ const io = @import("io.zig");
 const codex = @import("reviewers/codex.zig");
 const claude = @import("reviewers/claude.zig");
 const kimi = @import("reviewers/kimi.zig");
-pub const Profile = @import("reviewers/shared.zig").Profile;
+const shared = @import("reviewers/shared.zig");
+pub const Profile = shared.Profile;
 
 fn adapter(comptime engine: core.Engine) type {
     return switch (engine) {
@@ -31,18 +32,24 @@ pub const Runner = struct {
     bin: []const u8,
     engine: core.Engine,
     profile: Profile,
+    starts: ?*u32 = null,
 
     pub fn review(self: Runner, prompt: []const u8) ![]const u8 {
+        if (self.profile.model) |model| try shared.requireStandardModel(model);
         // Keep the same bound for all reviewers. Kimi passes the prompt as
         // one argument, so it must fit below Linux's per-argument limit.
-        if (prompt.len > 96 * 1024) return error.ReviewContextLimit;
+        if (prompt.len > core.review_context_limit) return error.ReviewContextLimit;
         switch (self.engine) {
             inline else => |engine| {
                 const reviewer = adapter(engine);
                 const invocation = try reviewer.prepare(self.cmd, self.bin, self.profile, prompt);
-                const output = self.cmd.run(invocation.args, invocation.stdin, 900) catch |err| {
-                    if (err == error.SubprocessTimeout) return error.ReviewerTimedOut;
-                    return reviewer.failure;
+                var cmd = self.cmd;
+                cmd.transport = @field(io.Transport, @tagName(engine));
+                if (self.starts) |count| count.* +|= 1;
+                const output = cmd.run(invocation.args, invocation.stdin, 900) catch |err| return switch (err) {
+                    error.SubprocessTimeout => error.ReviewerTimedOut,
+                    error.CodexRateLimited, error.ClaudeRateLimited, error.KimiRateLimited => err,
+                    else => reviewer.failure,
                 };
                 return reviewer.result(self.cmd, output);
             },
@@ -89,5 +96,20 @@ test "reviewer command profiles pin default models and preserve explicit overrid
         try t.expect(invocation.args.len >= case.expected_tail.len);
         const tail = invocation.args[invocation.args.len - case.expected_tail.len ..];
         for (case.expected_tail, tail) |expected, actual| try t.expectEqualStrings(expected, actual);
+        if (case.engine == .codex) {
+            var standard = false;
+            for (invocation.args) |arg| standard = standard or io.eq(u8, arg, "service_tier=\"default\"");
+            try t.expect(standard);
+        }
     }
+}
+
+test "reviewers cannot launch a saved high-speed model" {
+    const reviewer: Runner = .{
+        .cmd = undefined,
+        .bin = "kimi",
+        .engine = .kimi,
+        .profile = .{ .model = "kimi-code/k3.1-pro-highspeed[1m]" },
+    };
+    try std.testing.expectError(error.PremiumSpeedModelDisabled, reviewer.review("prompt"));
 }

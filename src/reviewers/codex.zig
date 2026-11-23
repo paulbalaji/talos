@@ -16,16 +16,17 @@ pub fn prepare(cmd: io.Command, bin: []const u8, profile: shared.Profile, prompt
     try io.write(cmd.dir, "schema.json", core.schema);
     var args: std.ArrayList([]const u8) = .empty;
     try args.appendSlice(cmd.a, &.{
-        bin,               "exec",                             "--ignore-user-config",  "--ignore-rules",
-        "--ephemeral",     "--skip-git-repo-check",            "--sandbox",             "read-only",
-        "--color",         "never",                            "--disable",             "shell_tool",
-        "--disable",       "apps",                             "--disable",             "plugins",
-        "--disable",       "hooks",                            "--disable",             "computer_use",
-        "--disable",       "browser_use",                      "--disable",             "multi_agent_v2",
-        "--disable",       "code_mode",                        "-c",                    "approval_policy=\"never\"",
-        "-c",              "web_search=\"disabled\"",          "-c",                    "project_doc_max_bytes=0",
-        "--output-schema", "schema.json",                      "--output-last-message", "result.json",
-        "-m",              profile.model orelse "gpt-6.2-sol",
+        bin,                     "exec",                     "--ignore-user-config", "--ignore-rules",
+        "--ephemeral",           "--skip-git-repo-check",    "--sandbox",            "read-only",
+        "--color",               "never",                    "--disable",            "shell_tool",
+        "--disable",             "apps",                     "--disable",            "plugins",
+        "--disable",             "hooks",                    "--disable",            "computer_use",
+        "--disable",             "browser_use",              "--disable",            "multi_agent_v2",
+        "--disable",             "code_mode",                "-c",                   "approval_policy=\"never\"",
+        "-c",                    "web_search=\"disabled\"",  "-c",                   "project_doc_max_bytes=0",
+        "--disable",             "fast_mode",                "--disable",            "ultrafast_mode",
+        "-c",                    "service_tier=\"default\"", "--output-schema",      "schema.json",
+        "--output-last-message", "result.json",              "-m",                   profile.model orelse "gpt-6.2-sol",
     });
     if (profile.effort != .default) {
         const setting = try io.fmt(cmd.a, "model_reasoning_effort=\"{s}\"", .{@tagName(profile.effort)});

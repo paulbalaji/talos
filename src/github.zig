@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("core.zig");
 const io = @import("io.zig");
+const stack = @import("stack.zig");
 const A = io.A;
 const eq = io.eq;
 
@@ -27,6 +28,14 @@ pub const Client = struct {
     cmd: io.Command,
     gh: []const u8,
     repo: []const u8,
+    calls: ?*u32 = null,
+
+    fn invoke(self: Client, args: []const []const u8, input: []const u8) ![]const u8 {
+        var cmd = self.cmd;
+        cmd.transport = .github;
+        if (self.calls) |count| count.* +|= 1;
+        return cmd.run(args, input, 90);
+    }
 
     fn endpoint(self: Client, suffix: []const u8) ![]const u8 {
         return io.fmt(self.cmd.a, "repos/{s}/{s}", .{ self.repo, suffix });
@@ -36,11 +45,11 @@ pub const Client = struct {
         var args: std.ArrayList([]const u8) = .empty;
         try args.appendSlice(self.cmd.a, &.{ self.gh, "api", "--hostname", "github.com", endpoint_path });
         try args.appendSlice(self.cmd.a, extra);
-        return self.cmd.run(args.items, input, 90);
+        return self.invoke(args.items, input);
     }
 
     pub fn identity(self: Client) ![]const u8 {
-        const result = self.api("user", &.{}, "") catch return error.GitHubIdentityFailed;
+        const result = self.api("user", &.{}, "") catch |err| return transportFailure(err, error.GitHubIdentityFailed);
         return (try io.parse(self.cmd.a, User, result)).login;
     }
 
@@ -58,7 +67,7 @@ pub const Client = struct {
         \\  repository(owner: $owner, name: $name) {
         \\    pullRequests(first: 100, after: $endCursor, states: [OPEN]) {
         \\      pageInfo { hasNextPage endCursor }
-        \\      nodes { number headRefOid isDraft }
+        \\      nodes { number headRefOid baseRefOid headRefName baseRefName headRepository { nameWithOwner } isDraft }
         \\    }
         \\  }
         \\}
@@ -70,7 +79,7 @@ pub const Client = struct {
         const args = [_][]const u8{
             "--paginate", "--slurp", "-f", try io.fmt(a, "query={s}", .{ready_query}),
         } ++ fields;
-        const raw = self.api("graphql", &args, "") catch return error.GitHubListFailed;
+        const raw = self.api("graphql", &args, "") catch |err| return transportFailure(err, error.GitHubListFailed);
         return decodeReady(a, raw);
     }
 
@@ -81,7 +90,7 @@ pub const Client = struct {
         var pulls: std.ArrayList(core.Pull) = .empty;
         var cursor: ?[]const u8 = null;
         for (responses, 0..) |page, index| {
-            if (page.errors != null) return error.GitHubListFailed;
+            try checkGraphErrors(page.errors, error.GitHubListFailed);
             const data = page.data orelse return error.GitHubListFailed;
             const connection = data.repository.pullRequests;
             cursor = try next(connection.pageInfo, cursor);
@@ -94,37 +103,62 @@ pub const Client = struct {
     pub fn pull(self: Client, number: u32) !core.Pull {
         const a = self.cmd.a;
         const repository = try io.fmt(a, "github.com/{s}", .{self.repo});
-        const input = self.cmd.run(&.{
+        const input = self.invoke(&.{
             self.gh,                                                                                           "pr", "view", try io.fmt(a, "{d}", .{number}), "-R", repository, "--json",
             "number,headRefOid,baseRefOid,isDraft,state,title,body,author,statusCheckRollup,mergeStateStatus",
-        }, "", 90) catch return error.GitHubPullFailed;
+        }, "") catch |err| return transportFailure(err, error.GitHubPullFailed);
         const result = try io.parse(a, core.Pull, input);
         if (result.number != number) return error.GitHubTargetMismatch;
         return result;
     }
 
+    pub fn stackPulls(self: Client, numbers: []const u32) ![]stack.Pin {
+        if (numbers.len == 0) return &.{};
+        const a = self.cmd.a;
+        var query: std.ArrayList(u8) = .empty;
+        const writer = query.writer(a);
+        try writer.writeAll("query($owner:String!,$name:String!){repository(owner:$owner,name:$name){");
+        for (numbers) |number| {
+            try writer.print("p{d}:pullRequest(number:{d}){{number headRefOid baseRefOid headRefName baseRefName headRepository{{nameWithOwner}} state isDraft}}", .{ number, number });
+        }
+        try writer.writeAll("}}");
+        const args = [_][]const u8{ "-f", try io.fmt(a, "query={s}", .{query.items}) } ++ try self.repoFields();
+        const input = self.api("graphql", &args, "") catch |err| return transportFailure(err, error.GitHubStackFailed);
+        const response = try io.parse(a, GraphResponse(struct { repository: std.json.Value }), input);
+        try checkGraphErrors(response.errors, error.GitHubStackFailed);
+        const data = response.data orelse return error.GitHubStackFailed;
+        if (data.repository != .object) return error.GitHubStackFailed;
+        const pins = try a.alloc(stack.Pin, numbers.len);
+        for (numbers, pins) |number, *pin| {
+            const node = data.repository.object.get(try io.fmt(a, "p{d}", .{number})) orelse return error.GitHubStackFailed;
+            pin.* = try std.json.parseFromValueLeaky(stack.Pin, a, node, .{});
+            if (pin.number != number or !pin.valid()) return error.GitHubTargetMismatch;
+        }
+        return pins;
+    }
+
     pub fn reviews(self: Client, number: u32) ![]const core.Prior {
-        return self.pages(core.Prior, try io.fmt(self.cmd.a, "pulls/{d}/reviews?per_page=100", .{number})) catch
-            error.GitHubReviewsFailed;
+        return self.pages(core.Prior, try io.fmt(self.cmd.a, "pulls/{d}/reviews?per_page=100", .{number})) catch |err|
+            transportFailure(err, error.GitHubReviewsFailed);
     }
 
     pub fn files(self: Client, number: u32) ![]const File {
-        return self.pages(File, try io.fmt(self.cmd.a, "pulls/{d}/files?per_page=100", .{number})) catch
-            error.GitHubFilesFailed;
+        return self.pages(File, try io.fmt(self.cmd.a, "pulls/{d}/files?per_page=100", .{number})) catch |err|
+            transportFailure(err, error.GitHubFilesFailed);
     }
 
     pub fn post(self: Client, number: u32, payload: core.Payload) !u64 {
         const a = self.cmd.a;
         const target = try self.endpoint(try io.fmt(a, "pulls/{d}/reviews", .{number}));
-        const data = self.api(target, &.{ "--method", "POST", "--input", "-" }, try io.json(a, payload)) catch
-            return error.GitHubPostUnconfirmed;
+        const data = self.api(target, &.{ "--method", "POST", "--input", "-" }, try io.json(a, payload)) catch |err|
+            return transportFailure(err, error.GitHubPostUnconfirmed);
         return (try io.parse(a, struct { id: u64 }, data)).id;
     }
 
     pub fn readReview(self: Client, number: u32, id: u64) !core.Prior {
         const a = self.cmd.a;
         const target = try self.endpoint(try io.fmt(a, "pulls/{d}/reviews/{d}", .{ number, id }));
-        const data = self.api(target, &.{}, "") catch return error.GitHubReadbackFailed;
+        const data = self.api(target, &.{}, "") catch |err| return transportFailure(err, error.GitHubReadbackFailed);
         return io.parse(a, core.Prior, data);
     }
 
@@ -134,9 +168,9 @@ pub const Client = struct {
         try args.appendSlice(a, &.{ "-f", try io.fmt(a, "query={s}", .{query}) });
         try args.appendSlice(a, fields);
         if (cursor) |value| try args.appendSlice(a, &.{ "-f", try io.fmt(a, "cursor={s}", .{value}) });
-        const input = self.api("graphql", args.items, "") catch return error.GitHubThreadsFailed;
+        const input = self.api("graphql", args.items, "") catch |err| return transportFailure(err, error.GitHubThreadsFailed);
         const result = try io.parse(a, GraphResponse(Data), input);
-        if (result.errors != null) return error.GitHubThreadsFailed;
+        try checkGraphErrors(result.errors, error.GitHubThreadsFailed);
         return result.data orelse error.GitHubThreadsFailed;
     }
 
@@ -226,6 +260,20 @@ pub const Client = struct {
     }
 };
 
+fn transportFailure(err: anyerror, fallback: anyerror) anyerror {
+    return if (err == error.GitHubRateLimited) err else fallback;
+}
+
+fn checkGraphErrors(errors: ?[]const std.json.Value, fallback: anyerror) !void {
+    const items = errors orelse return;
+    for (items) |item| {
+        if (item != .object) continue;
+        const kind = item.object.get("type") orelse continue;
+        if (kind == .string and eq(u8, kind.string, "RATE_LIMITED")) return error.GitHubRateLimited;
+    }
+    return fallback;
+}
+
 test "a paginated scan rejects partial responses and preserves discovery order" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -243,4 +291,5 @@ test "a paginated scan rejects partial responses and preserves discovery order" 
     try std.testing.expectError(error.InvalidPagination, Client.decodeReady(a, "[" ++ page1 ++ "]"));
     try std.testing.expectError(error.InvalidPagination, Client.decodeReady(a, "[" ++ page1 ++ "," ++ page1 ++ "]"));
     try std.testing.expectError(error.GitHubListFailed, Client.decodeReady(a, "[" ++ page1 ++ ",{\"errors\":[{}]}]"));
+    try std.testing.expectError(error.GitHubRateLimited, Client.decodeReady(a, "[{\"errors\":[{\"type\":\"RATE_LIMITED\"}]}]"));
 }

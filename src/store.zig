@@ -1,11 +1,13 @@
 const std = @import("std");
 const io = @import("io.zig");
 const core = @import("core.zig");
+const queue = @import("queue.zig");
 const A = io.A;
 
 pub const State = struct {
     version: u32 = 1,
     default_engines: []const core.Engine = &.{.codex},
+    queue_budget: queue.Budget = .{},
     entries: []core.Entry = &.{},
 
     pub fn find(self: *State, repo: []const u8) ?*core.Entry {
@@ -61,11 +63,12 @@ pub const Store = struct {
         const state = try io.parse(self.a, State, data);
         if (state.version != 1) return error.UnsupportedStateVersion;
         try core.validateEngines(state.default_engines);
+        try state.queue_budget.validate(state.entries);
         return state;
     }
 
     pub fn save(self: Store, state: *const State) !void {
-        try io.write(self.dir, "state.json", try io.json(self.a, state));
+        try io.writeJson(self.dir, "state.json", state);
     }
 
     pub fn repoPath(self: Store, repo: []const u8, suffix: []const u8) ![]const u8 {
@@ -96,6 +99,6 @@ pub const Store = struct {
         const dir = try self.repoPath(repo, "results");
         try self.dir.makePath(dir);
         const path = try io.fmt(self.a, "{s}/{d}.json", .{ dir, number });
-        try io.write(self.dir, path, try io.json(self.a, payload));
+        try io.writeJson(self.dir, path, payload);
     }
 };
