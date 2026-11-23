@@ -13,7 +13,6 @@ const batch_size = 32;
 pub const max_requests = core.max_evidence_requests;
 const supplement_limit = 16 * 1024;
 const delta_limit = 12 * 1024;
-pub const max_supplement_bytes = supplement_limit + delta_limit + 1024;
 const excerpt_blob_limit = 128 * 1024;
 const excerpt_line_limit = 120;
 
@@ -216,9 +215,18 @@ pub const Git = struct {
             "origin", try io.fmt(a, "+refs/pull/{d}/head:{s}", .{ pr.number, head_ref }), try io.fmt(a, "+{s}:{s}", .{ pr.baseRefOid, base_ref }),
         };
         _ = self.git(path, &args, "") catch return error.GitFetchFailed;
-        const pins = io.trim(u8, try self.git(path, &.{ "rev-parse", head_ref, base_ref }, ""), "\r\n");
+        if (!try self.cachedPinsMatch(path, pr)) return error.TargetChanged;
+    }
+
+    fn cachedPinsMatch(self: Git, path: []const u8, pr: core.Pull) !bool {
+        const raw = self.git(path, &.{ "rev-parse", "refs/talos/head", "refs/talos/base" }, "") catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return false,
+        };
+        const pins = io.trim(u8, raw, "\r\n");
+        const a = self.cmd.a;
         const expected = try io.fmt(a, "{s}\n{s}", .{ pr.headRefOid, pr.baseRefOid });
-        if (!eq(u8, pins, expected)) return error.TargetChanged;
+        return eq(u8, pins, expected);
     }
 
     fn diff(self: Git, cache_path: []const u8, base: []const u8, head: []const u8) ![]const u8 {
@@ -230,6 +238,7 @@ pub const Git = struct {
         const a = self.cmd.a;
         const previous = if (previous_head) |oid| if (eq(u8, oid, pr.headRefOid)) null else oid else null;
         if (previous == null and requests.len == 0) return .{};
+        if (!core.validOid(pr.headRefOid) or !core.validOid(pr.baseRefOid)) return error.InvalidCommit;
         var repo_dir = (try self.object_cache.repoDir(true)) orelse return error.GitCacheInitFailed;
         defer repo_dir.close();
         const parent = try repo_dir.realpathAlloc(a, ".");
@@ -237,7 +246,7 @@ pub const Git = struct {
         try self.object_cache.evict(repo_dir, std.time.timestamp());
         errdefer self.object_cache.evict(repo_dir, std.time.timestamp()) catch |err|
             std.log.warn("Git cache eviction failed for {s} ({s})", .{ self.object_cache.repo.name, @errorName(err) });
-        try self.pin(repo_dir, cache_path, pr);
+        if (!try self.cachedPinsMatch(cache_path, pr)) try self.pin(repo_dir, cache_path, pr);
         const result = try self.readSupplement(cache_path, pr.headRefOid, previous, requests);
         try self.object_cache.evict(repo_dir, std.time.timestamp());
         return result;

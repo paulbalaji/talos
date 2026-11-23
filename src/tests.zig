@@ -367,10 +367,11 @@ test "an otherwise clean same-head review can approve once checks pass" {
         .replies = &.{.{ .author = .{ .login = "author" }, .body = "Documented follow-up accepted.", .url = "accepted-reply" }},
     };
     var fake: Fake = .{ .a = a, .result = clean, .discussion = &.{resolved} };
-    fake.target.statusCheckRollup = &.{.{ .status = "QUEUED" }};
+    fake.target.statusCheckRollup = &.{.{ .name = "Build and test", .status = "QUEUED" }};
     var job: core.Job = .{ .number = fixture_pull.number, .head = head };
     const before = (try core.run(a, &fake, configured, &job, .scheduled)).?;
     try t.expectEqual(core.Event.COMMENT, before.event);
+    try t.expect(std.mem.indexOf(u8, before.body, "Build and test · QUEUED") != null);
     try t.expect(job.awaiting_checks);
     job.observeReviewInput(try core.ReviewInput.init(a, configured, fake.target, base, try fake.reviewDiscussion(42)), false);
     try t.expectEqual(core.Phase.complete, job.phase);

@@ -1010,6 +1010,8 @@ const Main = struct {
                     });
                     job.analysis = null;
                     job.route_progress = null;
+                    job.last_review = null;
+                    job.expected_inline = null;
                     if (job.options.request != null) job.options.request = "(set)";
                 }
                 try self.out("{s}{s}", .{ if (first) "" else ",", try io.json(self.a, .{
