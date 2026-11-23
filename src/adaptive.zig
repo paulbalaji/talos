@@ -55,7 +55,11 @@ pub fn run(a: io.A, reviewer: anytype, plan: Plan) !Outcome {
     }
 
     const required = requestedCount(plan.repo, applied);
-    if (plan.providers.len < required) return outcome;
+    if (plan.providers.len < required) {
+        // Keep the decision and pin for discovery without retaining a review.
+        progress.screen_result = null;
+        return outcome;
+    }
     const prompt = try core.routedPrompt(a, plan.prepared.context, applied);
     // If only the additional lens header would overflow the transport, keep
     // its requirements and mark the review incomplete rather than dropping a lens.
@@ -98,7 +102,7 @@ fn screen(a: io.A, reviewer: anytype, plan: Plan, progress: *core.RouteProgress)
             var timer = try std.time.Timer.start();
             const raw = reviewer.routeReview(engine, model, core.screen_schema, prompt) catch |err| {
                 progress.screen_ms +|= timer.read() / std.time.ns_per_ms;
-                if (err == error.ProviderBudgetReached) continue;
+                if (unavailable(err)) continue;
                 break;
             };
             progress.screen_ms +|= timer.read() / std.time.ns_per_ms;
@@ -148,6 +152,7 @@ const MockReviewer = struct {
     count: u32 = 0,
     unavailable_engine: ?core.Engine = null,
     screen_enabled: bool = true,
+    screen_rate_limit: bool = false,
 
     pub fn available(self: *MockReviewer, engine: core.Engine) bool {
         return self.unavailable_engine != engine;
@@ -162,6 +167,7 @@ const MockReviewer = struct {
         self.count += 1;
         if (model != null) {
             try std.testing.expectEqualStrings(core.screen_schema, schema);
+            if (self.screen_rate_limit and engine == .codex) return error.CodexRateLimited;
             return if (self.screen_enabled) light_screen else "malformed";
         }
         try std.testing.expect(!std.mem.containsAtLeast(u8, prompt, 1, "Choose review fidelity"));
@@ -245,4 +251,22 @@ test "independence survives a pause and a completed provider is never repeated" 
     try t.expectEqual(routing.Depth.multi, final.report.?.applied.depth);
     try t.expectEqualSlices(core.Engine, &.{ .codex, .claude }, final.report.?.providers);
     try t.expectEqualSlices(core.Engine, &.{.claude}, resumed.calls[0..resumed.count]);
+}
+
+test "an authorized light model takes over screening after a provider rate limit" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    var plan = sample_plan;
+    plan.repo.light_models = &.{
+        .{ .engine = .codex, .model = "primary-fixture" },
+        .{ .engine = .claude, .model = "fallback-fixture" },
+    };
+    plan.start_limit = @import("queue.zig").reviewerCost(plan.repo);
+    try t.expectEqual(@as(u32, 4), plan.start_limit);
+    var reviewer: MockReviewer = .{ .screen_rate_limit = true };
+    const outcome = try run(arena.allocator(), &reviewer, plan);
+    try t.expectEqual(routing.Depth.light, outcome.report.?.applied.depth);
+    try t.expectEqual(@as(?core.Engine, .claude), outcome.report.?.screen_provider);
+    try t.expectEqualSlices(core.Engine, &.{ .codex, .claude }, reviewer.calls[0..reviewer.count]);
 }

@@ -129,9 +129,7 @@ pub const Budget = struct {
         var at = @max(job.next, self.github.until);
         if (job.phase != .uncertain and job.analysis == null) {
             if (job.route_progress) |progress| {
-                if (progress.decision) |decision| {
-                    if (entry.repo.routing_mode == .adaptive and decision.depth == .multi and entry.repo.providerCount() < 2) return null;
-                }
+                if (progress.needsAnotherProvider(entry.repo)) return null;
             }
             at = @max(at, self.reviewAt(entry.repo, job.route_progress, now, limited, current) orelse return null);
         }
@@ -150,11 +148,13 @@ pub const Budget = struct {
         return next;
     }
 
-    pub fn pick(self: Budget, entry: *core.Entry, now: i64, remaining: u32, receipts: u32, selected: []const u32, limited: u8, current: usage.Snapshot) Pick {
+    pub fn pick(self: Budget, entry: *core.Entry, now: i64, remaining: u32, receipts: u32, selected: []const u32, limited: u8, current: usage.Snapshot, allow_fresh_routed: bool) Pick {
         var result: Pick = .{};
         for (entry.jobs) |*job| {
             const at = self.eligibleAt(entry.*, job.*, now, limited, current) orelse continue;
             if (at > now or std.mem.indexOfScalar(u32, selected, job.number) != null) continue;
+            if (!allow_fresh_routed and entry.repo.usesRouting() and
+                job.phase == .pending and job.route_progress == null and job.analysis == null) continue;
             if (jobCost(entry.repo, job.*) > remaining or (job.phase == .uncertain and receipts == 0)) {
                 result.budget_deferred = true;
                 continue;
@@ -172,7 +172,8 @@ pub fn engineBit(engine: core.Engine) u8 {
 
 pub fn reviewerCost(repo: core.Repo) u32 {
     const full = if (repo.routing_mode == .adaptive) @max(2, repo.reviewSize()) else repo.reviewSize();
-    return @intCast(full + @intFromBool(repo.routing_mode != .fixed and repo.light_models.len != 0));
+    const screen_count = if (repo.routing_mode == .fixed) 0 else repo.light_models.len;
+    return @intCast(full + screen_count);
 }
 
 fn jobCost(repo: core.Repo, job: core.Job) u32 {
@@ -191,14 +192,14 @@ test "queue selection accounts for reviewer count and leaves receipt lookup elig
     const budget: Budget = .{};
     try t.expectError(error.ReviewBudgetTooSmall, (Budget{ .limit = 2 }).validate(&.{entry}));
     const limited = engineBit(.claude);
-    const cooled = budget.pick(&entry, 100, budget.limit, budget.limit, &.{}, limited, .{});
+    const cooled = budget.pick(&entry, 100, budget.limit, budget.limit, &.{}, limited, .{}, true);
     try t.expect(!cooled.budget_deferred);
     try t.expectEqual(@as(u32, 2), cooled.job.?.number);
-    const receipt = budget.pick(&entry, 100, 0, budget.limit, &.{}, 0, .{});
+    const receipt = budget.pick(&entry, 100, 0, budget.limit, &.{}, 0, .{}, true);
     try t.expect(receipt.budget_deferred);
     try t.expectEqual(@as(u32, 2), receipt.job.?.number);
-    try t.expect(budget.pick(&entry, 100, 0, 0, &.{}, 0, .{}).job == null);
-    const next = budget.pick(&entry, 100, budget.limit, budget.limit, &.{}, 0, .{});
+    try t.expect(budget.pick(&entry, 100, 0, 0, &.{}, 0, .{}, true).job == null);
+    const next = budget.pick(&entry, 100, budget.limit, budget.limit, &.{}, 0, .{}, true);
     try t.expect(!next.budget_deferred);
     try t.expectEqual(@as(u32, 1), next.job.?.number);
     try t.expectEqual(@as(u32, 3), budget.nextEligible(entry, 100, .{}).?.reviewer_starts);
@@ -213,11 +214,55 @@ test "a batch excludes multiple heads of the same PR" {
     var entry: core.Entry = .{ .repo = .{ .name = "owner/repo", .login = "user" }, .jobs = &jobs };
     var lane: RepoJobs = .{ .index = 0 };
     const budget: Budget = .{};
-    const first = budget.pick(&entry, 100, 3, 3, lane.selected(), 0, .{}).job.?;
+    const first = budget.pick(&entry, 100, 3, 3, lane.selected(), 0, .{}, true).job.?;
     try std.testing.expectEqualStrings("old", first.head);
     lane.add(first.number);
-    const next = budget.pick(&entry, 100, 3, 3, lane.selected(), 0, .{}).job.?;
+    const next = budget.pick(&entry, 100, 3, 3, lane.selected(), 0, .{}, true).job.?;
     try std.testing.expectEqual(@as(u32, 2), next.number);
+}
+
+test "checkpoint saturation leaves saved passes and receipts selectable" {
+    const t = std.testing;
+    var jobs = [_]core.Job{
+        .{ .number = 1, .head = "fresh" },
+        .{ .number = 2, .head = "saved", .route_progress = .{ .fingerprint = @splat(0) } },
+        .{ .number = 3, .head = "receipt", .phase = .uncertain },
+    };
+    var entry: core.Entry = .{
+        .repo = .{ .name = "owner/repo", .login = "user", .routing_mode = .adaptive },
+        .jobs = &jobs,
+    };
+    const budget: Budget = .{};
+    try t.expectEqual(@as(u32, 1), budget.pick(&entry, 100, 2, 2, &.{}, 0, .{}, true).job.?.number);
+    try t.expectEqual(@as(u32, 2), budget.pick(&entry, 100, 2, 2, &.{}, 0, .{}, false).job.?.number);
+    try t.expectEqual(@as(u32, 3), budget.pick(&entry, 100, 2, 2, &.{2}, 0, .{}, false).job.?.number);
+}
+
+test "a retargeted head can leave a route waiting for more providers" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var pull: core.Pull = .{
+        .number = 1,
+        .headRefOid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .baseRefOid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .isDraft = false,
+    };
+    var entry: core.Entry = .{ .repo = .{ .name = "owner/repo", .login = "user", .routing_mode = .adaptive } };
+    try entry.queue(a, pull, null);
+    entry.jobs[0].route_progress = .{
+        .base = pull.baseRefOid,
+        .fingerprint = @splat(0),
+        .decision = .{ .depth = .multi, .security = true },
+    };
+    const budget: Budget = .{};
+    try entry.discover(a, &.{pull}, false);
+    try t.expect(budget.nextEligible(entry, 100, .{}) == null);
+    pull.baseRefOid = "cccccccccccccccccccccccccccccccccccccccc";
+    try entry.discover(a, &.{pull}, false);
+    try t.expectEqual(@as(usize, 1), entry.jobs.len);
+    try t.expectEqual(@as(u32, 1), budget.nextEligible(entry, 100, .{}).?.number);
 }
 
 test "transport cooldowns block only affected starts and stay bounded" {
@@ -232,14 +277,14 @@ test "transport cooldowns block only affected starts and stay bounded" {
         .{ .number = 1, .head = "next", .attempts = 1, .next = 130 },
     };
     var entry: core.Entry = .{ .repo = .{ .name = "owner/repo", .login = "user", .additional_engines = &.{.claude} }, .jobs = &jobs };
-    try t.expect(budget.pick(&entry, 130, 2, 2, &.{}, 0, .{}).job == null);
+    try t.expect(budget.pick(&entry, 130, 2, 2, &.{}, 0, .{}, true).job == null);
     try t.expectEqual(@as(i64, 160), budget.nextEligible(entry, 130, .{}).?.at);
-    try t.expect(budget.pick(&entry, 160, 2, 2, &.{}, 0, .{}).job != null);
+    try t.expect(budget.pick(&entry, 160, 2, 2, &.{}, 0, .{}, true).job != null);
     entry.jobs[0].phase = .uncertain;
-    try t.expect(budget.pick(&entry, 130, 0, 2, &.{}, 0, .{}).job != null);
+    try t.expect(budget.pick(&entry, 130, 0, 2, &.{}, 0, .{}, true).job != null);
     budget.noteFailure(130, error.GitHubRateLimited);
     try t.expect(!budget.canScan(131));
-    try t.expect(budget.pick(&entry, 131, 0, 2, &.{}, 0, .{}).job == null);
+    try t.expect(budget.pick(&entry, 131, 0, 2, &.{}, 0, .{}, true).job == null);
     for (0..15) |_| budget.noteFailure(budget.github.until, error.GitHubRateLimited);
     try t.expectEqual(@as(u8, 5), budget.github.attempts);
 }

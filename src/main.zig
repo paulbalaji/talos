@@ -645,12 +645,11 @@ const Main = struct {
         try self.finishReady(state, counts, batch);
         const entry = &state.entries[lane.index];
         if (try self.db.paused(entry.repo.name)) return false;
-        const decision = state.queue_budget.pick(entry, std.time.timestamp(), batch.starts_left, batch.receipts_left, lane.selected(), batch.limited.load(.monotonic), batch.usageSnapshot());
+        const allow_fresh_routed = retainedCount(state) + batch.pending < queue.parallel_jobs;
+        const decision = state.queue_budget.pick(entry, std.time.timestamp(), batch.starts_left, batch.receipts_left, lane.selected(), batch.limited.load(.monotonic), batch.usageSnapshot(), allow_fresh_routed);
         if (decision.budget_deferred or (!has_slot and decision.job != null)) batch.deferRepo(lane.index);
         const job = decision.job orelse return false;
         if (!has_slot) return false;
-        if (entry.repo.usesRouting() and job.phase == .pending and job.route_progress == null and job.analysis == null and
-            retainedCount(state) + batch.pending >= queue.parallel_jobs) return false;
         lane.add(job.number);
 
         // Reserve the full ensemble before touching GitHub. Deduplicated
@@ -692,7 +691,7 @@ const Main = struct {
         work.policy = state.queue_budget;
         if (entry.repo.usesRouting()) {
             const fingerprint = try core.SavedAnalysis.key(self.a, entry.repo, work.prepared);
-            var progress: core.RouteProgress = .{ .fingerprint = fingerprint };
+            var progress: core.RouteProgress = .{ .fingerprint = fingerprint, .base = work.prepared.pr.baseRefOid };
             if (job.route_progress) |saved| {
                 if (eq(u8, &saved.fingerprint, &fingerprint)) {
                     progress = saved;
@@ -769,7 +768,10 @@ const Main = struct {
     fn retainedCount(state: *const store.State) usize {
         var retained: usize = 0;
         for (state.entries) |entry| {
-            for (entry.jobs) |job| retained += @intFromBool(job.analysis != null or job.route_progress != null);
+            for (entry.jobs) |job| {
+                const has_checkpoint = if (job.route_progress) |progress| !progress.needsAnotherProvider(entry.repo) else false;
+                retained += @intFromBool(job.analysis != null or has_checkpoint);
+            }
         }
         return retained;
     }

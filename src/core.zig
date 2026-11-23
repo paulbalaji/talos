@@ -180,7 +180,7 @@ pub const Seen = struct { number: u32, head: []const u8 };
 const Discovery = struct {
     observed: bool = false,
     queued: bool = false,
-    ready: bool = false,
+    ready_base: ?[]const u8 = null,
 };
 pub const SeenContext = struct {
     pub fn hash(_: SeenContext, key: Seen) u64 {
@@ -254,14 +254,20 @@ pub const Entry = struct {
             try ready.append(a, seen);
             const slot = try index.getOrPut(a, seen);
             if (!slot.found_existing) slot.value_ptr.* = .{};
-            slot.value_ptr.ready = true;
+            slot.value_ptr.ready_base = pr.baseRefOid;
         }
         var retained: std.ArrayList(Job) = .empty;
         errdefer retained.deinit(a);
         try retained.ensureTotalCapacity(a, self.jobs.len);
         for (self.jobs) |job| {
-            if (job.phase == .uncertain or index.get(.{ .number = job.number, .head = job.head }).?.ready)
-                retained.appendAssumeCapacity(job);
+            var current = job;
+            const base = index.get(.{ .number = job.number, .head = job.head }).?.ready_base;
+            if (job.phase == .pending and base != null) {
+                if (job.route_progress) |progress| {
+                    if (!eq(u8, progress.base, base.?)) current.route_progress = null;
+                }
+            }
+            if (job.phase == .uncertain or base != null) retained.appendAssumeCapacity(current);
         }
         if (!baseline) {
             for (ready.items) |seen| {
@@ -726,12 +732,18 @@ pub const Prepared = struct {
 
 pub const RouteProgress = struct {
     fingerprint: [32]u8,
+    base: []const u8 = "",
     decision: ?routing.Decision = null,
     screen_waiting: bool = true,
     screen_result: ?ReviewerResult = null,
     screen_ms: u64 = 0,
     results: []const ReviewerResult = &.{},
     review_ms: u64 = 0,
+
+    pub fn needsAnotherProvider(self: RouteProgress, repo: Repo) bool {
+        const decision = self.decision orelse return false;
+        return repo.routing_mode == .adaptive and decision.depth == .multi and repo.providerCount() < 2;
+    }
 };
 
 pub const RouteReport = struct {
