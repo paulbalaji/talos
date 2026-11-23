@@ -21,7 +21,7 @@ const usage =
     \\talos [--home DIR] status [OWNER/REPO] [--json]
     \\talos [--home DIR] result OWNER/REPO PR
     \\talos [--home DIR] queue-budget [STARTS]
-    \\talos [--home DIR] queue OWNER/REPO PR [--mode MODE] [--prompt TEXT]
+    \\talos [--home DIR] queue OWNER/REPO PR [--mode MODE] [--prompt TEXT [--publish]]
     \\talos [--home DIR] stack OWNER/REPO STACK_NUMBER
     \\talos [--home DIR] stack OWNER/REPO NAME PR PR [PR ...]
     \\talos [--home DIR] unstack OWNER/REPO NAME
@@ -701,14 +701,20 @@ const Main = struct {
         return pr;
     }
 
-    fn reviewOptions(args: []const []const u8) !core.ReviewOptions {
+    fn reviewOptions(args: []const []const u8, allow_publish: bool) !core.ReviewOptions {
         var options: core.ReviewOptions = .{};
         var has_mode = false;
-        if (args.len % 2 != 0) return error.Usage;
         var index: usize = 0;
-        while (index < args.len) : (index += 2) {
+        while (index < args.len) {
             const flag = args[index];
-            const value = args[index + 1];
+            index += 1;
+            if (eq(u8, flag, "--publish") and allow_publish and !options.publish_prompted) {
+                options.publish_prompted = true;
+                continue;
+            }
+            if (index == args.len) return error.Usage;
+            const value = args[index];
+            index += 1;
             if (eq(u8, flag, "--mode") and !has_mode) {
                 options.focus = std.meta.stringToEnum(core.ReviewFocus, value) orelse return error.InvalidReviewMode;
                 has_mode = true;
@@ -717,12 +723,13 @@ const Main = struct {
                 options.request = value;
             } else return error.Usage;
         }
+        if (options.publish_prompted and options.request == null) return error.Usage;
         return options;
     }
 
     fn dry(self: Main, state: *store.State, args: []const []const u8) !void {
         var preview: core.Preview = .{
-            .options = if (args.len > 2) try reviewOptions(args[2..]) else null,
+            .options = if (args.len > 2) try reviewOptions(args[2..], false) else null,
         };
         if (args.len >= 1 and !core.validRepoName(args[0])) return error.Usage;
         const number = if (args.len >= 2) try prNumber(args[1]) else null;
@@ -911,11 +918,20 @@ const Main = struct {
             return self.out("Removed {s} stack {s}\n", .{ entry.repo.name, params[1] });
         }
         if (eq(u8, cmd, "queue") and params.len >= 2) {
-            const options = if (params.len > 2) try reviewOptions(params[2..]) else null;
+            const options = if (params.len > 2) try reviewOptions(params[2..], true) else null;
             const entry = state.find(params[0]) orelse return error.UnknownRepository;
             const pull = try self.choose(entry, try prNumber(params[1]));
             try entry.queue(self.a, pull, options);
             try self.db.save(&state);
+            for (entry.jobs) |job| {
+                if (job.number != pull.number or !eq(u8, job.head, pull.headRefOid)) continue;
+                if (job.phase == .uncertain) return self.out("Queued receipt reconciliation for {s} #{d} at {s}{s}\n", .{
+                    entry.repo.name,                                                           job.number, job.head,
+                    if (options != null) ". Review options apply only to new reviews" else "",
+                });
+                if (job.phase == .complete) return self.out("Already reviewed {s} #{d} at {s}\n", .{ entry.repo.name, job.number, job.head });
+                break;
+            }
             return self.out("Selected {s} #{d} at {s}\n", .{ entry.repo.name, pull.number, pull.headRefOid });
         }
         return error.Usage;
@@ -1165,14 +1181,17 @@ test "a budget-deferred ensemble gets first turn after reload" {
 test "numbered preview accepts each mode and one operator prompt" {
     const t = std.testing;
     for (std.meta.tags(core.ReviewFocus)) |mode| {
-        const options = try Main.reviewOptions(&.{ "--prompt", "Review the allocator path.", "--mode", @tagName(mode) });
+        const options = try Main.reviewOptions(&.{ "--prompt", "Review the allocator path.", "--mode", @tagName(mode) }, false);
         try t.expectEqual(mode, options.focus);
         try t.expectEqualStrings("Review the allocator path.", options.request.?);
     }
-    try t.expectError(error.InvalidReviewMode, Main.reviewOptions(&.{ "--mode", "unknown" }));
-    try t.expectError(error.Usage, Main.reviewOptions(&.{ "--mode", "general", "--mode", "general" }));
-    try t.expectError(error.Usage, Main.reviewOptions(&.{"--prompt"}));
-    try t.expectError(error.InvalidReviewPrompt, Main.reviewOptions(&.{ "--prompt", "  " }));
+    try t.expectError(error.InvalidReviewMode, Main.reviewOptions(&.{ "--mode", "unknown" }, false));
+    try t.expectError(error.Usage, Main.reviewOptions(&.{ "--mode", "general", "--mode", "general" }, false));
+    try t.expectError(error.Usage, Main.reviewOptions(&.{"--prompt"}, false));
+    try t.expectError(error.InvalidReviewPrompt, Main.reviewOptions(&.{ "--prompt", "  " }, false));
+    try t.expectError(error.Usage, Main.reviewOptions(&.{ "--prompt", "Check retries.", "--publish" }, false));
+    try t.expectError(error.Usage, Main.reviewOptions(&.{"--publish"}, true));
+    try t.expect((try Main.reviewOptions(&.{ "--publish", "--prompt", "Check retries." }, true)).publish_prompted);
 }
 
 test "review workers overlap and use separate scratch directories" {
@@ -1196,7 +1215,7 @@ test "review workers overlap and use separate scratch directories" {
         \\    sleep 0.05
         \\done
         \\while [ "$1" != "--output-last-message" ]; do shift; done
-        \\printf '%s' '{"complete":true,"summary":"Fixture","findings":[],"existing_open_findings":[]}' > "$2"
+        \\printf '%s' '{"complete":true,"summary":"Fixture","findings":[],"existing_open_findings":[],"non_blocking_threads":[]}' > "$2"
     ;
     var env = std.process.EnvMap.init(a);
     try env.put("HOME", path);

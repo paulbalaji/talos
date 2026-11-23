@@ -18,10 +18,10 @@ const fixture_pull = core.Pull{
     .author = .{ .login = "author" },
 };
 const finding =
-    \\{"complete":true,"summary":"Static review.","findings":[{"severity":"P2","path":"src/watch.rs","line":20,"body":"The cursor skips a height."}],"existing_open_findings":[]}
+    \\{"complete":true,"summary":"Static review.","findings":[{"severity":"P2","path":"src/watch.rs","line":20,"body":"The cursor skips a height."}],"existing_open_findings":[],"non_blocking_threads":[]}
 ;
 const clean =
-    \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":[]}
+    \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":[],"non_blocking_threads":[]}
 ;
 
 const Fake = struct {
@@ -237,10 +237,10 @@ test "multiple reviewers produce one verified review with one comment per anchor
     configured.additional_engines = &.{ .codex, .kimi };
     configured.approvals = true;
     const same_finding =
-        \\{"complete":true,"summary":"Second pass.","findings":[{"severity":"P1","path":"src/watch.rs","line":20,"body":"The cursor skips a height."}],"existing_open_findings":["unresolved","resolved"]}
+        \\{"complete":true,"summary":"Second pass.","findings":[{"severity":"P1","path":"src/watch.rs","line":20,"body":"The cursor skips a height."}],"existing_open_findings":["unresolved","resolved"],"non_blocking_threads":[]}
     ;
     const distinct_finding =
-        \\{"complete":true,"summary":"Third pass.","findings":[{"severity":"P2","path":"src/watch.rs","line":20,"body":"The cursor is saved before processing succeeds."},{"severity":"P3","path":"src/watch.rs","line":40,"body":"The log omits the cursor."}],"existing_open_findings":["unresolved"]}
+        \\{"complete":true,"summary":"Third pass.","findings":[{"severity":"P2","path":"src/watch.rs","line":20,"body":"The cursor is saved before processing succeeds."},{"severity":"P3","path":"src/watch.rs","line":40,"body":"The log omits the cursor."}],"existing_open_findings":["unresolved"],"non_blocking_threads":[]}
     ;
     var fake = Fake{
         .a = a,
@@ -277,7 +277,7 @@ test "every configured reviewer must succeed and report complete coverage for ap
     configured.additional_engines = &.{.claude};
     configured.approvals = true;
     const incomplete =
-        \\{"complete":false,"summary":"Incomplete coverage.","findings":[],"existing_open_findings":[]}
+        \\{"complete":false,"summary":"Incomplete coverage.","findings":[],"existing_open_findings":[],"non_blocking_threads":[]}
     ;
     var job = core.Job{ .number = 42, .head = head };
     var failing = Fake{ .a = a, .result = clean, .fail_engine = .claude };
@@ -422,7 +422,7 @@ test "Hyperlane PR 10122 resolved reorg acceptance reaches the model without res
         .target = fixture,
         .discussion = threads,
         .result =
-        \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":["resolved-reorg","open-different-finding"]}
+        \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":["resolved-reorg","open-different-finding"],"non_blocking_threads":[]}
         ,
     };
     var work: core.Job = .{ .number = fixture.number, .head = head };
@@ -439,10 +439,10 @@ test "strict result validation rejects extra keys and invalid paths" {
     defer allocator.deinit();
     const a = allocator.allocator();
     try t.expectError(error.InvalidReview, core.parseReview(a,
-        \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":[],"command":"test"}
+        \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":[],"non_blocking_threads":[],"command":"test"}
     ));
     try t.expectError(error.InvalidReview, core.parseReview(a,
-        \\{"complete":true,"summary":"Static review.","findings":[{"severity":"P2","path":"../secrets","line":20,"body":"x"}],"existing_open_findings":[]}
+        \\{"complete":true,"summary":"Static review.","findings":[{"severity":"P2","path":"../secrets","line":20,"body":"x"}],"existing_open_findings":[],"non_blocking_threads":[]}
     ));
 }
 
@@ -624,7 +624,7 @@ test "an approval is discarded when a thread opens before posting" {
     try t.expect(fake.saved_result == null);
 }
 
-test "a queued focused review survives restart and publishes a comment under an approval policy" {
+test "a queued focused review survives restart and publishes only with explicit authorization" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -637,25 +637,31 @@ test "a queued focused review survives restart and publishes a comment under an 
     configured.approvals = true;
     var entries = [_]core.Entry{.{ .repo = configured }};
     const request = "Check the allocator path.";
-    try entries[0].queue(a, fixture_pull, .{ .focus = .@"perf-maxxing", .request = request });
-    try entries[0].queue(a, fixture_pull, null);
-    try db.save(&.{ .entries = &entries });
+    for ([_]bool{ false, true }) |publish| {
+        try entries[0].queue(a, fixture_pull, .{ .focus = .@"perf-maxxing", .request = request, .publish_prompted = publish });
+        try entries[0].queue(a, fixture_pull, null);
+        try db.save(&.{ .entries = &entries });
 
-    const state = try db.load();
-    const job = &state.entries[0].jobs[0];
-    try t.expectEqualStrings(request, job.options.request.?);
-    var fake: Fake = .{ .a = a, .result = clean };
-    const result = (try core.run(a, &fake, configured, job, .scheduled)).?;
-    try t.expectEqual(core.Event.COMMENT, fake.posted_result.?.event);
-    try t.expect(std.mem.indexOf(u8, fake.prompt_text, request) != null);
-    try t.expect(std.mem.indexOf(u8, result.body, "perf-maxxing") != null);
-    try t.expect(std.mem.indexOf(u8, result.body, request) == null);
+        const state = try db.load();
+        const job = &state.entries[0].jobs[0];
+        try t.expectEqualStrings(request, job.options.request.?);
+        var fake: Fake = .{ .a = a, .result = clean };
+        const result = (try core.run(a, &fake, configured, job, .scheduled)).?;
+        try t.expectEqual(core.Event.COMMENT, result.event);
+        try t.expectEqual(publish, fake.posted_result != null);
+        try t.expect(std.mem.indexOf(u8, fake.prompt_text, request) != null);
+        try t.expect(std.mem.indexOf(u8, result.body, "perf-maxxing") != null);
+        try t.expect(std.mem.indexOf(u8, result.body, request) == null);
+    }
 }
 
 test "non-blocking thread assessments need a reason and unique IDs" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    try t.expectError(error.InvalidReview, core.parseReview(a,
+        \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":[]}
+    ));
     try t.expectError(error.InvalidReview, core.parseReview(a,
         \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":[],"non_blocking_threads":[{"id":"thread-1","reason":" "}]}
     ));

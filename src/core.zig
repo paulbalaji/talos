@@ -123,7 +123,7 @@ pub const Review = struct {
     summary: []const u8,
     findings: []const Finding,
     existing_open_findings: []const []const u8,
-    non_blocking_threads: []const ThreadAssessment = &.{},
+    non_blocking_threads: ?[]const ThreadAssessment = null,
 };
 pub const ReviewerResult = struct { engine: Engine, review: Review };
 pub const Event = enum { COMMENT, APPROVE };
@@ -330,6 +330,7 @@ pub const ReviewFocus = enum {
 pub const ReviewOptions = struct {
     focus: ReviewFocus = .general,
     request: ?[]const u8 = null,
+    publish_prompted: bool = false,
 
     fn general(self: ReviewOptions) bool {
         return self.focus == .general and self.request == null;
@@ -386,7 +387,8 @@ pub fn parseReview(a: A, data: []const u8) !Review {
     if (data.len > 128 * 1024) return error.InvalidReview;
     const review = std.json.parseFromSliceLeaky(Review, a, data, .{ .allocate = .alloc_always }) catch
         return error.InvalidReview;
-    if (!textValid(review.summary, 4000) or review.findings.len > 15 or review.existing_open_findings.len > 100 or review.non_blocking_threads.len > 100)
+    const assessments = review.non_blocking_threads orelse return error.InvalidReview;
+    if (!textValid(review.summary, 4000) or review.findings.len > 15 or review.existing_open_findings.len > 100 or assessments.len > 100)
         return error.InvalidReview;
     for (review.findings, 0..) |finding, index| {
         if (!validPath(finding.path) or finding.line == 0 or !textValid(finding.body, 4000))
@@ -396,9 +398,9 @@ pub fn parseReview(a: A, data: []const u8) !Review {
         }
     }
     for (review.existing_open_findings) |id| if (!textValid(id, 250)) return error.InvalidReview;
-    for (review.non_blocking_threads, 0..) |assessment, index| {
+    for (assessments, 0..) |assessment, index| {
         if (!textValid(assessment.id, 250) or !textValid(assessment.reason, 400)) return error.InvalidReview;
-        for (review.non_blocking_threads[0..index]) |previous| {
+        for (assessments[0..index]) |previous| {
             if (eq(u8, previous.id, assessment.id)) return error.InvalidReview;
         }
     }
@@ -441,7 +443,7 @@ fn openFindings(a: A, results: []const ReviewerResult, threads: []const Thread) 
 }
 
 fn assessmentReason(result: ReviewerResult, id: []const u8) ?[]const u8 {
-    for (result.review.non_blocking_threads) |assessment| {
+    for (result.review.non_blocking_threads orelse &.{}) |assessment| {
         if (eq(u8, assessment.id, id)) return assessment.reason;
     }
     return null;
@@ -796,20 +798,23 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
     if (prepared.dry) return result;
     const own_pr = if (latest.author) |author| eq(u8, author.login, repo.login) else true;
     if (result.event == .APPROVE and (!repo.approvals or own_pr)) result.event = .COMMENT;
-    const permitted = if (result.event == .APPROVE) repo.approvals else repo.comments;
+    const permitted = if (result.event == .APPROVE)
+        repo.approvals
+    else
+        repo.comments and (prepared.options.request == null or prepared.options.publish_prompted);
     if (permitted) {
         if (try receipt(a, repo, job.*, try adapter.reviews(pr.number))) |prior| {
             try completeJob(a, adapter, repo, job, prior.id);
             return null;
         }
         try adapter.checkIdentity();
-        if (result.event == .APPROVE and
-            !eq(u8, original_threads, try io.json(a, try adapter.threads(pr.number))))
-            return error.ThreadsChanged;
         const final = try adapter.pull(pr.number);
         if (!sameTarget(pr, final)) return error.TargetChanged;
         if (supports_stacks) try adapter.checkStackBeforePost(inherited, final);
-        if (result.event == .APPROVE and !checksPassed(final)) return error.ChecksChanged;
+        if (result.event == .APPROVE) {
+            if (!checksPassed(final)) return error.ChecksChanged;
+            if (!eq(u8, original_threads, try io.json(a, try adapter.threads(pr.number)))) return error.ThreadsChanged;
+        }
     }
     try adapter.saveResult(job.number, result);
     if (supports_stacks) try adapter.saveStackContext(pr, snap, result);

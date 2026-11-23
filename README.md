@@ -31,7 +31,7 @@ talos status                          # See scans, queue, errors, and cache size
 | Preview the next review in one repo | `talos run-once OWNER/REPO` |
 | Show or set the reviewer default for new repos | `talos defaults` or `talos defaults --engine claude` |
 | Queue a specific PR under the repo's publication policy | `talos queue OWNER/REPO 123` |
-| Queue a review with a focus | `talos queue OWNER/REPO 123 --mode perf-maxxing --prompt 'Check allocations on the request path.'` |
+| Queue a review with a focus | `talos queue OWNER/REPO 123 --mode perf-maxxing --prompt 'Check allocations on the request path.' --publish` |
 | Read the latest local review candidate for a PR | `talos result OWNER/REPO 123` |
 | Queue a numbered GitHub stack | `talos stack OWNER/REPO 10088` |
 | Queue branches as an explicit stack | `talos stack OWNER/REPO feature 123 124 125` |
@@ -55,9 +55,9 @@ talos run-once OWNER/REPO 123 --mode reliability-maxxing
 talos run-once OWNER/REPO 123 --mode security-maxxing
 ```
 
-Performance covers hot paths and scaling. Reliability covers partial failure, retries, and recovery. Security checks trust boundaries and mitigations from static source. With no mode, Talos runs the general review. Talos saves queued prompts locally and sends them to the configured reviewers. Keep credentials out of them. A focused or custom-prompt review can publish a comment when the repo allows comments. Queue the same head again with no flags to retry with its saved options. A verified GitHub review already recorded for that head is deduplicated.
+Performance covers hot paths and scaling. Reliability covers partial failure, retries, and recovery. Security checks trust boundaries and mitigations from static source. With no mode, Talos runs the general review. Talos saves queued prompts locally and sends them to the configured reviewers. Keep credentials out of them. A review with a custom prompt stays local by default. Add `--publish` to allow its result to appear on GitHub when the repo allows comments. Review modes without a custom prompt follow the repo’s comment policy. Focused reviews publish as comments. Queue the same head again with no flags to retry with its saved options. A verified GitHub review already recorded for that head is deduplicated.
 
-`talos status OWNER/REPO` shows completed jobs still tracked and links to verified GitHub reviews. `talos result OWNER/REPO 123` prints the last saved local candidate, including its reviewed commit. A review reconciled from GitHub can have a receipt without a local candidate.
+`talos status OWNER/REPO` shows up to five completed jobs still tracked and links to verified GitHub reviews. `talos result OWNER/REPO 123` prints the last saved local candidate, including its reviewed commit. A review reconciled from GitHub can have a receipt without a local candidate.
 
 ### Review a PR stack
 
