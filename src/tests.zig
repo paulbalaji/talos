@@ -174,6 +174,7 @@ test "same-head discussion changes get one new receipt and survive an ambiguous 
     try t.expect((try core.run(a, &fake, repo, &recovered, .scheduled)) == null);
     try t.expectEqual(core.Phase.complete, recovered.phase);
     try t.expectEqual(@as(usize, 2), fake.posts);
+    const first_followup = fake.offered.?;
     recovered.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false);
     try t.expectEqual(core.Phase.complete, recovered.phase);
 
@@ -181,6 +182,47 @@ test "same-head discussion changes get one new receipt and survive an ambiguous 
     fake.discussion = &.{thread};
     recovered.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false);
     try t.expectEqual(core.Phase.pending, recovered.phase);
+    recovered.phase = .failed;
+    recovered.attempts = 6;
+    var entry: core.Entry = .{ .repo = repo, .jobs = (&recovered)[0..1] };
+    try entry.queue(a, fixture_pull, null);
+    try t.expectEqual(core.Phase.pending, recovered.phase);
+    try t.expectEqual(@as(u8, 0), recovered.attempts);
+    _ = (try core.run(a, &fake, repo, &recovered, .scheduled)).?;
+    thread.isResolved = true;
+    fake.discussion = &.{thread};
+    recovered.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false);
+    fake.offered = first_followup;
+    _ = (try core.run(a, &fake, repo, &recovered, .scheduled)).?;
+    try t.expectEqual(@as(usize, 4), fake.posts);
+    try t.expectEqual(@as(u64, 3), recovered.followup_sequence);
+    try t.expect(!std.mem.eql(u8, first_followup.body.?, fake.posted_result.?.body));
+}
+
+test "truncated discussion withholds approval and new findings flag an earlier approval" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var configured = repo;
+    configured.approvals = true;
+    var fake: Fake = .{
+        .a = a,
+        .result = clean,
+        .comments = &.{.{ .author = .{ .login = "author" }, .body = "Cut short", .url = "note", .truncated = true }},
+    };
+    var job: core.Job = .{ .number = fixture_pull.number, .head = head };
+    const preview = (try core.run(a, &fake, configured, &job, .{ .preview = .{} })).?;
+    try t.expectEqual(core.Event.COMMENT, preview.event);
+    try t.expect(std.mem.indexOf(u8, preview.body, "Review coverage was limited.") != null);
+
+    fake.comments = &.{};
+    fake.result = finding;
+    fake.offered = .{ .id = 55, .commit_id = head, .state = "APPROVED", .user = .{ .login = repo.login }, .body = "Prior approval" };
+    job.followup = true;
+    job.followup_sequence = 1;
+    const result = (try core.run(a, &fake, configured, &job, .scheduled)).?;
+    try t.expectEqual(core.Event.COMMENT, result.event);
+    try t.expect(std.mem.indexOf(u8, result.body, "Reassess that approval before merging.") != null);
 }
 
 test "effective diff changes and human conversation comments trigger review" {

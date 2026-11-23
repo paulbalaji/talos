@@ -63,6 +63,8 @@ After a review, Talos checks for new human conversation and inline replies, thre
 
 When approvals are enabled and CI is the only reason Talos withheld approval, passing checks trigger a rereview on the same head. The new review rechecks the current source and discussion before approving.
 
+If a rereview finds an issue after an approval, its comment flags the earlier approval for a person to reassess. On upgrade, Talos uses newer human replies to catch up completed reviews. It tracks resolution changes from the first successful scan.
+
 `talos status OWNER/REPO` shows up to five completed jobs still tracked and links to verified GitHub reviews. `talos result OWNER/REPO 123` prints the last saved local candidate, including its reviewed commit. A review reconciled from GitHub can have a receipt without a local candidate.
 
 ### Review a PR stack

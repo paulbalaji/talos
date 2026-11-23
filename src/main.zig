@@ -545,7 +545,10 @@ const Main = struct {
             if (job.phase != .complete) continue;
             for (pulls) |pull| {
                 if (pull.number != job.number or !core.isReady(pull) or !eq(u8, pull.headRefOid, job.head)) continue;
-                try self.refreshReviewInput(entry.repo, client, job, pull);
+                self.refreshReviewInput(entry.repo, client, job, pull) catch |err| {
+                    if (err == error.GitHubRateLimited) return err;
+                    try entry.problem(self.a, std.time.timestamp(), job.number, @errorName(err));
+                };
                 checked += 1;
                 break;
             }

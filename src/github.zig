@@ -355,6 +355,7 @@ pub const Client = struct {
         for (replies.items) |*reply| {
             if (reply.body.len > 2400) {
                 truncated = true;
+                reply.truncated = true;
                 reply.body = try io.fmt(a, "{s} [reply truncated]", .{reply.body[0..core.safePrefix(reply.body, 2400)]});
             }
         }
@@ -384,8 +385,10 @@ pub const Client = struct {
                     if (eq(u8, author.kind, "Bot") or std.ascii.endsWithIgnoreCase(author.login, "[bot]")) continue;
                 }
                 var comment = reply;
-                if (comment.body.len > 2400)
+                if (comment.body.len > 2400) {
+                    comment.truncated = true;
                     comment.body = try io.fmt(a, "{s} [reply truncated]", .{reply.body[0..core.safePrefix(reply.body, 2400)]});
+                }
                 try comments.append(a, comment);
             }
             cursor = try next(current.pageInfo, cursor);
