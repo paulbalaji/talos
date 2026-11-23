@@ -29,6 +29,7 @@ const usage =
     \\  --cache-idle-days DAYS               Default 7
     \\  --engine ENGINE[,ENGINE...]         codex, claude, or kimi
     \\  --model MODEL                        Override the first reviewer's model
+    \\  --reviewer-model ENGINE=MODEL        Override a specific reviewer's model, repeatable
     \\  --git PATH --gh PATH --codex PATH --claude PATH --kimi PATH
     \\  --comments                           Publish comment reviews
     \\  --approvals                          Publish clean approvals
@@ -153,7 +154,7 @@ const Adapter = struct {
             .cmd = self.tools.command(&env),
             .bin = bin,
             .engine = engine,
-            .model = if (engine == self.repo.engine) self.repo.model else null,
+            .model = self.repo.modelFor(engine),
         };
         return reviewer.review(prompt);
     }
@@ -212,6 +213,7 @@ const Main = struct {
         var programs = self.local(previous).programs;
         var engines = if (previous) |old| try old.engines(self.a) else state.default_engines;
         var new_engines = false;
+        var models = std.EnumArray(core.Engine, ?[]const u8).initFill(null);
         var options = args[1..];
         // Preserve the v0 command line without opening the old checkout.
         if (options.len != 0 and !std.mem.startsWith(u8, options[0], "--")) options = options[1..];
@@ -238,8 +240,11 @@ const Main = struct {
                     engines = try parseEngines(self.a, value);
                     new_engines = true;
                 } else if (eq(u8, opt, "--model")) {
-                    if (value.len == 0 or value[0] == '-' or value.len > 200) return error.InvalidModel;
-                    repo.model = value;
+                    repo.model = try modelName(value);
+                } else if (eq(u8, opt, "--reviewer-model")) {
+                    const split = std.mem.indexOfScalar(u8, value, '=') orelse return error.InvalidModel;
+                    const engine = std.meta.stringToEnum(core.Engine, value[0..split]) orelse return error.UnknownReviewer;
+                    models.set(engine, try modelName(value[split + 1 ..]));
                 } else if (std.mem.startsWith(u8, opt, "--")) {
                     const tool = std.meta.stringToEnum(Tool, opt[2..]) orelse return error.Usage;
                     switch (tool) {
@@ -250,9 +255,23 @@ const Main = struct {
         }
         repo.engine = engines[0];
         repo.additional_engines = engines[1..];
-        if (repo.model == null and !new_engines) {
-            if (previous) |old| repo.model = old.model;
+        var model_options = models.iterator();
+        while (model_options.next()) |option| {
+            if (option.value.* != null and std.mem.indexOfScalar(core.Engine, engines, option.key) == null)
+                return error.ReviewerModelForUnselectedEngine;
         }
+        const retained = if (new_engines) null else previous;
+        if (models.get(repo.engine)) |named| {
+            repo.model = named;
+        } else if (repo.model == null) {
+            if (retained) |old| repo.model = old.modelFor(repo.engine);
+        }
+        var additional_models: std.ArrayList(core.ReviewerModel) = .empty;
+        for (repo.additional_engines) |engine| {
+            const model = models.get(engine) orelse if (retained) |old| old.modelFor(engine) else null;
+            if (model) |value| try additional_models.append(self.a, .{ .engine = engine, .model = value });
+        }
+        repo.additional_models = additional_models.items;
         var tools = self.local(null);
         tools.programs = programs;
         repo.git = try tools.bin(.git);
@@ -509,6 +528,11 @@ fn reviewerTool(engine: core.Engine) Tool {
     };
 }
 
+fn modelName(value: []const u8) ![]const u8 {
+    if (value.len == 0 or value[0] == '-' or value.len > 200) return error.InvalidModel;
+    return value;
+}
+
 fn parseEngines(a: A, value: []const u8) ![]const core.Engine {
     var parts = std.mem.splitScalar(u8, value, ',');
     var engines: std.ArrayList(core.Engine) = .empty;
@@ -646,6 +670,20 @@ test "each reviewer combination registers with only its selected executables" {
         }
         try t.expectEqual(@as(u32, 240), configured.interval);
     }
+    try app.dispatch(&.{
+        "add",              "example/models",   "--engine",         "claude,codex,kimi",
+        "--model",          "primary-model",    "--reviewer-model", "codex=second-model",
+        "--reviewer-model", "kimi=third-model",
+    });
+    try app.dispatch(&.{ "add", "example/models", "--reviewer-model", "kimi=new-third-model" });
+    var state = try db.load();
+    const modeled = state.find("example/models").?.repo;
+    try t.expectEqualStrings("primary-model", modeled.modelFor(.claude).?);
+    try t.expectEqualStrings("second-model", modeled.modelFor(.codex).?);
+    try t.expectEqualStrings("new-third-model", modeled.modelFor(.kimi).?);
+    try t.expectError(error.ReviewerModelForUnselectedEngine, app.dispatch(&.{
+        "add", "example/models", "--engine", "claude", "--reviewer-model", "kimi=model",
+    }));
     try t.expectError(error.DuplicateReviewer, parseEngines(a, "claude,claude"));
     try t.expectError(error.UnknownReviewer, parseEngines(a, "claude,"));
 }

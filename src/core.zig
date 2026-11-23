@@ -6,6 +6,7 @@ pub const schema = @embedFile("review-schema.json");
 
 pub const Engine = enum { codex, claude, kimi };
 pub const engine_count = std.meta.fields(Engine).len;
+pub const ReviewerModel = struct { engine: Engine, model: []const u8 };
 
 pub fn validateEngines(engines: []const Engine) !void {
     if (engines.len == 0) return error.UnknownReviewer;
@@ -25,6 +26,7 @@ pub const Repo = struct {
     engine: Engine = .codex,
     additional_engines: []const Engine = &.{},
     model: ?[]const u8 = null,
+    additional_models: []const ReviewerModel = &.{},
     comments: bool = false,
     approvals: bool = false,
     git: []const u8 = "git",
@@ -35,6 +37,14 @@ pub const Repo = struct {
 
     pub fn engines(self: Repo, a: A) ![]const Engine {
         return std.mem.concat(a, Engine, &.{ &.{self.engine}, self.additional_engines });
+    }
+
+    pub fn modelFor(self: Repo, engine: Engine) ?[]const u8 {
+        if (engine == self.engine) return self.model;
+        for (self.additional_models) |model| {
+            if (model.engine == engine) return model.model;
+        }
+        return null;
     }
 };
 

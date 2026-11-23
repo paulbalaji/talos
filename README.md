@@ -49,6 +49,7 @@ talos add OWNER/REPO --engine codex --interval 180
 talos add OWNER/REPO --engine claude --model sonnet
 talos add OWNER/REPO --engine kimi --model kimi-code/kimi-for-coding
 talos add OWNER/REPO --engine claude,codex --model sonnet
+talos add OWNER/REPO --engine claude,codex,kimi --reviewer-model claude=sonnet --reviewer-model kimi=kimi-code/kimi-for-coding
 talos add OWNER/REPO --comments
 talos add OWNER/REPO --approvals
 talos add OWNER/REPO --comments --approvals
@@ -56,7 +57,9 @@ talos add OWNER/REPO --cache-mib 256 --cache-idle-days 14
 talos add OWNER/REPO --cache-mib 0
 ```
 
-At registration, Talos resolves Git, GitHub CLI, and each selected reviewer on PATH. Set paths explicitly with `--git`, `--gh`, `--codex`, `--claude`, or `--kimi`. Setting `--engine` without `--model` uses each reviewer's own model default. With a list, `--model` applies to the first reviewer.
+At registration, Talos resolves Git, GitHub CLI, and each selected reviewer on PATH. Set paths explicitly with `--git`, `--gh`, `--codex`, `--claude`, or `--kimi`.
+
+Use `--model MODEL` for the first reviewer, or repeat `--reviewer-model ENGINE=MODEL` for any selected reviewers. A named override takes precedence for that reviewer. When you set `--engine` again, repeat any model overrides you want to keep.
 
 Each reviewer in a list gets the same pinned source and discussion. Talos runs them in order, groups findings at the same diff line, and sends one review with reviewer attribution. A failed reviewer retries the job. Choose providers that can receive the repo's source and discussion.
 
