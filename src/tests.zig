@@ -31,11 +31,14 @@ const Fake = struct {
     offered: ?core.Prior = null,
     discussion: []const core.Thread = &.{},
     result: []const u8 = finding,
+    other_results: []const []const u8 = &.{},
+    fail_engine: ?core.Engine = null,
     lose_response: bool = false,
     lose_readback: bool = false,
     move_during_review: enum { none, head, base } = .none,
     posts: usize = 0,
     reviews_run: usize = 0,
+    reviewed_engines: [core.engine_count]core.Engine = undefined,
     readbacks: usize = 0,
     prompt_text: []const u8 = "",
     posted_result: ?core.Payload = null,
@@ -62,15 +65,18 @@ const Fake = struct {
         return std.mem.eql(u8, path, "src/watch.rs") and line == 20;
     }
 
-    pub fn review(self: *Fake, prompt_text: []const u8) ![]const u8 {
+    pub fn review(self: *Fake, engine: core.Engine, prompt_text: []const u8) ![]const u8 {
         self.prompt_text = prompt_text;
+        self.reviewed_engines[self.reviews_run % core.engine_count] = engine;
         self.reviews_run += 1;
         switch (self.move_during_review) {
             .none => {},
             .head => self.target.headRefOid = changed,
             .base => self.target.baseRefOid = changed,
         }
-        return self.result;
+        if (engine == self.fail_engine) return error.ClaudeFailed;
+        const extra = self.reviews_run -| 2;
+        return if (self.reviews_run > 1 and extra < self.other_results.len) self.other_results[extra] else self.result;
     }
 
     pub fn post(self: *Fake, _: u32, payload: core.Payload) !u64 {
@@ -151,6 +157,75 @@ test "publishes one commit-bound comment, verifies it, and deduplicates a second
     try t.expectEqual(@as(?core.Payload, null), try core.run(a, &fake, repo, &work, .scheduled));
     try t.expectEqual(@as(usize, 1), fake.posts);
     try t.expectEqual(@as(usize, 1), fake.reviews_run);
+}
+
+test "multiple reviewers produce one verified review with one comment per anchor" {
+    var allocator = std.heap.ArenaAllocator.init(t.allocator);
+    defer allocator.deinit();
+    const a = allocator.allocator();
+    var configured = repo;
+    configured.engine = .claude;
+    configured.additional_engines = &.{ .codex, .kimi };
+    configured.approvals = true;
+    const same_finding =
+        \\{"complete":true,"summary":"Second pass.","findings":[{"severity":"P1","path":"src/watch.rs","line":20,"body":"The cursor skips a height."}],"existing_open_findings":["unresolved","resolved"]}
+    ;
+    const distinct_finding =
+        \\{"complete":true,"summary":"Third pass.","findings":[{"severity":"P2","path":"src/watch.rs","line":20,"body":"The cursor is saved before processing succeeds."},{"severity":"P3","path":"src/watch.rs","line":40,"body":"The log omits the cursor."}],"existing_open_findings":["unresolved"]}
+    ;
+    var fake = Fake{
+        .a = a,
+        .other_results = &.{ same_finding, distinct_finding },
+        .discussion = &.{
+            .{ .id = "unresolved", .isResolved = false, .isOutdated = false, .path = "src/watch.rs", .line = 20, .replies = &.{} },
+            .{ .id = "resolved", .isResolved = true, .isOutdated = false, .path = "src/watch.rs", .line = 20, .replies = &.{} },
+        },
+    };
+    var job = core.Job{ .number = 42, .head = head };
+    const review = (try core.run(a, &fake, configured, &job, .scheduled)).?;
+    try t.expectEqualSlices(core.Engine, &.{ .claude, .codex, .kimi }, &fake.reviewed_engines);
+    try t.expectEqual(core.Event.COMMENT, review.event);
+    try t.expectEqual(@as(usize, 1), review.comments.len);
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, review.comments[0].body, "The cursor skips a height."));
+    try t.expect(std.mem.indexOf(u8, review.comments[0].body, "**P1.** claude, codex") != null);
+    try t.expect(std.mem.indexOf(u8, review.comments[0].body, "The cursor is saved before processing succeeds.") != null);
+    try t.expect(std.mem.indexOf(u8, review.body, "src/watch.rs:40") != null);
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, review.body, "Existing open finding unresolved"));
+    try t.expect(std.mem.indexOf(u8, review.body, "Existing open finding resolved") == null);
+    try t.expectEqual(@as(usize, 1), fake.posts);
+    try t.expectEqual(@as(usize, 1), fake.readbacks);
+    var duplicate = core.Job{ .number = 42, .head = head };
+    try t.expect((try core.run(a, &fake, configured, &duplicate, .scheduled)) == null);
+    try t.expectEqual(@as(usize, 1), fake.posts);
+    try t.expectEqual(@as(usize, 3), fake.reviews_run);
+}
+
+test "every configured reviewer must succeed and report complete coverage for approval" {
+    var allocator = std.heap.ArenaAllocator.init(t.allocator);
+    defer allocator.deinit();
+    const a = allocator.allocator();
+    var configured = repo;
+    configured.additional_engines = &.{.claude};
+    configured.approvals = true;
+    const incomplete =
+        \\{"complete":false,"summary":"Incomplete coverage.","findings":[],"existing_open_findings":[]}
+    ;
+    var job = core.Job{ .number = 42, .head = head };
+    var failing = Fake{ .a = a, .result = clean, .fail_engine = .claude };
+    try t.expectError(error.ClaudeFailed, core.run(a, &failing, configured, &job, .scheduled));
+    try t.expectEqual(@as(usize, 0), failing.posts);
+    try t.expectEqual(core.Phase.pending, job.phase);
+    var invalid = Fake{ .a = a, .result = clean, .other_results = &.{"{}"} };
+    try t.expectError(error.InvalidReview, core.run(a, &invalid, configured, &job, .scheduled));
+    try t.expectEqual(@as(usize, 0), invalid.posts);
+    var partial = Fake{ .a = a, .result = clean, .other_results = &.{incomplete} };
+    const preview = (try core.run(a, &partial, configured, &job, .{ .preview = null })).?;
+    try t.expectEqual(core.Event.COMMENT, preview.event);
+    try t.expect(std.mem.indexOf(u8, preview.body, "Review coverage was limited.") != null);
+    var unanimous = Fake{ .a = a, .result = clean };
+    const approved = (try core.run(a, &unanimous, configured, &job, .scheduled)).?;
+    try t.expectEqual(core.Event.APPROVE, approved.event);
+    try t.expectEqual(@as(usize, 1), unanimous.posts);
 }
 
 test "dry runs never post and comments and approvals are independent" {

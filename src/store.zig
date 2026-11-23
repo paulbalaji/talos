@@ -5,6 +5,7 @@ const A = io.A;
 
 pub const State = struct {
     version: u32 = 1,
+    default_engines: []const core.Engine = &.{.codex},
     entries: []core.Entry = &.{},
 
     pub fn find(self: *State, repo: []const u8) ?*core.Entry {
@@ -59,6 +60,7 @@ pub const Store = struct {
         };
         const state = try io.parse(self.a, State, data);
         if (state.version != 1) return error.UnsupportedStateVersion;
+        try core.validateEngines(state.default_engines);
         return state;
     }
 

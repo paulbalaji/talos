@@ -17,6 +17,10 @@ pub const Runner = struct {
         try args.append(a, self.bin);
         switch (self.engine) {
             .codex => {
+                self.cmd.dir.deleteFile("result.json") catch |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => return err,
+                };
                 try io.write(self.cmd.dir, "schema.json", core.schema);
                 try args.appendSlice(a, &.{
                     "exec",                    "--ignore-user-config",  "--ignore-rules",            "--ephemeral",

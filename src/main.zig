@@ -15,6 +15,7 @@ const usage =
     \\Talos tracks ready GitHub pull requests and reviews new commits.
     \\
     \\talos [--home DIR] add OWNER/REPO [options]
+    \\talos [--home DIR] defaults [--engine ENGINE[,ENGINE...]]
     \\talos [--home DIR] status [OWNER/REPO] [--json]
     \\talos [--home DIR] queue OWNER/REPO PR
     \\talos [--home DIR] run-once [OWNER/REPO [PR]]
@@ -26,8 +27,8 @@ const usage =
     \\  --interval SECONDS                  Default 180, minimum 15
     \\  --cache-mib MIB                      Default 128, 0 for per-review disposal
     \\  --cache-idle-days DAYS               Default 7
-    \\  --engine codex|claude|kimi           Default codex
-    \\  --model MODEL                        Override reviewer model
+    \\  --engine ENGINE[,ENGINE...]         codex, claude, or kimi
+    \\  --model MODEL                        Override the first reviewer's model
     \\  --git PATH --gh PATH --codex PATH --claude PATH --kimi PATH
     \\  --comments                           Publish comment reviews
     \\  --approvals                          Publish clean approvals
@@ -116,7 +117,7 @@ const Adapter = struct {
     repo: core.Repo,
     github_client: github.Client,
     git_source: source.Git,
-    reviewer: runner.Runner,
+    tools: Local,
     files: []const github.File = &.{},
 
     pub fn checkIdentity(self: *Adapter) !void {
@@ -145,12 +146,16 @@ const Adapter = struct {
         return source.anchor(self.files, path, line);
     }
 
-    pub fn review(self: *Adapter, prompt: []const u8) ![]const u8 {
-        self.reviewer.cmd.dir.deleteFile("result.json") catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
+    pub fn review(self: *Adapter, engine: core.Engine, prompt: []const u8) ![]const u8 {
+        const bin = try self.tools.bin(reviewerTool(engine));
+        const env = try self.tools.reviewerEnv(engine, bin);
+        const reviewer: runner.Runner = .{
+            .cmd = self.tools.command(&env),
+            .bin = bin,
+            .engine = engine,
+            .model = if (engine == self.repo.engine) self.repo.model else null,
         };
-        return self.reviewer.review(prompt);
+        return reviewer.review(prompt);
     }
 
     pub fn post(self: *Adapter, number: u32, payload: core.Payload) !u64 {
@@ -199,11 +204,14 @@ const Main = struct {
     fn add(self: Main, state: *store.State, args: []const []const u8) !void {
         if (args.len == 0) return error.Usage;
         const name = try repoName(self.a, args[0]);
+        const previous = if (state.find(name)) |entry| entry.repo else null;
         var repo: core.Repo = .{
             .name = name,
             .login = "",
         };
-        var programs: Programs = .{};
+        var programs = self.local(previous).programs;
+        var engines = if (previous) |old| try old.engines(self.a) else state.default_engines;
+        var new_engines = false;
         var options = args[1..];
         // Preserve the v0 command line without opening the old checkout.
         if (options.len != 0 and !std.mem.startsWith(u8, options[0], "--")) options = options[1..];
@@ -227,7 +235,8 @@ const Main = struct {
                     repo.cache_idle_days = std.fmt.parseUnsigned(u16, value, 10) catch return error.InvalidCacheAge;
                     if (repo.cache_idle_days == 0) return error.InvalidCacheAge;
                 } else if (eq(u8, opt, "--engine")) {
-                    repo.engine = std.meta.stringToEnum(core.Engine, value) orelse return error.UnknownReviewer;
+                    engines = try parseEngines(self.a, value);
+                    new_engines = true;
                 } else if (eq(u8, opt, "--model")) {
                     if (value.len == 0 or value[0] == '-' or value.len > 200) return error.InvalidModel;
                     repo.model = value;
@@ -239,15 +248,25 @@ const Main = struct {
                 } else return error.Usage;
             }
         }
+        repo.engine = engines[0];
+        repo.additional_engines = engines[1..];
+        if (repo.model == null and !new_engines) {
+            if (previous) |old| repo.model = old.model;
+        }
         var tools = self.local(null);
         tools.programs = programs;
-        const reviewer_tool = std.meta.stringToEnum(Tool, @tagName(repo.engine)).?;
-        const reviewer_bin = try tools.bin(reviewer_tool);
         repo.git = try tools.bin(.git);
         repo.gh = try tools.bin(.gh);
-        repo.codex = if (repo.engine == .codex) reviewer_bin else programs.codex;
-        repo.claude = if (repo.engine == .claude) reviewer_bin else programs.claude;
-        repo.kimi = if (repo.engine == .kimi) reviewer_bin else programs.kimi;
+        for (engines) |engine| {
+            const tool = reviewerTool(engine);
+            const bin = try tools.bin(tool);
+            switch (tool) {
+                inline else => |t| @field(programs, @tagName(t)) = bin,
+            }
+        }
+        repo.codex = programs.codex;
+        repo.claude = programs.claude;
+        repo.kimi = programs.kimi;
 
         const gh_env = try tools.githubEnv();
         const client = try tools.gh(&gh_env, name);
@@ -273,19 +292,26 @@ const Main = struct {
         }
     }
 
-    fn adapter(self: Main, entry: *core.Entry, state: *const store.State, gh_env: *std.process.EnvMap, reviewer_env: *std.process.EnvMap) !Adapter {
+    fn defaults(self: Main, state: *store.State, args: []const []const u8) !void {
+        if (args.len != 0) {
+            if (args.len != 2 or !eq(u8, args[0], "--engine")) return error.Usage;
+            state.default_engines = try parseEngines(self.a, args[1]);
+            try self.db.save(state);
+        }
+        try io.out("Default reviewers for new repos {s}\n", .{try engineNames(self.a, state.default_engines)});
+    }
+
+    fn adapter(self: Main, entry: *core.Entry, state: *const store.State, gh_env: *std.process.EnvMap) !Adapter {
         const repo = entry.repo;
         const tools = self.local(repo);
         gh_env.* = try tools.githubEnv();
-        const bin = try tools.bin(std.meta.stringToEnum(Tool, @tagName(repo.engine)).?);
-        reviewer_env.* = try tools.reviewerEnv(repo.engine, bin);
         return .{
             .db = self.db,
             .state = state,
             .repo = repo,
             .github_client = try tools.gh(gh_env, repo.name),
             .git_source = try tools.git(gh_env, self.db, repo),
-            .reviewer = .{ .cmd = tools.command(reviewer_env), .bin = bin, .engine = repo.engine, .model = repo.model },
+            .tools = tools,
         };
     }
 
@@ -335,8 +361,7 @@ const Main = struct {
 
     fn runJob(self: Main, state: *const store.State, entry: *core.Entry, job: *core.Job) !void {
         var gh_env: std.process.EnvMap = undefined;
-        var reviewer_env: std.process.EnvMap = undefined;
-        var live = try self.adapter(entry, state, &gh_env, &reviewer_env);
+        var live = try self.adapter(entry, state, &gh_env);
         _ = try core.run(self.a, &live, entry.repo, job, .scheduled);
     }
 
@@ -369,8 +394,7 @@ const Main = struct {
                 job = queued.*;
             }
             var gh_env: std.process.EnvMap = undefined;
-            var reviewer_env: std.process.EnvMap = undefined;
-            var live = try self.adapter(entry, state, &gh_env, &reviewer_env);
+            var live = try self.adapter(entry, state, &gh_env);
             const payload = (try core.run(self.a, &live, entry.repo, &job, .{ .preview = initial })).?;
             try io.out("{s}\n", .{try io.json(self.a, .{ .repo = entry.repo.name, .pr = job.number, .review = payload })});
         }
@@ -402,7 +426,7 @@ const Main = struct {
                 continue;
             }
             try io.out("{s}  {s}  {s}  interval {d}s  comments {s}  approvals {s}\n", .{
-                entry.repo.name,     if (paused) "paused" else "active",       @tagName(entry.repo.engine),
+                entry.repo.name,     if (paused) "paused" else "active",       try engineNames(self.a, try entry.repo.engines(self.a)),
                 entry.repo.interval, if (entry.repo.comments) "on" else "off", if (entry.repo.approvals) "on" else "off",
             });
             try io.out("  Last successful scan {s}  |  Next scan {s}  |  Ready PRs {d}\n", .{
@@ -439,6 +463,10 @@ const Main = struct {
             var state = try self.db.load();
             return self.status(&state, params);
         }
+        if (eq(u8, cmd, "defaults") and params.len == 0) {
+            var state = try self.db.load();
+            return self.defaults(&state, params);
+        }
         if (eq(u8, cmd, "pause") or eq(u8, cmd, "resume")) {
             if (params.len != 1) return error.Usage;
             var state = try self.db.load();
@@ -459,6 +487,7 @@ const Main = struct {
         defer lock.close();
         var state = try self.db.load();
         if (eq(u8, cmd, "add")) return self.add(&state, params);
+        if (eq(u8, cmd, "defaults")) return self.defaults(&state, params);
         if (eq(u8, cmd, "tick") and params.len == 0) return self.tick(&state);
         if (eq(u8, cmd, "run-once")) return self.dry(&state, params);
         if (eq(u8, cmd, "queue") and params.len == 2) {
@@ -471,6 +500,32 @@ const Main = struct {
         return error.Usage;
     }
 };
+
+fn reviewerTool(engine: core.Engine) Tool {
+    return switch (engine) {
+        .codex => .codex,
+        .claude => .claude,
+        .kimi => .kimi,
+    };
+}
+
+fn parseEngines(a: A, value: []const u8) ![]const core.Engine {
+    var parts = std.mem.splitScalar(u8, value, ',');
+    var engines: std.ArrayList(core.Engine) = .empty;
+    while (parts.next()) |part| {
+        const engine = std.meta.stringToEnum(core.Engine, part) orelse return error.UnknownReviewer;
+        if (std.mem.indexOfScalar(core.Engine, engines.items, engine) != null) return error.DuplicateReviewer;
+        try engines.append(a, engine);
+    }
+    return engines.toOwnedSlice(a);
+}
+
+fn engineNames(a: A, engines: []const core.Engine) ![]const u8 {
+    var names: [core.engine_count][]const u8 = undefined;
+    try core.validateEngines(engines);
+    for (engines, 0..) |engine, index| names[index] = @tagName(engine);
+    return std.mem.join(a, ",", names[0..engines.len]);
+}
 
 fn repoName(a: A, name: []const u8) ![]const u8 {
     if (!core.validRepoName(name)) return error.InvalidRepository;
@@ -535,4 +590,68 @@ test {
     _ = @import("source.zig");
     _ = @import("runner.zig");
     _ = @import("tests.zig");
+}
+
+test "each reviewer combination registers with only its selected executables" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try io.temp(a);
+    defer std.fs.deleteTreeAbsolute(path) catch {};
+    var db = try store.Store.open(a, path);
+    defer db.dir.close();
+    const cases = [_]struct { flag: []const u8, engines: []const core.Engine }{
+        .{ .flag = "claude", .engines = &.{.claude} },
+        .{ .flag = "codex", .engines = &.{.codex} },
+        .{ .flag = "kimi", .engines = &.{.kimi} },
+        .{ .flag = "claude,codex", .engines = &.{ .claude, .codex } },
+        .{ .flag = "codex,kimi", .engines = &.{ .codex, .kimi } },
+        .{ .flag = "claude,kimi", .engines = &.{ .claude, .kimi } },
+        .{ .flag = "kimi,codex,claude", .engines = &.{ .kimi, .codex, .claude } },
+    };
+    var env = std.process.EnvMap.init(a);
+    const app: Main = .{ .a = a, .db = db, .env = &env, .home = path, .scratch = path, .scratch_dir = db.dir };
+    for (cases, 0..) |case, index| {
+        const bin_name = try io.fmt(a, "bin-{d}", .{index});
+        try db.dir.makeDir(bin_name);
+        var bin = try db.dir.openDir(bin_name, .{});
+        defer bin.close();
+        try env.put("PATH", try bin.realpathAlloc(a, "."));
+        try writeExecutable(bin, "git", "#!/bin/sh\nexit 1\n");
+        try writeExecutable(bin, "gh",
+            \\#!/bin/sh
+            \\case "$4" in
+            \\  user) printf '%s' '{"login":"test"}' ;;
+            \\  graphql) printf '%s' '[{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}]' ;;
+            \\  *) exit 1 ;;
+            \\esac
+            \\
+        );
+        for (case.engines) |engine| try writeExecutable(bin, @tagName(engine), "#!/bin/sh\nexit 1\n");
+        const name = try io.fmt(a, "example/repo-{d}", .{index});
+        try app.dispatch(&.{ "defaults", "--engine", case.flag });
+        try app.dispatch(&.{ "add", name });
+        var state = try db.load();
+        try t.expectEqualSlices(core.Engine, case.engines, state.default_engines);
+
+        try app.dispatch(&.{ "defaults", "--engine", "codex,kimi,claude" });
+        try app.dispatch(&.{ "add", name, "--interval", "240" });
+        state = try db.load();
+        const configured = state.find(name).?.repo;
+        try t.expectEqualSlices(core.Engine, case.engines, try configured.engines(a));
+        const tools = app.local(configured);
+        for (case.engines) |engine| {
+            try t.expectEqualStrings(try bin.realpathAlloc(a, @tagName(engine)), try tools.bin(reviewerTool(engine)));
+        }
+        try t.expectEqual(@as(u32, 240), configured.interval);
+    }
+    try t.expectError(error.DuplicateReviewer, parseEngines(a, "claude,claude"));
+    try t.expectError(error.UnknownReviewer, parseEngines(a, "claude,"));
+}
+
+fn writeExecutable(dir: std.fs.Dir, name: []const u8, contents: []const u8) !void {
+    const file = try dir.createFile(name, .{ .mode = 0o700 });
+    defer file.close();
+    try file.writeAll(contents);
 }
