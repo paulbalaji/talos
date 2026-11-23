@@ -30,8 +30,9 @@ talos status                          # See scans, queue, errors, and cache size
 | Preview the next review in one repo | `talos run-once OWNER/REPO` |
 | Show or set the reviewer default for new repos | `talos defaults` or `talos defaults --engine claude` |
 | Queue a specific PR under the repo's publication policy | `talos queue OWNER/REPO 123` |
-| Queue a PR stack bottom to top | `talos stack OWNER/REPO feature 123 124 125` |
-| Remove a stack's ordering and context | `talos unstack OWNER/REPO feature` |
+| Queue a numbered GitHub stack | `talos stack OWNER/REPO 10088` |
+| Queue branches as an explicit stack | `talos stack OWNER/REPO feature 123 124 125` |
+| Remove an explicit local stack definition | `talos unstack OWNER/REPO feature` |
 | Inspect one repo or read JSON | `talos status OWNER/REPO` or `talos status --json` |
 | Show or set the review budget per tick | `talos queue-budget` or `talos queue-budget 3` |
 | Pause or resume reviews for a repo | `talos pause OWNER/REPO` or `talos resume OWNER/REPO` |
@@ -43,18 +44,19 @@ talos status                          # See scans, queue, errors, and cache size
 
 ### Review a PR stack
 
-Talos detects linear stacks when it scans ready PRs. The next PR must target the previous PR's branch and exact head in the same repo. Ambiguous links and branches with multiple children use the ordinary queue. Detection keeps the baseline intact and groups existing per-head jobs.
+When Talos scans ready PRs, it uses the number and member order GitHub recorded for each `gh stack`. It reads that metadata through the GitHub API. Stack detection keeps the baseline intact and groups existing per-head jobs.
 
-To define a stack explicitly, pass two to eight ready PRs in one repo, bottom to top. Talos keeps up to eight stacks per repo and gives priority to explicit stacks, then detected stacks with unfinished work.
+For PRs without a GitHub stack, Talos can infer a linear chain when each PR targets the previous PR's branch and exact head in the same repo. Ambiguous or branched relationships stay in the ordinary queue. You can also define a local stack with two to eight ready PRs in one repo, bottom to top.
 
 ```sh
+talos stack OWNER/REPO 10088
 talos stack OWNER/REPO feature 123 124 125
 talos status OWNER/REPO
 talos run-once OWNER/REPO 124
 talos unstack OWNER/REPO feature
 ```
 
-Talos waits for queued ancestor reviews or merges before starting the next scheduled PR. A baselined ancestor in a detected stack contributes its pinned diff and any available review without starting a new model run. Each PR keeps its own diff anchors and publication receipt. If a pin changes, Talos refreshes downstream context and keeps existing receipts. Use `status` to see the order and why a PR is blocked. `unstack` removes the explicit definition and keeps its queued jobs. A later scan can detect the chain again.
+Talos waits for queued ancestor reviews or merges before starting the next scheduled PR. A baselined ancestor can contribute its pinned diff and any available review without starting a new model run. Reviewers see excerpts from the nearest ancestors, and Talos rechecks the entire ordered prefix before publication. Each PR keeps its own diff anchors and publication receipt. Use `status` to see the stack number, order, and why a PR is blocked. `unstack` removes an explicit local definition and keeps its queued jobs. A later scan can detect the chain again. [GitHub stack APIs](https://docs.github.com/en/pull-requests/reference/stacked-pull-requests-apis-and-webhooks)
 
 ### Configure each repo
 

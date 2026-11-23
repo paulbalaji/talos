@@ -21,6 +21,7 @@ const usage =
     \\talos [--home DIR] status [OWNER/REPO] [--json]
     \\talos [--home DIR] queue-budget [STARTS]
     \\talos [--home DIR] queue OWNER/REPO PR
+    \\talos [--home DIR] stack OWNER/REPO STACK_NUMBER
     \\talos [--home DIR] stack OWNER/REPO NAME PR PR [PR ...]
     \\talos [--home DIR] unstack OWNER/REPO NAME
     \\talos [--home DIR] run-once [OWNER/REPO [PR]]
@@ -148,21 +149,28 @@ const Adapter = struct {
         const position = stack.find(self.entry.stacks, pr.number) orelse return .{};
         const item = self.entry.stacks[position.stack_index];
         const prefix = item.members[0 .. position.member_index + 1];
-        if (prefix.len > stack.max_members) return error.InvalidStackSize;
-        var numbers: [stack.max_members]u32 = undefined;
-        for (prefix, numbers[0..prefix.len]) |member, *number| number.* = member.pin.number;
-        const pins = try self.github_client.stackPulls(numbers[0..prefix.len]);
+        const pins = if (item.native) |identity|
+            (try self.github_client.nativeStack(identity, prefix.len)).pins
+        else local: {
+            if (prefix.len > stack.max_members) return error.InvalidStackSize;
+            var numbers: [stack.max_members]u32 = undefined;
+            for (prefix, numbers[0..prefix.len]) |member, *number| number.* = member.pin.number;
+            break :local try self.github_client.stackPulls(numbers[0..prefix.len]);
+        };
         const target = pins[pins.len - 1];
-        if (!target.ready() or !eq(u8, target.headRefOid, pr.headRefOid) or !eq(u8, target.baseRefOid, pr.baseRefOid))
+        if (target.number != pr.number or !target.ready() or !eq(u8, target.headRefOid, pr.headRefOid) or !eq(u8, target.baseRefOid, pr.baseRefOid))
             return error.StackChanged;
-        const ancestors = try self.db.a.alloc(stack.Ancestor, pins.len - 1);
+        const parent_count = pins.len - 1;
+        const detail_start = parent_count -| stack.context_members;
+        const ancestors = try self.db.a.alloc(stack.Ancestor, parent_count - detail_start);
         for (prefix, pins, 0..) |member, pin, index| {
+            if (member.pin.number != pin.number or (item.native == null and pin.nativeStack != null)) return error.StackChanged;
             if (!preview and !stack.samePin(member.pin, pin)) return error.StackChanged;
             if (pin.state != .MERGED and !pin.ready()) return error.StackChanged;
-            if (index > 0 and pin.state != .MERGED and pins[index - 1].state != .MERGED and
+            if (item.native == null and index > 0 and pin.state != .MERGED and pins[index - 1].state != .MERGED and
                 !stack.linked(self.repo.name, pins[index - 1], pin)) return error.StackChanged;
         }
-        for (prefix[0..ancestors.len], pins[0..ancestors.len], ancestors) |member, pin, *ancestor| {
+        for (prefix[detail_start..parent_count], pins[detail_start..parent_count], ancestors) |member, pin, *ancestor| {
             const merged_pin = pin.state == .MERGED and eq(u8, pin.headRefOid, member.pin.headRefOid);
             const base = if (merged_pin) member.diff_base else pin.baseRefOid;
             var ancestor_pr = pin.pull();
@@ -183,7 +191,7 @@ const Adapter = struct {
                 .review_excerpt = digest.findings,
             };
         }
-        return .{ .pins = pins, .ancestors = ancestors };
+        return .{ .pins = pins, .ancestors = ancestors, .native = item.native };
     }
 
     fn ancestorReview(self: *Adapter, pin: stack.Pin) !?core.Payload {
@@ -201,12 +209,26 @@ const Adapter = struct {
 
     pub fn checkStack(self: *Adapter, context: stack.Context) !void {
         if (context.pins.len == 0) return;
-        var numbers: [stack.max_members]u32 = undefined;
-        for (context.pins, numbers[0..context.pins.len]) |pin, *number| number.* = pin.number;
-        const latest = try self.github_client.stackPulls(numbers[0..context.pins.len]);
+        const latest = if (context.native) |identity|
+            (try self.github_client.nativeStack(identity, context.pins.len)).pins
+        else local: {
+            var numbers: [stack.max_members]u32 = undefined;
+            for (context.pins, numbers[0..context.pins.len]) |pin, *number| number.* = pin.number;
+            break :local try self.github_client.stackPulls(numbers[0..context.pins.len]);
+        };
         for (context.pins, latest) |before, after| {
             if (!stack.samePin(before, after)) return error.StackChanged;
         }
+    }
+
+    pub fn checkStackBeforePost(self: *Adapter, context: stack.Context, target: core.Pull) !void {
+        if (context.pins.len != 0) return self.checkStack(context);
+        // A normal PR can join a native stack after the most recent scan.
+        // Refuse to publish a standalone review for it before persisting intent.
+        const pins = try self.github_client.stackPulls(&.{target.number});
+        const pin = pins[0];
+        if (pin.nativeStack != null or !pin.ready() or !eq(u8, pin.headRefOid, target.headRefOid) or
+            !eq(u8, pin.baseRefOid, target.baseRefOid)) return error.StackChanged;
     }
 
     pub fn saveStackContext(self: *Adapter, pr: core.Pull, snap: core.Snapshot, payload: core.Payload) !void {
@@ -307,10 +329,12 @@ const Main = struct {
             try self.out("Updated {s} as {s}\n", .{ name, repo.login });
         } else {
             const pulls = try client.ready();
+            const natives = try client.nativeGroups(pulls);
             var repo_dir = (try self.objectCache(repo).repoDir(true)) orelse return error.RepositoryDirectoryMissing;
             repo_dir.close();
             var entry: core.Entry = .{ .repo = repo };
             try entry.discover(self.a, pulls, true);
+            try stack.syncNative(&entry, self.a, natives);
             try stack.autogroup(&entry, self.a, pulls);
             entry.last_scan = std.time.timestamp();
             entry.next_scan = entry.last_scan + repo.interval;
@@ -350,9 +374,11 @@ const Main = struct {
         const client = try local_tools.gh(&env, entry.repo.name);
         if (!std.ascii.eqlIgnoreCase(entry.repo.login, try client.identity())) return error.GitHubIdentityChanged;
         const pulls = try client.ready();
+        const natives = try client.nativeGroups(pulls);
         const pins = try client.stackPulls(try stack.numbers(self.a, entry.stacks));
         try entry.discover(self.a, pulls, false);
         try stack.refresh(entry, self.a, pins);
+        try stack.syncNative(entry, self.a, natives);
         try stack.autogroup(entry, self.a, pulls);
     }
 
@@ -451,22 +477,30 @@ const Main = struct {
         var gh_env: std.process.EnvMap = undefined;
         var live = try self.adapter(entry, state, &gh_env);
         _ = core.run(self.a, &live, entry.repo, job, .scheduled) catch |err| {
-            if (err == error.StackChanged) entry.next_scan = 0;
+            if (err == error.StackChanged or err == error.GitHubStackChanged) entry.next_scan = 0;
             return err;
         };
     }
 
     fn registerStack(self: Main, state: *store.State, args: []const []const u8) !void {
-        if (args.len < 4 or args.len > stack.max_members + 2) return error.Usage;
+        if (args.len != 2 and (args.len < 4 or args.len > stack.max_members + 2)) return error.Usage;
         const entry = state.find(args[0]) orelse return error.UnknownRepository;
+        const tools = self.local(entry.repo);
+        const env = try tools.githubEnv();
+        const client = try tools.gh(&env, entry.repo.name);
+        if (args.len == 2) {
+            const number = try prNumber(args[1]);
+            if (!std.ascii.eqlIgnoreCase(entry.repo.login, try client.identity())) return error.GitHubIdentityChanged;
+            const group = try client.nativeByNumber(number);
+            const count = try stack.queueNative(entry, self.a, group);
+            try self.db.save(state);
+            return self.out("Queued {s} GitHub stack #{d} with {d} ready PRs\n", .{ entry.repo.name, number, count });
+        }
         const name = args[1];
         var members: [stack.max_members]u32 = undefined;
         const numbers = members[0 .. args.len - 2];
         for (args[2..], numbers) |arg, *number| number.* = try prNumber(arg);
         try stack.validateRegistration(entry.*, name, numbers);
-        const tools = self.local(entry.repo);
-        const env = try tools.githubEnv();
-        const client = try tools.gh(&env, entry.repo.name);
         if (!std.ascii.eqlIgnoreCase(entry.repo.login, try client.identity())) return error.GitHubIdentityChanged;
         try stack.register(entry, self.a, name, try client.stackPulls(numbers));
         try self.db.save(state);
@@ -576,7 +610,11 @@ const Main = struct {
             }
             if (queued == 0) try self.out("  Queue empty\n", .{});
             for (stacks) |item| {
-                try self.out("  {s} {s} (bottom to top)\n", .{ if (item.automatic) "Auto stack" else "Stack", item.name });
+                if (item.native_number) |number| {
+                    try self.out("  GitHub stack #{d} (bottom to top)\n", .{number});
+                } else {
+                    try self.out("  {s} {s} (bottom to top)\n", .{ if (item.automatic) "Auto stack" else "Stack", item.name });
+                }
                 for (item.members) |member| {
                     try self.out("    #{d} {s} {s}", .{ member.number, member.state, member.review });
                     if (member.blocked_by) |reason|

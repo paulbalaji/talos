@@ -67,7 +67,7 @@ pub const Client = struct {
         \\  repository(owner: $owner, name: $name) {
         \\    pullRequests(first: 100, after: $endCursor, states: [OPEN]) {
         \\      pageInfo { hasNextPage endCursor }
-        \\      nodes { number headRefOid baseRefOid headRefName baseRefName headRepository { nameWithOwner } isDraft }
+        \\      nodes { number headRefOid baseRefOid headRefName baseRefName headRepository { nameWithOwner } isDraft nativeStack:stack { id number } }
         \\    }
         \\  }
         \\}
@@ -119,7 +119,7 @@ pub const Client = struct {
         const writer = query.writer(a);
         try writer.writeAll("query($owner:String!,$name:String!){repository(owner:$owner,name:$name){");
         for (numbers) |number| {
-            try writer.print("p{d}:pullRequest(number:{d}){{number headRefOid baseRefOid headRefName baseRefName headRepository{{nameWithOwner}} state isDraft}}", .{ number, number });
+            try writer.print("p{d}:pullRequest(number:{d}){{number headRefOid baseRefOid headRefName baseRefName headRepository{{nameWithOwner}} state isDraft nativeStack:stack{{id number}}}}", .{ number, number });
         }
         try writer.writeAll("}}");
         const args = [_][]const u8{ "-f", try io.fmt(a, "query={s}", .{query.items}) } ++ try self.repoFields();
@@ -135,6 +135,117 @@ pub const Client = struct {
             if (pin.number != number or !pin.valid()) return error.GitHubTargetMismatch;
         }
         return pins;
+    }
+
+    const native_query =
+        \\query($id:ID!,$cursor:String){
+        \\  node(id:$id){... on PullRequestStack {
+        \\    id number size entries(first:25,after:$cursor){
+        \\      totalCount pageInfo{hasNextPage endCursor}
+        \\      nodes{position pullRequest{
+        \\        number headRefOid baseRefOid headRefName baseRefName state isDraft
+        \\        repository{nameWithOwner} headRepository{nameWithOwner}
+        \\      }}
+        \\    }
+        \\  }}
+        \\}
+    ;
+    const NativePage = struct {
+        id: []const u8,
+        number: u32,
+        size: usize,
+        entries: struct {
+            totalCount: usize,
+            pageInfo: Page,
+            nodes: []const struct { position: usize, pullRequest: ?stack.Pin },
+        },
+    };
+
+    fn nativePage(self: Client, id: []const u8, cursor: ?[]const u8) !NativePage {
+        const a = self.cmd.a;
+        var args: std.ArrayList([]const u8) = .empty;
+        try args.appendSlice(a, &.{ "-f", try io.fmt(a, "query={s}", .{native_query}), "-f", try io.fmt(a, "id={s}", .{id}) });
+        if (cursor) |value| try args.appendSlice(a, &.{ "-f", try io.fmt(a, "cursor={s}", .{value}) });
+        const raw = self.api("graphql", args.items, "") catch |err| return transportFailure(err, error.GitHubStackFailed);
+        const parsed = try io.parse(a, GraphResponse(struct { node: ?NativePage }), raw);
+        try checkGraphErrors(parsed.errors, error.GitHubStackFailed);
+        const data = parsed.data orelse return error.GitHubStackFailed;
+        return data.node orelse error.GitHubStackChanged;
+    }
+
+    pub fn nativeStack(self: Client, stack_ref: stack.NativeRef, prefix: ?usize) !stack.NativeGroup {
+        const a = self.cmd.a;
+        var pins: std.ArrayList(stack.Pin) = .empty;
+        var cursor: ?[]const u8 = null;
+        var size: ?usize = null;
+        while (true) {
+            const response = try self.nativePage(stack_ref.id, cursor);
+            if (response.number != stack_ref.number or !eq(u8, response.id, stack_ref.id) or
+                response.size == 0 or response.entries.totalCount != response.size or
+                (size != null and size.? != response.size)) return error.GitHubStackChanged;
+            size = response.size;
+            const wanted = prefix orelse response.size;
+            if (wanted > response.size or response.entries.nodes.len == 0 or response.entries.nodes.len > 25)
+                return error.InvalidPagination;
+            for (response.entries.nodes) |entry| {
+                if (entry.position != pins.items.len + 1 or entry.position > response.size)
+                    return error.GitHubStackChanged;
+                var pin = entry.pullRequest orelse return error.GitHubStackChanged;
+                const repository = pin.repository orelse return error.GitHubStackChanged;
+                if (!pin.valid() or !std.ascii.eqlIgnoreCase(repository.nameWithOwner, self.repo))
+                    return error.GitHubStackChanged;
+                pin.nativeStack = stack_ref;
+                try pins.append(a, pin);
+                if (prefix != null and pins.items.len == wanted)
+                    return .{ .ref = stack_ref, .pins = pins.items };
+            }
+            cursor = try next(response.entries.pageInfo, cursor);
+            if (cursor == null) {
+                if (pins.items.len != wanted) return error.InvalidPagination;
+                return .{ .ref = stack_ref, .pins = pins.items };
+            }
+            if (pins.items.len >= wanted) return error.InvalidPagination;
+        }
+    }
+
+    pub fn nativeByNumber(self: Client, number: u32) !stack.NativeGroup {
+        const a = self.cmd.a;
+        const path = try self.endpoint(try io.fmt(a, "stacks/{d}", .{number}));
+        const raw = self.api(path, &.{ "-H", "X-GitHub-Api-Version: 2026-03-10" }, "") catch |err|
+            return transportFailure(err, error.GitHubStackFailed);
+        const response = try io.parse(a, struct { number: u32, node_id: []const u8 }, raw);
+        if (response.number != number or response.node_id.len == 0) return error.GitHubTargetMismatch;
+        return self.nativeStack(.{ .number = number, .id = response.node_id }, null);
+    }
+
+    pub fn nativeGroups(self: Client, pulls: []const core.Pull) ![]stack.NativeGroup {
+        const a = self.cmd.a;
+        var loaded: std.AutoHashMapUnmanaged(u32, stack.NativeRef) = .empty;
+        defer loaded.deinit(a);
+        var membership: std.AutoHashMapUnmanaged(u32, stack.NativeRef) = .empty;
+        defer membership.deinit(a);
+        var groups: std.ArrayList(stack.NativeGroup) = .empty;
+        for (pulls) |pull_value| {
+            const stack_ref = pull_value.nativeStack orelse continue;
+            const slot = try loaded.getOrPut(a, stack_ref.number);
+            if (slot.found_existing) {
+                if (!stack.sameRef(slot.value_ptr.*, stack_ref)) return error.GitHubStackChanged;
+                continue;
+            }
+            slot.value_ptr.* = stack_ref;
+            const group = try self.nativeStack(stack_ref, null);
+            for (group.pins) |pin| {
+                const member = try membership.getOrPut(a, pin.number);
+                if (member.found_existing) return error.GitHubStackChanged;
+                member.value_ptr.* = stack_ref;
+            }
+            try groups.append(a, group);
+        }
+        for (pulls) |pull_value| {
+            if (!stack.sameRef(membership.get(pull_value.number), pull_value.nativeStack))
+                return error.GitHubStackChanged;
+        }
+        return groups.items;
     }
 
     pub fn reviews(self: Client, number: u32) ![]const core.Prior {

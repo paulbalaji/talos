@@ -4,10 +4,12 @@ const io = @import("io.zig");
 
 pub const max_stacks = 8;
 pub const max_members = 8;
+pub const context_members = 4;
 const diff_bytes = 640;
 const finding_bytes = 480;
 
 pub const RepositoryRef = struct { nameWithOwner: []const u8 };
+pub const NativeRef = struct { id: []const u8, number: u32 };
 
 pub const Pin = struct {
     number: u32,
@@ -16,6 +18,8 @@ pub const Pin = struct {
     headRefName: []const u8,
     baseRefName: []const u8,
     headRepository: ?RepositoryRef,
+    repository: ?RepositoryRef = null,
+    nativeStack: ?NativeRef = null,
     state: enum { OPEN, MERGED, CLOSED },
     isDraft: bool,
 
@@ -35,6 +39,7 @@ pub const Pin = struct {
             .headRefName = self.headRefName,
             .baseRefName = self.baseRefName,
             .headRepository = self.headRepository,
+            .nativeStack = self.nativeStack,
             .isDraft = self.isDraft,
             .state = @tagName(self.state),
         };
@@ -50,6 +55,7 @@ pub const Pin = struct {
             .headRefName = pr.headRefName,
             .baseRefName = pr.baseRefName,
             .headRepository = pr.headRepository,
+            .nativeStack = pr.nativeStack,
             .state = .OPEN,
             .isDraft = pr.isDraft,
         };
@@ -87,7 +93,13 @@ pub const Member = struct {
 pub const Stack = struct {
     name: []const u8,
     automatic: bool = false,
+    native: ?NativeRef = null,
     members: []Member,
+};
+
+pub const NativeGroup = struct {
+    ref: NativeRef,
+    pins: []Pin,
 };
 
 pub const Ancestor = struct {
@@ -102,6 +114,7 @@ pub const Ancestor = struct {
 pub const Context = struct {
     pins: []const Pin = &.{},
     ancestors: []const Ancestor = &.{},
+    native: ?NativeRef = null,
 };
 
 pub const Position = struct { stack_index: usize, member_index: usize };
@@ -127,6 +140,11 @@ fn inExplicit(stacks: []const Stack, number: u32) bool {
     return !stacks[position.stack_index].automatic;
 }
 
+fn inNative(stacks: []const Stack, number: u32) bool {
+    const position = find(stacks, number) orelse return false;
+    return stacks[position.stack_index].native != null;
+}
+
 fn validName(name: []const u8) bool {
     if (name.len == 0 or name.len > 40) return false;
     for (name) |byte| {
@@ -145,7 +163,7 @@ pub fn validateRegistration(entry: core.Entry, name: []const u8, members: []cons
     if (explicit >= max_stacks) return error.StackLimit;
     if (named(entry.stacks, name) != null) return error.StackAlreadyExists;
     for (members, 0..) |number, index| {
-        if (inExplicit(entry.stacks, number) or std.mem.indexOfScalar(u32, members[0..index], number) != null)
+        if (inExplicit(entry.stacks, number) or inNative(entry.stacks, number) or std.mem.indexOfScalar(u32, members[0..index], number) != null)
             return error.StackMemberAlreadyListed;
     }
 }
@@ -156,22 +174,30 @@ pub fn register(entry: *core.Entry, a: io.A, name: []const u8, pins: []const Pin
     for (pins, numbers_buffer[0..pins.len]) |pin, *number| number.* = pin.number;
     try validateRegistration(entry.*, name, numbers_buffer[0..pins.len]);
     for (pins, 0..) |pin, index| {
+        if (pin.nativeStack != null) return error.PreferGitHubStack;
         if (!pin.valid() or !pin.ready()) return error.PullRequestNotReady;
         if (index > 0 and !linked(entry.repo.name, pins[index - 1], pin)) return error.InvalidStackDependency;
     }
     const members = try a.alloc(Member, pins.len);
     for (members, pins) |*member, pin| member.* = .{ .pin = pin, .diff_base = pin.baseRefOid };
     var stacks: std.ArrayList(Stack) = .empty;
+    var local_count: usize = 1;
     for (entry.stacks) |item| {
-        if (!item.automatic) try stacks.append(a, item);
+        if (!item.automatic or item.native != null) {
+            try stacks.append(a, item);
+            if (item.native == null) local_count += 1;
+        }
     }
     try stacks.append(a, .{ .name = name, .members = members });
     for (entry.stacks) |item| {
-        if (stacks.items.len >= max_stacks) break;
-        if (!item.automatic) continue;
+        if (local_count >= max_stacks) break;
+        if (!item.automatic or item.native != null) continue;
         for (item.members) |member| {
             if (std.mem.indexOfScalar(u32, numbers_buffer[0..pins.len], member.pin.number) != null) break;
-        } else try stacks.append(a, item);
+        } else {
+            try stacks.append(a, item);
+            local_count += 1;
+        }
     }
     for (pins) |pin| try entry.queue(a, pin.pull(), true);
     entry.stacks = stacks.items;
@@ -194,8 +220,15 @@ pub fn samePin(before: Pin, after: Pin) bool {
     else
         after.headRepository == null;
     return before.number == after.number and before.state == after.state and before.isDraft == after.isDraft and
+        sameRef(before.nativeStack, after.nativeStack) and
         io.eq(u8, before.headRefOid, after.headRefOid) and io.eq(u8, before.baseRefOid, after.baseRefOid) and
         io.eq(u8, before.headRefName, after.headRefName) and io.eq(u8, before.baseRefName, after.baseRefName) and same_head_repo;
+}
+
+pub fn sameRef(before: ?NativeRef, after: ?NativeRef) bool {
+    const left = before orelse return after == null;
+    const right = after orelse return false;
+    return left.number == right.number and io.eq(u8, left.id, right.id);
 }
 
 const BranchPin = struct { name: []const u8, oid: []const u8 };
@@ -222,10 +255,17 @@ const Node = struct {
 
 pub fn autogroup(entry: *core.Entry, a: io.A, pulls: []const core.Pull) !void {
     var groups: std.ArrayList(Stack) = .empty;
+    var local_count: usize = 0;
     for (entry.stacks) |item| {
-        if (!item.automatic) try groups.append(a, item);
+        if (!item.automatic or item.native != null) {
+            try groups.append(a, item);
+            if (item.native == null) local_count += 1;
+        }
     }
-    if (groups.items.len == max_stacks) return;
+    if (local_count == max_stacks) {
+        entry.stacks = groups.items;
+        return;
+    }
     var pending: std.HashMapUnmanaged(core.Seen, void, core.SeenContext, std.hash_map.default_max_load_percentage) = .empty;
     defer pending.deinit(a);
     for (entry.jobs) |job| {
@@ -234,7 +274,10 @@ pub fn autogroup(entry: *core.Entry, a: io.A, pulls: []const core.Pull) !void {
     var nodes: std.ArrayList(Node) = .empty;
     for (pulls) |pr| {
         const pin = Pin.fromReady(pr) orelse continue;
-        try nodes.append(a, .{ .pin = pin, .ambiguous = inExplicit(entry.stacks, pin.number) });
+        try nodes.append(a, .{
+            .pin = pin,
+            .ambiguous = pin.nativeStack != null or inNative(entry.stacks, pin.number) or inExplicit(entry.stacks, pin.number),
+        });
     }
     var heads: std.HashMapUnmanaged(BranchPin, usize, BranchContext, std.hash_map.default_max_load_percentage) = .empty;
     defer heads.deinit(a);
@@ -264,7 +307,7 @@ pub fn autogroup(entry: *core.Entry, a: io.A, pulls: []const core.Pull) !void {
     var idle: [max_stacks]Stack = undefined;
     var idle_count: usize = 0;
     roots: for (nodes.items, 0..) |root, index| {
-        if (groups.items.len == max_stacks) break;
+        if (local_count == max_stacks) break;
         if (root.parent != null) continue;
         var chain: [max_members]Member = undefined;
         const merged = mergedPrefix(entry.stacks, root.pin.number);
@@ -288,12 +331,13 @@ pub fn autogroup(entry: *core.Entry, a: io.A, pulls: []const core.Pull) !void {
         };
         if (active) {
             try groups.append(a, item);
+            local_count += 1;
         } else {
             idle[idle_count] = item;
             idle_count += 1;
         }
     }
-    try groups.appendSlice(a, idle[0..@min(idle_count, max_stacks - groups.items.len)]);
+    try groups.appendSlice(a, idle[0..@min(idle_count, max_stacks - local_count)]);
     entry.stacks = groups.items;
 }
 
@@ -329,9 +373,12 @@ fn sameAncestry(before: []const Member, after: []const Member) bool {
 }
 
 pub fn numbers(a: io.A, stacks: []const Stack) ![]u32 {
-    if (stacks.len > max_stacks) return error.StackLimit;
+    var count: usize = 0;
     var list: std.ArrayList(u32) = .empty;
     for (stacks) |item| {
+        if (item.native != null) continue;
+        count += 1;
+        if (count > max_stacks) return error.StackLimit;
         if (item.members.len < 2 or item.members.len > max_members) return error.InvalidStackSize;
         for (item.members) |member| try list.append(a, member.pin.number);
     }
@@ -341,6 +388,7 @@ pub fn numbers(a: io.A, stacks: []const Stack) ![]u32 {
 pub fn refresh(entry: *core.Entry, a: io.A, observed: []const Pin) !void {
     var expected: usize = 0;
     for (entry.stacks) |item| {
+        if (item.native != null) continue;
         for (item.members) |member| {
             if (expected == observed.len or member.pin.number != observed[expected].number or !observed[expected].valid())
                 return error.StackObservationMismatch;
@@ -350,6 +398,7 @@ pub fn refresh(entry: *core.Entry, a: io.A, observed: []const Pin) !void {
     if (expected != observed.len) return error.StackObservationMismatch;
     var offset: usize = 0;
     for (entry.stacks) |item| {
+        if (item.native != null) continue;
         var prefix_changed = false;
         for (item.members) |*member| {
             const updated = observed[offset];
@@ -370,6 +419,96 @@ pub fn refresh(entry: *core.Entry, a: io.A, observed: []const Pin) !void {
             try refreshJob(entry, a, updated, item.automatic);
         }
     }
+}
+
+fn nativeItem(entry: *core.Entry, a: io.A, group: NativeGroup) !Stack {
+    var previous: []const Member = &.{};
+    for (entry.stacks) |item| {
+        if (sameRef(item.native, group.ref)) {
+            previous = item.members;
+            break;
+        }
+    }
+    var indices: std.AutoHashMapUnmanaged(u32, usize) = .empty;
+    defer indices.deinit(a);
+    for (previous, 0..) |member, index| try indices.put(a, member.pin.number, index);
+    const members = try a.alloc(Member, group.pins.len);
+    var prefix_changed = false;
+    for (members, group.pins, 0..) |*member, pin, index| {
+        member.* = .{ .pin = pin, .diff_base = pin.baseRefOid };
+        if (indices.get(pin.number)) |old_index| {
+            const old = previous[old_index];
+            const unchanged = samePin(old.pin, pin);
+            if (unchanged or (pin.state == .MERGED and io.eq(u8, old.pin.headRefOid, pin.headRefOid))) {
+                member.diff_base = old.diff_base;
+                member.digest = old.digest;
+            }
+            if (prefix_changed or old_index != index) {
+                if (member.digest) |*digest| digest.findings = "";
+            }
+            prefix_changed = prefix_changed or old_index != index or !unchanged;
+            if (prefix_changed) try refreshJob(entry, a, pin, true);
+        } else {
+            prefix_changed = true;
+        }
+    }
+    return .{
+        .name = try io.fmt(a, "github-{d}", .{group.ref.number}),
+        .automatic = true,
+        .native = group.ref,
+        .members = members,
+    };
+}
+
+pub fn syncNative(entry: *core.Entry, a: io.A, discovered: []const NativeGroup) !void {
+    // Validate the complete observation before changing persisted work. A
+    // concurrent re-stack must not assign a PR to two different stacks.
+    var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer seen.deinit(a);
+    for (discovered) |group| {
+        if (group.pins.len == 0) return error.GitHubStackChanged;
+        for (group.pins) |pin| {
+            const slot = try seen.getOrPut(a, pin.number);
+            if (slot.found_existing or !pin.valid() or !sameRef(pin.nativeStack, group.ref))
+                return error.GitHubStackChanged;
+        }
+    }
+    var groups: std.ArrayList(Stack) = .empty;
+    for (discovered) |group| try groups.append(a, try nativeItem(entry, a, group));
+    for (entry.stacks) |item| {
+        if (item.native != null) continue;
+        for (item.members) |member| {
+            if (seen.contains(member.pin.number)) break;
+        } else try groups.append(a, item);
+    }
+    entry.stacks = groups.items;
+}
+
+pub fn queueNative(entry: *core.Entry, a: io.A, group: NativeGroup) !usize {
+    var count: usize = 0;
+    for (group.pins) |pin| {
+        if (pin.ready()) count += 1;
+    }
+    if (count == 0) return error.NoReadyStackMembers;
+    var groups: std.ArrayList(NativeGroup) = .empty;
+    try groups.append(a, group);
+    for (entry.stacks) |item| {
+        const identity = item.native orelse continue;
+        if (sameRef(identity, group.ref)) continue;
+        const pins = try a.alloc(Pin, item.members.len);
+        for (pins, item.members) |*pin, member| pin.* = member.pin;
+        for (pins) |pin| {
+            for (group.pins) |queued| {
+                if (queued.number == pin.number) break;
+            } else continue;
+            break;
+        } else try groups.append(a, .{ .ref = identity, .pins = pins });
+    }
+    try syncNative(entry, a, groups.items);
+    for (group.pins) |pin| {
+        if (pin.ready()) try entry.queue(a, pin.pull(), true);
+    }
+    return count;
 }
 
 fn refreshJob(entry: *core.Entry, a: io.A, pin: Pin, automatic: bool) !void {
@@ -576,6 +715,49 @@ test "inferred stacks retain merged ancestors and uncertain receipt backoff" {
     try t.expect(!blocked(entry, entry.jobs[0]));
 }
 
+test "GitHub order is authoritative for a 26-member stack" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var entry = core.Entry{ .repo = fixture_repo };
+    const stack_ref = NativeRef{ .id = "PRS_example", .number = 23 };
+    var pins: [26]Pin = undefined;
+    var pulls: [25]core.Pull = undefined;
+    for (&pins, 0..) |*pin, index| {
+        pin.* = fixture_parent;
+        pin.number = @intCast(1000 + index);
+        pin.nativeStack = stack_ref;
+        if (index > 0) {
+            // The authoritative native positions survive even when branch
+            // metadata cannot establish the same chain during a rebase.
+            pin.headRefName = try io.fmt(a, "head-{d}", .{index});
+            pin.baseRefName = "rebasing";
+            pulls[index - 1] = pin.pull();
+        } else {
+            pin.state = .MERGED;
+        }
+    }
+    const group: NativeGroup = .{ .ref = stack_ref, .pins = &pins };
+    try entry.discover(a, &pulls, true);
+    try syncNative(&entry, a, &.{group});
+    try autogroup(&entry, a, &pulls);
+    try t.expectEqual(@as(usize, 26), entry.stacks[0].members.len);
+    try t.expectEqual(@as(usize, 0), entry.jobs.len);
+    try t.expectEqual(@as(usize, 0), (try numbers(a, entry.stacks)).len);
+    try entry.queue(a, pulls[24], true);
+    try t.expect(!blocked(entry, entry.jobs[0]));
+    const report = try statuses(a, entry);
+    try t.expectEqual(@as(?u32, 23), report[0].native_number);
+    try t.expectEqual(@as(u32, 1025), report[0].members[25].number);
+    try t.expectEqual(@as(usize, 25), try queueNative(&entry, a, group));
+    try t.expect(blocked(entry, entry.jobs[0]));
+    try t.expect(!blocked(entry, entry.jobs[1]));
+    pins[1].state = .MERGED;
+    try syncNative(&entry, a, &.{group});
+    try t.expect(!blocked(entry, entry.jobs[2]));
+}
+
 pub const Block = struct { number: u32, reason: []const u8 };
 
 fn matchingJob(jobs: []const core.Job, pin: Pin) ?core.Job {
@@ -590,7 +772,7 @@ pub fn blocker(entry: core.Entry, item: Stack, index: usize) ?Block {
         const pin = member.pin;
         if (pin.state == .MERGED and member_index < index) continue;
         if (!pin.ready()) return .{ .number = pin.number, .reason = if (pin.isDraft) "draft" else "not open" };
-        if (member_index > 0) {
+        if (member_index > 0 and item.native == null) {
             const before = item.members[member_index - 1].pin;
             if (before.state != .MERGED and !linked(entry.repo.name, before, pin))
                 return .{ .number = pin.number, .reason = "base is not the previous PR head" };
@@ -620,7 +802,7 @@ pub const MemberStatus = struct {
     blocked_by: ?Block = null,
 };
 
-pub const Status = struct { name: []const u8, automatic: bool, members: []const MemberStatus };
+pub const Status = struct { name: []const u8, automatic: bool, native_number: ?u32, members: []const MemberStatus };
 
 pub fn statuses(a: io.A, entry: core.Entry) ![]Status {
     const result = try a.alloc(Status, entry.stacks.len);
@@ -645,7 +827,7 @@ pub fn statuses(a: io.A, entry: core.Entry) ![]Status {
                 .blocked_by = blocked_by,
             };
         }
-        output.* = .{ .name = item.name, .automatic = item.automatic, .members = members };
+        output.* = .{ .name = item.name, .automatic = item.automatic, .native_number = if (item.native) |identity| identity.number else null, .members = members };
     }
     return result;
 }

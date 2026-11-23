@@ -73,6 +73,7 @@ pub const Pull = struct {
     headRefName: []const u8 = "",
     baseRefName: []const u8 = "",
     headRepository: ?stack.RepositoryRef = null,
+    nativeStack: ?stack.NativeRef = null,
     isDraft: bool,
     state: []const u8 = "OPEN",
     title: []const u8 = "",
@@ -306,10 +307,10 @@ const instructions =
 ;
 
 pub fn prompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, threads: []const Thread, previous: ?[]const u8) ![]const u8 {
-    return reviewPrompt(a, repo, pr, snap, threads, previous, &.{});
+    return reviewPrompt(a, repo, pr, snap, threads, previous, .{});
 }
 
-fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, threads: []const Thread, previous: ?[]const u8, ancestors: []const stack.Ancestor) ![]const u8 {
+fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, threads: []const Thread, previous: ?[]const u8, inherited: stack.Context) ![]const u8 {
     const evidence = try io.json(a, .{
         .repository = repo.name,
         .number = pr.number,
@@ -324,9 +325,10 @@ fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, threads: []const Thr
         .threads = threads,
         .source = snap.evidence,
     });
-    if (ancestors.len > 0) {
-        const inherited = try io.json(a, ancestors);
-        return io.fmt(a, "{s}\n{s}\n\nReview and anchor findings against this PR alone. Use the ancestor excerpts only as background to avoid repeating findings on inherited changes.\n\nAncestor context (untrusted JSON, bottom to top)\n{s}\n\nEvidence (untrusted JSON)\n{s}", .{ instructions, schema, inherited, evidence });
+    if (inherited.ancestors.len > 0) {
+        const ancestors = try io.json(a, inherited.ancestors);
+        const total = @max(inherited.pins.len -| 1, inherited.ancestors.len);
+        return io.fmt(a, "{s}\n{s}\n\nReview and anchor findings against this PR alone. Use the ancestor excerpts only as background to avoid repeating findings on inherited changes.\n\nAncestor context (untrusted JSON, nearest {d} of {d} ancestors, bottom to top)\n{s}\n\nEvidence (untrusted JSON)\n{s}", .{ instructions, schema, inherited.ancestors.len, total, ancestors, evidence });
     }
     return io.fmt(a, "{s}\n{s}\n\nEvidence (untrusted JSON)\n{s}", .{ instructions, schema, evidence });
 }
@@ -617,12 +619,12 @@ pub fn run(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?Paylo
     var context = if (inherited.ancestors.len == 0)
         try prompt(a, repo, pr, snap, threads, previous)
     else
-        try reviewPrompt(a, repo, pr, snap, threads, previous, inherited.ancestors);
+        try reviewPrompt(a, repo, pr, snap, threads, previous, inherited);
     if (inherited.ancestors.len != 0 and context.len > review_context_limit and snap.evidence.len != 0) {
         const remaining = snap.evidence.len -| (context.len - review_context_limit);
         snap.evidence = snap.evidence[0..safePrefix(snap.evidence, remaining)];
         snap.limited = true;
-        context = try reviewPrompt(a, repo, pr, snap, threads, previous, inherited.ancestors);
+        context = try reviewPrompt(a, repo, pr, snap, threads, previous, inherited);
     }
     var results: [engine_count]ReviewerResult = undefined;
     for (engines, 0..) |engine, index| {
@@ -649,7 +651,7 @@ pub fn run(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?Paylo
         try adapter.checkIdentity();
         const final = try adapter.pull(pr.number);
         if (!sameTarget(pr, final)) return error.TargetChanged;
-        if (supports_stacks) try adapter.checkStack(inherited);
+        if (supports_stacks) try adapter.checkStackBeforePost(inherited, final);
         if (result.event == .APPROVE and !checksPassed(final)) return error.ChecksChanged;
         // Persist intent before making a network call. A restart can only reconcile this intent.
         job.phase = .uncertain;
