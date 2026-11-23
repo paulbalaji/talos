@@ -4,6 +4,7 @@ const posix = std.posix;
 
 pub const filename = "launchd.log";
 const archive_prefix = filename ++ ".";
+const staging_name = ".launchd.log.pending";
 const day_ns = @as(i128, std.time.s_per_day) * std.time.ns_per_s;
 const max_age_ns = 30 * day_ns;
 const max_bytes = 10 * 1024 * 1024;
@@ -15,6 +16,15 @@ fn regularStat(dir: std.fs.Dir, name: []const u8) !?posix.Stat {
         else => return err,
     };
     return if (stat.mode & posix.S.IFMT == posix.S.IFREG) stat else null;
+}
+
+fn writeArchive(dir: std.fs.Dir, name: []const u8, bytes: []const u8) !void {
+    const pending = try dir.createFile(staging_name, .{ .exclusive = true, .mode = 0o600 });
+    defer pending.close();
+    errdefer dir.deleteFile(staging_name) catch {};
+    try pending.writeAll(bytes);
+    try pending.sync();
+    try dir.rename(staging_name, name);
 }
 
 fn rotate(a: io.A, dir: std.fs.Dir, now: i128) !void {
@@ -30,6 +40,10 @@ fn rotate(a: io.A, dir: std.fs.Dir, now: i128) !void {
     const current = try posix.fstat(fd);
     if (current.mode & posix.S.IFMT != posix.S.IFREG or current.nlink != 1) return;
     const stat = std.fs.File.Stat.fromPosix(current);
+    const stderr = std.fs.File.stderr();
+    const inherited: ?posix.Stat = posix.fstat(stderr.handle) catch null;
+    const writes_log = if (inherited) |opened| opened.dev == current.dev and opened.ino == current.ino else false;
+    if (writes_log) try stderr.seekTo(stat.size);
     if (stat.size == 0 or (stat.size < segment_bytes and @divFloor(stat.mtime, day_ns) >= @divFloor(now, day_ns))) return;
 
     const tail = try readTail(a, file, stat.size, @intCast(@min(stat.size, max_bytes)));
@@ -39,13 +53,11 @@ fn rotate(a: io.A, dir: std.fs.Dir, now: i128) !void {
         // Retrying an interrupted archive write uses the same destination.
         stat.mtime, std.hash.Wyhash.hash(stat.size, tail),
     });
-    try io.write(dir, archive, tail);
+    try writeArchive(dir, archive, tail);
     // launchd opens stderr before Talos obtains its lock. Preserve the inode
     // so an inherited descriptor continues writing to the active log.
     try file.setEndPos(0);
-    const stderr = std.fs.File.stderr();
-    const inherited = posix.fstat(stderr.handle) catch return;
-    if (inherited.dev == current.dev and inherited.ino == current.ino) try stderr.seekTo(0);
+    if (writes_log) try stderr.seekTo(0);
 }
 
 const Archive = struct {
@@ -98,7 +110,7 @@ fn keepTail(a: io.A, dir: std.fs.Dir, archive: Archive, bytes: usize) !void {
     if (stat.kind != .file or stat.size <= bytes) return;
     const tail = try readTail(a, file, stat.size, bytes);
     defer a.free(tail);
-    try io.write(dir, archive.name, tail);
+    try writeArchive(dir, archive.name, tail);
 }
 
 fn prune(a: io.A, dir: std.fs.Dir, now: i128, cap: u64) !void {
@@ -138,6 +150,7 @@ fn prune(a: io.A, dir: std.fs.Dir, now: i128, cap: u64) !void {
 }
 
 pub fn maintain(a: io.A, dir: std.fs.Dir, now: i128) !void {
+    if (try regularStat(dir, staging_name) != null) try dir.deleteFile(staging_name);
     const rotation = rotate(a, dir, now);
     const pruning = prune(a, dir, now, max_bytes);
     try rotation;
@@ -173,7 +186,9 @@ test "rotation archives an earlier UTC day and keeps today's log in place" {
     }
     try t.expectEqual(@as(usize, 1), archives);
     try io.write(tmp.dir, filename, "new diagnostic");
+    try io.write(tmp.dir, staging_name, "interrupted archive");
     try maintain(t.allocator, tmp.dir, now);
+    try t.expectError(error.FileNotFound, tmp.dir.access(staging_name, .{}));
     try tmp.dir.access(filename, .{});
 }
 
