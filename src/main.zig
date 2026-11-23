@@ -316,11 +316,17 @@ const ReviewWorker = struct {
     done: std.atomic.Value(bool) = .init(false),
     result: anyerror!core.ReviewResults = undefined,
 
-    pub fn review(self: *ReviewWorker, engine: core.Engine, prompt: []const u8) ![]const u8 {
-        const limited = self.batch.limited.load(.monotonic);
-        for (self.prepared.engines) |selected| {
-            if (limited & queue.engineBit(selected) != 0) return error.ReviewerCoolingDown;
+    fn remainingLimited(engines: []const core.Engine, current: core.Engine, limited: u8) bool {
+        const offset = std.mem.indexOfScalar(core.Engine, engines, current).?;
+        for (engines[offset..]) |engine| {
+            if (limited & queue.engineBit(engine) != 0) return true;
         }
+        return false;
+    }
+
+    pub fn review(self: *ReviewWorker, engine: core.Engine, prompt: []const u8) ![]const u8 {
+        if (remainingLimited(self.prepared.engines, engine, self.batch.limited.load(.monotonic)))
+            return error.ReviewerCoolingDown;
         return runReviewer(self.tools, self.adapter.repo, engine, prompt) catch |err| {
             switch (err) {
                 error.CodexRateLimited, error.ClaudeRateLimited, error.KimiRateLimited => _ = self.batch.limited.fetchOr(queue.engineBit(engine), .monotonic),
@@ -560,7 +566,13 @@ const Main = struct {
             work.thread = null;
             batch.pending -= 1;
             counts.reviewer_starts += work.counts.reviewer_starts;
-            self.finishJob(state, work) catch |err| try self.jobFailed(state, work.adapter.entry, work.job, err);
+            self.finishJob(state, work) catch |err| switch (err) {
+                error.ReviewerCoolingDown => {
+                    const reserved: u32 = @intCast(work.prepared.engines.len);
+                    batch.starts_left += reserved - work.counts.reviewer_starts;
+                },
+                else => try self.jobFailed(state, work.adapter.entry, work.job, err),
+            };
         }
     }
 
@@ -585,7 +597,11 @@ const Main = struct {
         }
         counts.jobs += 1;
         state.queue_budget.next_repo = batch.deferred_repo orelse (lane.index + 1) % state.entries.len;
-        self.startJob(state, entry, job, batch) catch |err| try self.jobFailed(state, entry, job, err);
+        self.startJob(state, entry, job, batch) catch |err| switch (err) {
+            // Refund model starts. Keep the PR slot charged for GitHub work.
+            error.ReviewerCoolingDown => batch.starts_left += queue.reviewerCost(entry.repo),
+            else => try self.jobFailed(state, entry, job, err),
+        };
         return true;
     }
 
@@ -606,7 +622,7 @@ const Main = struct {
             // Persist the invalidation even if the provider holds this job.
             try self.db.save(state);
         }
-        if (!state.queue_budget.canReview(entry.repo, std.time.timestamp(), batch.limited.load(.monotonic))) return;
+        if (!state.queue_budget.canReview(entry.repo, std.time.timestamp(), batch.limited.load(.monotonic))) return error.ReviewerCoolingDown;
         work.thread = try std.Thread.spawn(.{}, ReviewWorker.analyze, .{work});
         batch.pending += 1;
         batch.workers[batch.len] = work;
@@ -640,7 +656,6 @@ const Main = struct {
     }
 
     fn jobFailed(self: Main, state: *store.State, entry: *core.Entry, job: *core.Job, err: anyerror) !void {
-        if (err == error.ReviewerCoolingDown) return;
         if (err != error.GitHubRateLimited) job.analysis = null;
         if (err == error.StackChanged or err == error.GitHubStackChanged) entry.next_scan = 0;
         const now = std.time.timestamp();
@@ -1184,4 +1199,11 @@ test "review workers overlap and use separate scratch directories" {
     try t.expect(!eq(u8, one, two));
     try t.expectError(error.FileNotFound, std.fs.accessAbsolute(one, .{}));
     try t.expectError(error.FileNotFound, std.fs.accessAbsolute(two, .{}));
+}
+
+test "reviewer cooldown applies to the remaining ensemble" {
+    const engines = &.{ .codex, .claude, .kimi };
+    try std.testing.expect(!ReviewWorker.remainingLimited(engines, .claude, queue.engineBit(.codex)));
+    try std.testing.expect(ReviewWorker.remainingLimited(engines, .claude, queue.engineBit(.claude)));
+    try std.testing.expect(ReviewWorker.remainingLimited(engines, .claude, queue.engineBit(.kimi)));
 }
