@@ -1082,8 +1082,8 @@ const Main = struct {
     }
 
     fn scheduledTick(self: Main) !void {
-        log_retention.rotate(self.db.dir, std.time.nanoTimestamp()) catch |err|
-            std.log.warn("diagnostic log rotation failed ({s})", .{@errorName(err)});
+        log_retention.maintain(self.a, self.db.dir, std.time.nanoTimestamp()) catch |err|
+            std.log.warn("diagnostic log maintenance failed ({s})", .{@errorName(err)});
         defer log_retention.maintain(self.a, self.db.dir, std.time.nanoTimestamp()) catch |err|
             std.log.warn("diagnostic log maintenance failed ({s})", .{@errorName(err)});
         const result: anyerror!void = tick: {
