@@ -249,8 +249,10 @@ pub const Git = struct {
         if (sensitive_count != 0) try coverage.append(a, try io.fmt(a, "Sensitive changed paths omitted: {d}.", .{sensitive_count}));
         if (patch_count != 0) try coverage.append(a, try io.fmt(a, "Files without a GitHub patch: {d}.", .{patch_count}));
         if (invalid_path_count != 0) try coverage.append(a, try io.fmt(a, "Unsupported changed paths omitted: {d}.", .{invalid_path_count}));
+        const logo_only = core.registryMain(self.object_cache.repo, pr) and coverage.items.len == 0 and
+            registry_logo.candidate(files, patch) and try self.appendStaticRegistryLogos(path, merge_base, pr.headRefOid, files, &evidence, remaining);
         var offset: usize = 0;
-        while (offset < candidates.items.len and remaining >= 1024) : (offset += batch_size) {
+        while (!logo_only and offset < candidates.items.len and remaining >= 1024) : (offset += batch_size) {
             const group = candidates.items[offset..@min(offset + batch_size, candidates.items.len)];
             const blobs = self.readBlobs(path, pr.headRefOid, group, remaining) catch {
                 // A lazy fetch can fail for one object. Keep available context
@@ -294,19 +296,25 @@ pub const Git = struct {
                 }
             }
         }
-        const logo_only = core.registryMain(self.object_cache.repo, pr) and coverage.items.len == 0 and
-            registry_logo.candidate(files, patch) and try self.staticRegistryLogos(path, merge_base, pr.headRefOid, files);
         return .{ .merge_base = merge_base, .evidence = evidence.items, .limited = coverage.items.len != 0, .coverage_reasons = coverage.items, .registry_logo_only = logo_only };
     }
 
-    fn staticRegistryLogos(self: Git, path: []const u8, base: []const u8, head: []const u8, files: []const github.File) !bool {
+    fn appendStaticRegistryLogos(self: Git, path: []const u8, base: []const u8, head: []const u8, files: []const github.File, evidence: *std.ArrayList(u8), remaining: usize) !bool {
+        const a = self.cmd.a;
+        var logos: std.ArrayList(u8) = .empty;
+        defer logos.deinit(a);
+        const writer = logos.writer(a);
         for (files) |file| {
             const new = try self.logoBlob(path, head, file.filename) orelse return false;
             if (registry_logo.isLogo(file.filename)) {
                 const old = try self.logoBlob(path, base, file.filename) orelse return false;
                 if (!registry_logo.staticSvg(old) or !registry_logo.staticSvg(new)) return false;
+                try writer.print("\n\nMerge-base file {s}:\n{s}", .{ file.filename, old });
             } else if (!registry_logo.patchChangeset(new)) return false;
+            try writer.print("\n\nHead file {s}:\n{s}", .{ file.filename, new });
+            if (logos.items.len > remaining) return false;
         }
+        try evidence.appendSlice(a, logos.items);
         return true;
     }
 

@@ -67,7 +67,7 @@ fn containsName(names: []const []const u8, name: []const u8) bool {
 }
 
 fn plainValue(value: []const u8) bool {
-    for (value) |c| if (!std.ascii.isAlphanumeric(c) and std.mem.indexOfScalar(u8, " #.,%+-\t\r\n", c) == null) return false;
+    for (value) |c| if (!std.ascii.isAlphanumeric(c) and std.mem.indexOfScalar(u8, " #.,%+-_\t\r\n", c) == null) return false;
     return true;
 }
 
@@ -139,7 +139,7 @@ test "only pinned passive registry logo replacements qualify for the narrow revi
     try t.expect(!candidate(&files, headers ++ "old mode 100644\nnew mode 120000\n"));
     try t.expect(patchChangeset("---\n'@hyperlane-xyz/registry': patch\n---\n\nPad the logo.\n"));
     try t.expect(!patchChangeset("---\n'@hyperlane-xyz/registry': major\n---\n"));
-    const open = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 80 80\">";
+    const open = "<svg id=\"Layer_1\" xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 80 80\">";
     try t.expect(staticSvg(open ++ "<defs><style>.cls-1 { fill: #fff; }</style></defs><polygon class=\"cls-1\" points=\"1 1 2 2 3 1\"/></svg>"));
     for ([_][]const u8{
         "<script>function f() {}</script>",

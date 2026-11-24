@@ -204,7 +204,7 @@ Talos requests standard serving speed in Codex and disables Claude's fast mode. 
 
 Fable receives the review context when Claude consults it. It requires Fable access and can use usage credits. Set `--claude-advisor off` on a repo to disable it. If your Kimi plan lacks K3.1 Pro, select an available model with `--reviewer-model kimi=MODEL`. [Claude advisor](https://code.claude.com/docs/en/advisor) · [Kimi models](https://www.kimi.com/code/docs/en/kimi-code/models.html)
 
-Each reviewer in a list gets the same pinned source and discussion. Talos runs them in order, groups findings at the same diff line, and sends one review with reviewer attribution. A failed reviewer retries the job. Choose providers that can receive the repo's source and discussion.
+Each reviewer in a list starts with the same pinned source and discussion. Talos runs them in order, groups findings at the same diff line, and sends one review. Choose providers that can receive the repo's source and discussion.
 
 Full reviewers can request specific missing source. Talos fetches one shared batch of up to six tracked paths at the pinned head and retries only the affected reviewers. Missing source or exhausted provider budget preserves the existing findings and coverage limits.
 
