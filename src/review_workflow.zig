@@ -118,20 +118,28 @@ fn sourceBacked(assessment: Assessment, source: []const u8, additional: []const 
 
 fn currentLineContains(source: []const u8, quote: []const u8) bool {
     var lines = std.mem.splitScalar(u8, source, '\n');
-    var inside_diff = false;
+    var section: enum { head, diff, base } = .head;
     while (lines.next()) |line| {
         if (std.mem.startsWith(u8, line, "diff --git ")) {
-            inside_diff = true;
+            section = .diff;
             continue;
         }
         if (std.mem.startsWith(u8, line, "Head file ") or std.mem.startsWith(u8, line, "Pinned head file ")) {
-            inside_diff = false;
+            section = .head;
             continue;
         }
-        const content = if (inside_diff) inside: {
-            if (line.len < 2 or std.mem.startsWith(u8, line, "+++ ") or (line[0] != '+' and line[0] != ' ')) continue;
-            break :inside line[1..];
-        } else line;
+        if (std.mem.startsWith(u8, line, "Pinned base Warp route config ")) {
+            section = .base;
+            continue;
+        }
+        const content = switch (section) {
+            .head => line,
+            .base => continue,
+            .diff => inside: {
+                if (line.len < 2 or std.mem.startsWith(u8, line, "+++ ") or (line[0] != '+' and line[0] != ' ')) continue;
+                break :inside line[1..];
+            },
+        };
         if (std.mem.indexOf(u8, content, quote) != null) return true;
     }
     return false;
@@ -212,4 +220,16 @@ test "synthesis deduplicates causes, verifies singletons, and treats absent sour
     try t.expect(!checked.results[0].review.complete and !checked.results[1].review.complete);
     try t.expect(std.mem.indexOf(u8, checked.summary, "could not resolve 1") != null);
     try t.expectError(error.InvalidSynthesis, verify(a, "{\"summary\":\"Dropped claims\",\"assessments\":[]}", results, source, ""));
+}
+
+test "synthesis only uses current registry lines as current evidence" {
+    const source = "Head file mono.ts:\ncurrent monorepo source\n\n" ++
+        "Pinned base Warp route config route.yaml:\nprevious route address\n\n" ++
+        "Pinned hyperlane-xyz/hyperlane-registry dependency diff\n" ++
+        "diff --git a/chains/chain/metadata.yaml b/chains/chain/metadata.yaml\n" ++
+        "@@ -1 +1 @@\n-previous registry value\n+current registry value\n";
+    try std.testing.expect(currentLineContains(source, "current monorepo source"));
+    try std.testing.expect(currentLineContains(source, "current registry value"));
+    try std.testing.expect(!currentLineContains(source, "previous registry value"));
+    try std.testing.expect(!currentLineContains(source, "previous route address"));
 }

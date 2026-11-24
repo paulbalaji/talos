@@ -595,22 +595,43 @@ pub const Git = struct {
 fn registryPatchComplete(file: github.File) bool {
     const additions = file.additions orelse return false;
     const deletions = file.deletions orelse return false;
-    const patch = file.patch orelse return eq(u8, file.status, "renamed") and file.previous_filename != null and additions == 0 and deletions == 0;
+    const patch = file.patch orelse return false;
     if (!std.mem.startsWith(u8, patch, "@@ -") or !std.unicode.utf8ValidateSlice(patch) or std.mem.indexOfScalar(u8, patch, 0) != null)
         return false;
     var lines = std.mem.splitScalar(u8, patch, '\n');
     var added: u32 = 0;
     var deleted: u32 = 0;
+    var left: u32 = 0;
+    var right: u32 = 0;
     while (lines.next()) |line| {
         if (line.len == 0) continue;
         switch (line[0]) {
-            '+' => added +|= 1,
-            '-' => deleted +|= 1,
-            ' ', '@', '\\' => {},
+            '@' => {
+                if (left != 0 or right != 0) return false;
+                const hunk = hunkRanges(line) orelse return false;
+                left = hunk.left.count;
+                right = hunk.right.count;
+            },
+            '+' => {
+                if (right == 0) return false;
+                right -= 1;
+                added +|= 1;
+            },
+            '-' => {
+                if (left == 0) return false;
+                left -= 1;
+                deleted +|= 1;
+            },
+            ' ' => {
+                if (left == 0 or right == 0) return false;
+                left -= 1;
+                right -= 1;
+            },
+            '\\' => if (!eq(u8, line, "\\ No newline at end of file")) return false,
             else => return false,
         }
     }
-    return added == additions and deleted == deletions;
+    return left == 0 and right == 0 and added == additions and deleted == deletions;
 }
 
 fn appendRegistryFiles(a: A, evidence: *std.ArrayList(u8), coverage: *std.ArrayList([]const u8), files: []const github.File) !void {
@@ -624,13 +645,13 @@ fn appendRegistryFiles(a: A, evidence: *std.ArrayList(u8), coverage: *std.ArrayL
             unavailable += 1;
             continue;
         }
-        if (evidence.items.len - start + file.filename.len + original.len + 4 > registry_diff_limit) {
+        const heading = "diff --git a/{s} b/{s}\n";
+        if (evidence.items.len - start + file.filename.len + original.len + heading.len - 6 > registry_diff_limit) {
             omitted += 1;
             continue;
         }
         const writer = evidence.writer(a);
-        if (!eq(u8, original, file.filename)) try writer.print("{s} -> ", .{original});
-        try writer.print("{s}\n", .{file.filename});
+        try writer.print(heading, .{ original, file.filename });
         if (!registryPatchComplete(file)) {
             unavailable += 1;
             continue;
@@ -764,13 +785,10 @@ fn patchHasLine(patch: []const u8, line: u32) bool {
         if (std.mem.startsWith(u8, text, "@@ -")) {
             if (right != right_end or left_remaining != 0) return false;
             if (matched) return true;
-            const plus = std.mem.indexOf(u8, text, " +") orelse return false;
-            const suffix = std.mem.indexOf(u8, text[plus + 2 ..], " @@") orelse return false;
-            const left = range(text[4..plus]) orelse return false;
-            const target = range(text[plus + 2 ..][0..suffix]) orelse return false;
-            left_remaining = left.count;
-            right = target.start;
-            right_end = std.math.add(u32, right, target.count) catch return false;
+            const hunk = hunkRanges(text) orelse return false;
+            left_remaining = hunk.left.count;
+            right = hunk.right.start;
+            right_end = std.math.add(u32, right, hunk.right.count) catch return false;
         } else if (text.len > 0) switch (text[0]) {
             ' ', '+' => {
                 if (right >= right_end) return false;
@@ -792,7 +810,17 @@ fn patchHasLine(patch: []const u8, line: u32) bool {
     return matched and right == right_end and left_remaining == 0;
 }
 
-fn range(text: []const u8) ?struct { start: u32, count: u32 } {
+const LineRange = struct { start: u32, count: u32 };
+
+fn hunkRanges(text: []const u8) ?struct { left: LineRange, right: LineRange } {
+    if (!std.mem.startsWith(u8, text, "@@ -")) return null;
+    const plus = std.mem.indexOf(u8, text[4..], " +") orelse return null;
+    const right = text[4 + plus + 2 ..];
+    const suffix = std.mem.indexOf(u8, right, " @@") orelse return null;
+    return .{ .left = range(text[4..][0..plus]) orelse return null, .right = range(right[0..suffix]) orelse return null };
+}
+
+fn range(text: []const u8) ?LineRange {
     var parts = std.mem.splitScalar(u8, text, ',');
     const start = std.fmt.parseUnsigned(u32, parts.next() orelse return null, 10) catch return null;
     const count = if (parts.next()) |value| std.fmt.parseUnsigned(u32, value, 10) catch return null else 1;
@@ -845,19 +873,21 @@ test "registry evidence retains exact text patches and withholds approval on omi
     const input = [_]github.File{
         .{ .filename = "chains/apechain/metadata.yaml", .patch = example, .additions = 1, .deletions = 1 },
         .{ .filename = "chains/renamed.yaml", .status = "renamed", .previous_filename = "chains/old.yaml", .additions = 0, .deletions = 0 },
-        .{ .filename = "chains/partial.yaml", .patch = example, .additions = 2, .deletions = 1 },
+        .{ .filename = "chains/partial.yaml", .patch = "@@ -1,3 +1,3 @@\n-old\n+new\n context", .additions = 1, .deletions = 1 },
         .{ .filename = "chains/credentials.yaml", .status = "renamed", .previous_filename = ".env.local", .patch = "hidden" },
         .{ .filename = "chains/missing.yaml", .additions = 1, .deletions = 1 },
     };
     var evidence: std.ArrayList(u8) = .empty;
     var coverage: std.ArrayList([]const u8) = .empty;
-    try appendRegistryFiles(a, &evidence, &coverage, input[0..2]);
-    try t.expectEqualStrings("chains/apechain/metadata.yaml\n" ++ example ++ "\nchains/old.yaml -> chains/renamed.yaml\n", evidence.items);
+    try appendRegistryFiles(a, &evidence, &coverage, input[0..1]);
+    try t.expectEqualStrings("diff --git a/chains/apechain/metadata.yaml b/chains/apechain/metadata.yaml\n" ++ example ++ "\n", evidence.items);
     try t.expectEqual(@as(usize, 0), coverage.items.len);
     evidence.clearRetainingCapacity();
-    try appendRegistryFiles(a, &evidence, &coverage, input[2..]);
-    try t.expectEqualStrings("chains/partial.yaml\nchains/missing.yaml\n", evidence.items);
-    try t.expectEqualStrings("Registry changes unavailable, partial, or excluded for 3 paths.", coverage.items[0]);
+    try appendRegistryFiles(a, &evidence, &coverage, input[1..]);
+    try t.expectEqualStrings("diff --git a/chains/old.yaml b/chains/renamed.yaml\n" ++
+        "diff --git a/chains/partial.yaml b/chains/partial.yaml\n" ++
+        "diff --git a/chains/missing.yaml b/chains/missing.yaml\n", evidence.items);
+    try t.expectEqualStrings("Registry changes unavailable, partial, or excluded for 4 paths.", coverage.items[0]);
     const oversized = [_]github.File{.{
         .filename = "big.yaml",
         .patch = "@@ -0,0 +1 @@\n+" ++ "x" ** registry_diff_limit,

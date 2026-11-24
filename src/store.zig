@@ -124,9 +124,11 @@ pub const Store = struct {
         var history: [7]core.PastResult = undefined;
         if (try self.loadResult(repo, number)) |prior| {
             var count: usize = 0;
-            const prior_local = if (prior.explanation) |detail| detail.publication == .local else false;
-            // A local rerun is a new verdict even if no publication intent changed.
-            if (prior_local or !io.eq(u8, prior.commit_id, candidate.commit_id) or !io.eq(u8, prior.followupId(), candidate.followupId())) {
+            const same_pending = prior.explanation != null and prior.explanation.?.publication == .pending and
+                candidate.explanation != null and candidate.explanation.?.publication == .pending and
+                prior.event == candidate.event and io.eq(u8, prior.commit_id, candidate.commit_id) and
+                io.eq(u8, prior.followupId(), candidate.followupId());
+            if (!same_pending) {
                 history[0] = .{ .commit_id = prior.commit_id, .event = prior.event, .explanation = prior.explanation };
                 count += 1;
             }
@@ -243,4 +245,13 @@ test "results preserve legacy reads and bound same-head history by review identi
     try t.expectEqualStrings(head, saved.history[0].commit_id);
     try t.expectEqual(.verified, saved.history[0].explanation.?.publication);
     try t.expectEqual(@as(?u64, 58), saved.history[0].explanation.?.github_review_id);
+
+    try db.confirmResult(repo, 42, newer, "", .COMMENT, 59);
+    record.explanation.?.publication = .local;
+    try db.result(repo, 42, record);
+    saved = (try db.loadResult(repo, 42)).?;
+    try t.expectEqual(.local, saved.explanation.?.publication);
+    try t.expectEqualStrings(newer, saved.history[0].commit_id);
+    try t.expectEqual(.verified, saved.history[0].explanation.?.publication);
+    try t.expectEqual(@as(?u64, 59), saved.history[0].explanation.?.github_review_id);
 }
