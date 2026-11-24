@@ -3,6 +3,7 @@ const core = @import("core.zig");
 const io = @import("io.zig");
 const onchain = @import("onchain.zig");
 const stack = @import("stack.zig");
+const agent_image = @import("agent_image.zig");
 const A = io.A;
 const eq = io.eq;
 
@@ -52,10 +53,14 @@ pub const Client = struct {
     calls: ?*u32 = null,
 
     fn invoke(self: Client, args: []const []const u8, input: []const u8) ![]const u8 {
+        return self.invokeWithin(args, input, 90);
+    }
+
+    fn invokeWithin(self: Client, args: []const []const u8, input: []const u8, seconds: u32) ![]const u8 {
         var cmd = self.cmd;
         cmd.transport = .github;
         if (self.calls) |count| count.* +|= 1;
-        return cmd.run(args, input, 90);
+        return cmd.run(args, input, seconds);
     }
 
     fn endpoint(self: Client, suffix: []const u8) ![]const u8 {
@@ -361,6 +366,27 @@ pub const Client = struct {
         return decodeRegistryFiles(a, raw, before, after);
     }
 
+    pub fn agentImageBuild(self: Client, commit: []const u8, tag: []const u8, digest: []const u8, timer: *std.time.Timer, limit: u32) !u64 {
+        if (!std.ascii.eqlIgnoreCase(self.repo, registry_pin_source) or !core.validOid(commit) or !agent_image.validTag(tag) or
+            !std.mem.startsWith(u8, commit, tag[0..7])) return error.InvalidAgentImageBuild;
+        const a = self.cmd.a;
+        const target = try self.endpoint(try io.fmt(a, "actions/workflows/rust-docker.yml/runs?branch=main&status=success&head_sha={s}&per_page=3", .{commit}));
+        const raw = try self.invokeWithin(&.{ self.gh, "api", "--hostname", "github.com", target }, "", @min(8, try agent_image.remainingSeconds(timer, limit)));
+        const runs = try io.parse(a, struct { workflow_runs: []const AgentImageRun }, raw);
+        const reference = try io.fmt(a, "ghcr.io/" ++ agent_image.registry_image ++ ":{s}@{s}", .{ tag, digest });
+        for (runs.workflow_runs[0..@min(3, runs.workflow_runs.len)]) |run| {
+            if (!run.matches(commit)) continue;
+            const log = self.invokeWithin(&.{
+                self.gh, "run", "view", try io.fmt(a, "{d}", .{run.id}), "--repo", "github.com/" ++ registry_pin_source, "--log",
+            }, "", @min(12, try agent_image.remainingSeconds(timer, limit))) catch |err| switch (err) {
+                error.OutOfMemory, error.GitHubRateLimited => return err,
+                else => continue,
+            };
+            if (agent_image.logMatches(log, reference)) return run.id;
+        }
+        return error.NoMatchingAgentImageBuild;
+    }
+
     fn decodeRegistryFiles(a: A, raw: []const u8, before: []const u8, after: []const u8) ![]const File {
         const Commit = struct { sha: []const u8 };
         const result = try io.parse(a, struct {
@@ -577,6 +603,49 @@ pub const Client = struct {
         }
     }
 };
+
+const AgentImageRun = struct {
+    id: u64,
+    path: []const u8,
+    event: []const u8,
+    head_branch: []const u8,
+    head_sha: []const u8,
+    status: []const u8,
+    conclusion: []const u8,
+    head_repository: struct { full_name: []const u8 },
+
+    fn matches(self: AgentImageRun, commit: []const u8) bool {
+        return self.id != 0 and eq(u8, self.head_repository.full_name, registry_pin_source) and
+            eq(u8, self.path, ".github/workflows/rust-docker.yml") and eq(u8, self.head_branch, "main") and
+            eq(u8, self.head_sha, commit) and eq(u8, self.status, "completed") and eq(u8, self.conclusion, "success") and
+            (eq(u8, self.event, "push") or eq(u8, self.event, "workflow_dispatch"));
+    }
+};
+
+test "agent image build evidence comes from the exact successful upstream main commit" {
+    const t = std.testing;
+    const commit = "35afeddbe09fba1da491cafb8122b981a6392a1e";
+    var run: AgentImageRun = .{
+        .id = 1,
+        .path = ".github/workflows/rust-docker.yml",
+        .event = "workflow_dispatch",
+        .head_branch = "main",
+        .head_sha = commit,
+        .status = "completed",
+        .conclusion = "success",
+        .head_repository = .{ .full_name = registry_pin_source },
+    };
+    try t.expect(run.matches(commit));
+    try t.expect(!run.matches("35afedd"));
+    run.head_repository.full_name = "fork/hyperlane-monorepo";
+    try t.expect(!run.matches(commit));
+    run.head_repository.full_name = registry_pin_source;
+    run.event = "pull_request";
+    try t.expect(!run.matches(commit));
+    run.event = "push";
+    run.head_branch = "not-main";
+    try t.expect(!run.matches(commit));
+}
 
 fn transportFailure(err: anyerror, fallback: anyerror) anyerror {
     return if (err == error.GitHubRateLimited) err else fallback;

@@ -164,6 +164,10 @@ Configure a [lightweight model](#route-reviews-by-risk) to enable these requests
 
 When a PR in `hyperlane-xyz/hyperlane-monorepo` changes `.registryrc`, Talos reads the old and new pins from the PR merge base and head. It adds a bounded GitHub comparison from `hyperlane-xyz/hyperlane-registry`, so reviewers can see the intended metadata update and other changes pulled in by the same bump. Talos withholds automatic approval when the pins diverge or comparison evidence is incomplete.
 
+### Review relayer image pins
+
+For PRs targeting `hyperlane-xyz/hyperlane-monorepo` main, Talos recognizes relayer image tags of the form `abcdef0-20261124-185322` in `typescript/infra/config/docker.ts`. It reads the pinned deployment selectors, hashes the public GHCR manifests, and matches each tagged digest to a successful main build log for the exact source commit. The prompt includes a bounded diff of the image build inputs, with bundled runtime configuration first. These read-only observations describe the tags at review time. Missing build records or incomplete source comparisons withhold automatic approval.
+
 ### Configure each repo
 
 Talos starts with Codex as the default. To use Claude Code on a Claude-only machine, run `talos defaults --engine claude` once. New repos use that setting unless you pass `--engine`. Existing repos keep their reviewer settings.

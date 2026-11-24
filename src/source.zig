@@ -6,6 +6,7 @@ const cache = @import("cache.zig");
 const onchain = @import("onchain.zig");
 const routing = @import("routing.zig");
 const registry_logo = @import("registry_logo.zig");
+const agent_image = @import("agent_image.zig");
 const A = io.A;
 const eq = io.eq;
 
@@ -23,6 +24,18 @@ const excerpt_blob_limit = 128 * 1024;
 const excerpt_line_limit = 120;
 const registry_diff_limit = 16 * 1024;
 const registry_pin_path = ".registryrc";
+const agent_image_diff_limit = 16 * 1024;
+const agent_image_diff_paths = [_][]const u8{ ".dockerignore", ".github/workflows/rust-docker.yml", "rust/Dockerfile", "rust/main", "rust/sealevel" };
+const agent_image_diff_order =
+    \\.github/workflows/rust-docker.yml
+    \\.dockerignore
+    \\rust/Dockerfile
+    \\rust/main/config
+    \\rust/main/app-contexts
+    \\rust/main/agents/relayer
+    \\rust/main/hyperlane-base
+    \\rust/main/hyperlane-core
+;
 
 pub const Supplement = struct {
     evidence: []const u8 = "",
@@ -273,6 +286,13 @@ pub const Git = struct {
         }
         if (std.ascii.eqlIgnoreCase(self.object_cache.repo.name, github.registry_pin_source)) {
             try self.appendRegistryComparison(path, merge_base, pr.headRefOid, &evidence, &coverage);
+            if (eq(u8, pr.baseRefName, "main")) {
+                for (files) |file| {
+                    if (!eq(u8, file.filename, agent_image.pin_path) or !eq(u8, file.status, "modified")) continue;
+                    try self.appendAgentImages(path, merge_base, pr.headRefOid, &evidence, &coverage);
+                    break;
+                }
+            }
         }
         const logo_only = core.registryMain(self.object_cache.repo, pr) and coverage.items.len == 0 and
             registry_logo.candidate(files, patch) and try self.staticRegistryLogos(path, merge_base, pr.headRefOid, files);
@@ -349,6 +369,179 @@ pub const Git = struct {
         };
         try evidence.writer(a).print("\n\nPinned {s} dependency diff, {s} to {s} ({d} paths returned):\n", .{ onchain.registry_repo, pins.before, pins.after, files.len });
         try appendRegistryFiles(a, evidence, coverage, files);
+    }
+
+    fn readAgentPins(self: Git, path: []const u8, commit: []const u8) !agent_image.Pins {
+        const blob = try self.pinnedBlob(path, try self.pinnedOid(path, commit, agent_image.pin_path));
+        return agent_image.pins(blob) orelse error.UnrecognizedAgentImagePins;
+    }
+
+    fn appendAgentImages(self: Git, path: []const u8, base: []const u8, head: []const u8, evidence: *std.ArrayList(u8), coverage: *std.ArrayList([]const u8)) !void {
+        const a = self.cmd.a;
+        const before = self.readAgentPins(path, base) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return,
+        };
+        const after = self.readAgentPins(path, head) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return,
+        };
+        var tags: std.ArrayList([]const u8) = .empty;
+        for (before, after) |old, new| {
+            if (eq(u8, old, new)) continue;
+            for ([_][]const u8{ old, new }) |tag| {
+                if (!agent_image.validTag(tag)) continue;
+                for (tags.items) |prior| {
+                    if (eq(u8, prior, tag)) break;
+                } else try tags.append(a, tag);
+            }
+        }
+        if (tags.items.len == 0) return;
+        const writer = evidence.writer(a);
+        try writer.writeAll("\n\nHyperlane Rust agent image evidence. GHCR observations describe the tags at review time. Successful main workflow logs corroborate the published manifest digests. Image layers were not opened.\n");
+        try self.appendAgentSelectors(path, head, before, after, evidence, coverage);
+        if (tags.items.len > agent_image.max_tags) {
+            try coverage.append(a, "Relayer image tags exceeded the verification budget.");
+            return;
+        }
+        var timer = try std.time.Timer.start();
+        const client: github.Client = .{ .cmd = self.cmd, .gh = self.gh, .repo = self.object_cache.repo.name, .calls = self.github_calls };
+        var network_env = std.process.EnvMap.init(a);
+        defer network_env.deinit();
+        var command = self.cmd;
+        command.env = &network_env;
+        const curl = io.executable(a, self.cmd.env.get("PATH") orelse "/usr/bin:/bin", "curl") catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => "",
+        };
+        const registry: agent_image.Client = .{ .cmd = command, .curl = curl, .timer = &timer, .limit = 30 };
+        const bearer: ?[]const u8 = if (curl.len == 0) null else registry.token() catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => null,
+        };
+        var commits: std.StringHashMapUnmanaged([]const u8) = .empty;
+        defer commits.deinit(a);
+        for (tags.items) |tag| {
+            const commit = self.resolveAgentCommit(path, tag) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    try coverage.append(a, try io.fmt(a, "Could not resolve an exact source commit for agent image {s}.", .{tag}));
+                    continue;
+                },
+            };
+            try commits.put(a, tag, commit);
+            const verified = if (bearer) |token| check: {
+                const digest = registry.digest(token, tag) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => break :check false,
+                };
+                const run = client.agentImageBuild(commit, tag, digest, &timer, registry.limit) catch |err| switch (err) {
+                    error.OutOfMemory, error.GitHubRateLimited => return err,
+                    else => break :check false,
+                };
+                try writer.print("ghcr.io/" ++ agent_image.registry_image ++ ":{s}@{s} was pushed by main workflow run {d} at source {s}.\n", .{ tag, digest, run, commit });
+                break :check true;
+            } else false;
+            if (!verified) try coverage.append(a, try io.fmt(a, "Could not verify the published digest against a main build log for agent image {s}.", .{tag}));
+        }
+        try self.appendAgentDiff(path, before, after, commits, evidence, coverage);
+    }
+
+    fn resolveAgentCommit(self: Git, path: []const u8, tag: []const u8) ![]const u8 {
+        const rev = try io.fmt(self.cmd.a, "{s}^{{commit}}", .{tag[0..7]});
+        const result = io.trim(u8, try self.gitWithin(path, &.{ "rev-parse", "--verify", "--end-of-options", rev }, "", 5), "\r\n");
+        if (!core.validOid(result) or !std.mem.startsWith(u8, result, tag[0..7])) return error.InvalidAgentImageCommit;
+        return result;
+    }
+
+    fn appendAgentSelectors(self: Git, path: []const u8, head: []const u8, before: agent_image.Pins, after: agent_image.Pins, evidence: *std.ArrayList(u8), coverage: *std.ArrayList([]const u8)) !void {
+        const a = self.cmd.a;
+        for (agent_image.environments, agent_image.exports, 0..) |environment, export_name, i| {
+            const offset = i * agent_image.roles.len;
+            const changed = for (before[offset..][0..agent_image.roles.len], after[offset..][0..agent_image.roles.len]) |old, new| {
+                if (!eq(u8, old, new)) break true;
+            } else false;
+            if (!changed) continue;
+            const filename = try io.fmt(a, "typescript/infra/config/environments/{s}/agent.ts", .{environment});
+            var seen: [agent_image.roles.len]bool = @splat(false);
+            const blob = selection: {
+                const oid = self.pinnedOid(path, head, filename) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => break :selection "",
+                };
+                break :selection self.pinnedBlob(path, oid) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => "",
+                };
+            };
+            var lines = std.mem.splitScalar(u8, blob, '\n');
+            var preceding: []const u8 = "";
+            var number: usize = 0;
+            var fields: [agent_image.roles.len][]const u8 = undefined;
+            for (agent_image.roles, &fields) |role, *field| field.* = try io.fmt(a, "tag: {s}.{s},", .{ export_name, role });
+            while (lines.next()) |line| {
+                number += 1;
+                defer preceding = line;
+                if (!eq(u8, io.trim(u8, preceding, " \t\r"), "repo: DockerImageRepos.AGENT,")) continue;
+                for (fields, 0..) |field, j| {
+                    if (seen[j] or eq(u8, before[offset + j], after[offset + j]) or !eq(u8, io.trim(u8, line, " \t\r"), field)) continue;
+                    seen[j] = true;
+                    try evidence.writer(a).print("Pinned deployment selector {s}:{d}-{d}:\n{s}\n{s}\n", .{ filename, number - 1, number, preceding, line });
+                }
+            }
+            for (agent_image.roles, 0..) |role, j| {
+                if (!seen[j] and !eq(u8, before[offset + j], after[offset + j]))
+                    try coverage.append(a, try io.fmt(a, "The {s} deployment selector for {s} was unavailable.", .{ environment, role }));
+            }
+        }
+    }
+
+    fn appendAgentDiff(self: Git, path: []const u8, before: agent_image.Pins, after: agent_image.Pins, commits: std.StringHashMapUnmanaged([]const u8), evidence: *std.ArrayList(u8), coverage: *std.ArrayList([]const u8)) !void {
+        const a = self.cmd.a;
+        var remaining: usize = agent_image_diff_limit;
+        const order_file = "agent-build-order";
+        try io.write(self.cmd.dir, order_file, agent_image_diff_order);
+        defer self.cmd.dir.deleteFile(order_file) catch {};
+        const order = try io.fmt(a, "-O{s}/{s}", .{ self.cmd.cwd, order_file });
+        var timer = try std.time.Timer.start();
+        for (before, after, 0..) |old, new, i| {
+            if (eq(u8, old, new)) continue;
+            for (before[0..i], after[0..i]) |earlier_old, earlier_new| {
+                if (eq(u8, old, earlier_old) and eq(u8, new, earlier_new)) break;
+            } else {
+                const base_commit = commits.get(old);
+                const head_commit = commits.get(new);
+                if (base_commit == null or head_commit == null or remaining < 512) {
+                    try coverage.append(a, "Some relayer image changes lacked comparable pinned build source.");
+                    continue;
+                }
+                const args = diff_flags ++ [_][]const u8{ order, base_commit.?, head_commit.?, "--" } ++ agent_image_diff_paths ++ excluded_paths;
+                const seconds = agent_image.remainingSeconds(&timer, 20) catch {
+                    try coverage.append(a, "Relayer image source comparisons exceeded the time budget.");
+                    return;
+                };
+                const patch = self.gitWithin(path, &args, "", seconds) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => {
+                        try coverage.append(a, "Could not compare the pinned build source for an agent image change.");
+                        continue;
+                    },
+                };
+                const prefix = patch[0..core.safePrefix(patch, @min(remaining, agent_image_diff_limit / 3))];
+                const clip = prefix.len != patch.len;
+                const textual = std.unicode.utf8ValidateSlice(prefix);
+                if (clip or !textual or std.mem.indexOf(u8, patch, "\nBinary files ") != null or
+                    std.mem.indexOf(u8, patch, "\n+Subproject commit ") != null or std.mem.indexOf(u8, patch, "\n-Subproject commit ") != null)
+                {
+                    try coverage.append(a, try io.fmt(a, "Pinned build source from {s} to {s} exceeded the review budget or contained non-text content.", .{ old, new }));
+                }
+                const excerpt = if (!textual) "" else if (clip) prefix[0..(std.mem.lastIndexOfScalar(u8, prefix, '\n') orelse 0)] else prefix;
+                remaining -= excerpt.len;
+                try evidence.writer(a).print("\nPinned agent build-source diff {s} to {s} ({s} to {s}){s}:\n{s}\n", .{
+                    old, new, base_commit.?, head_commit.?, if (clip or !textual) " (excerpt)" else "", excerpt,
+                });
+            }
+        }
     }
 
     fn pin(self: Git, repo_dir: std.fs.Dir, path: []const u8, pr: core.Pull) !void {
