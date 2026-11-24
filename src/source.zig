@@ -25,6 +25,7 @@ const excerpt_line_limit = 120;
 const registry_diff_limit = 16 * 1024;
 const registry_pin_path = ".registryrc";
 const agent_image_diff_limit = 16 * 1024;
+const agent_image_inventory_limit = 24 * 1024;
 const agent_image_diff_paths = [_][]const u8{ ".dockerignore", ".github/workflows/rust-docker.yml", "rust/Dockerfile", "rust/main", "rust/sealevel" };
 const agent_image_diff_order =
     \\.github/workflows/rust-docker.yml
@@ -286,17 +287,18 @@ pub const Git = struct {
                 route_bytes -= config.len + excerpt.len + 64;
             }
         }
+        var optional_evidence_start: ?usize = null;
         if (std.ascii.eqlIgnoreCase(self.object_cache.repo.name, github.registry_pin_source)) {
             try self.appendRegistryComparison(path, merge_base, pr.headRefOid, &evidence, &coverage);
             if (eq(u8, pr.baseRefName, "main")) {
                 for (files) |file| {
                     if (!eq(u8, file.filename, agent_image.pin_path) or !eq(u8, file.status, "modified")) continue;
-                    try self.appendAgentImages(path, merge_base, pr.headRefOid, &evidence, &coverage);
+                    optional_evidence_start = try self.appendAgentImages(path, merge_base, pr.headRefOid, &evidence, &coverage);
                     break;
                 }
             }
         }
-        return .{ .merge_base = merge_base, .evidence = evidence.items, .limited = coverage.items.len != 0, .coverage_reasons = coverage.items, .registry_logo_only = logo_only };
+        return .{ .merge_base = merge_base, .evidence = evidence.items, .limited = coverage.items.len != 0, .coverage_reasons = coverage.items, .registry_logo_only = logo_only, .optional_evidence_start = optional_evidence_start };
     }
 
     fn appendStaticRegistryLogos(self: Git, path: []const u8, base: []const u8, head: []const u8, files: []const github.File, evidence: *std.ArrayList(u8), remaining: usize) !bool {
@@ -384,15 +386,15 @@ pub const Git = struct {
         return agent_image.pins(blob) orelse error.UnrecognizedAgentImagePins;
     }
 
-    fn appendAgentImages(self: Git, path: []const u8, base: []const u8, head: []const u8, evidence: *std.ArrayList(u8), coverage: *std.ArrayList([]const u8)) !void {
+    fn appendAgentImages(self: Git, path: []const u8, base: []const u8, head: []const u8, evidence: *std.ArrayList(u8), coverage: *std.ArrayList([]const u8)) !?usize {
         const a = self.cmd.a;
         const before = self.readAgentPins(path, base) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            else => return,
+            else => return null,
         };
         const after = self.readAgentPins(path, head) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            else => return,
+            else => return null,
         };
         var tags: std.ArrayList([]const u8) = .empty;
         for (before, after) |old, new| {
@@ -404,13 +406,13 @@ pub const Git = struct {
                 } else try tags.append(a, tag);
             }
         }
-        if (tags.items.len == 0) return;
+        if (tags.items.len == 0) return null;
         const writer = evidence.writer(a);
         try writer.writeAll("\n\nHyperlane Rust agent image evidence. GHCR observations describe the tags at review time. Successful main workflow logs corroborate the published manifest digests. Image layers were not opened.\n");
         try self.appendAgentSelectors(path, head, before, after, evidence, coverage);
         if (tags.items.len > agent_image.max_tags) {
             try coverage.append(a, "Relayer image tags exceeded the verification budget.");
-            return;
+            return null;
         }
         var timer = try std.time.Timer.start();
         const client: github.Client = .{ .cmd = self.cmd, .gh = self.gh, .repo = self.object_cache.repo.name, .calls = self.github_calls };
@@ -452,7 +454,7 @@ pub const Git = struct {
             } else false;
             if (!verified) try coverage.append(a, try io.fmt(a, "Could not verify the published digest against a main build log for agent image {s}.", .{tag}));
         }
-        try self.appendAgentDiff(path, before, after, commits, evidence, coverage);
+        return self.appendAgentDiff(path, before, after, commits, evidence, coverage);
     }
 
     fn resolveAgentCommit(self: Git, path: []const u8, tag: []const u8) ![]const u8 {
@@ -504,52 +506,69 @@ pub const Git = struct {
         }
     }
 
-    fn appendAgentDiff(self: Git, path: []const u8, before: agent_image.Pins, after: agent_image.Pins, commits: std.StringHashMapUnmanaged([]const u8), evidence: *std.ArrayList(u8), coverage: *std.ArrayList([]const u8)) !void {
+    fn appendAgentDiff(self: Git, path: []const u8, before: agent_image.Pins, after: agent_image.Pins, commits: std.StringHashMapUnmanaged([]const u8), evidence: *std.ArrayList(u8), coverage: *std.ArrayList([]const u8)) !?usize {
         const a = self.cmd.a;
-        var remaining: usize = agent_image_diff_limit;
+        const Pair = struct { old: []const u8, new: []const u8, base: []const u8, head: []const u8 };
+        var pairs: std.ArrayList(Pair) = .empty;
+        var missing_pair = false;
+        for (before, after) |old, new| {
+            if (eq(u8, old, new)) continue;
+            const base = commits.get(old);
+            const head = commits.get(new);
+            if (base == null or head == null) {
+                missing_pair = true;
+                continue;
+            }
+            for (pairs.items) |pair| {
+                if (eq(u8, old, pair.old) and eq(u8, new, pair.new)) break;
+            } else try pairs.append(a, .{ .old = old, .new = new, .base = base.?, .head = head.? });
+        }
+        if (missing_pair) try coverage.append(a, "Some relayer image changes lacked comparable pinned build source.");
+        if (pairs.items.len == 0) return null;
+
+        var timer = try std.time.Timer.start();
+        const writer = evidence.writer(a);
+        var inventory_left: usize = agent_image_inventory_limit;
+        for (pairs.items) |pair| {
+            const seconds = agent_image.remainingSeconds(&timer, 20) catch {
+                try coverage.append(a, "Could not enumerate changed relayer build inputs within the time limit.");
+                return null;
+            };
+            const args = [_][]const u8{ "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--ignore-submodules=none", "--numstat", "-z", pair.base, pair.head, "--" } ++ agent_image_diff_paths;
+            const inventory = self.gitWithin(path, &args, "", seconds) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    try coverage.append(a, try io.fmt(a, "Could not enumerate changed build inputs from {s} to {s}.", .{ pair.old, pair.new }));
+                    continue;
+                },
+            };
+            try writer.print("\nChanged agent build inputs {s} to {s} ({s} to {s}), in additions/deletions/path format:\n", .{ pair.old, pair.new, pair.base, pair.head });
+            if (!try appendAgentInventory(a, evidence, inventory, &inventory_left))
+                try coverage.append(a, try io.fmt(a, "The changed build input inventory from {s} to {s} could not include every path.", .{ pair.old, pair.new }));
+        }
+
+        const excerpt_start = evidence.items.len;
         const order_file = "agent-build-order";
         try io.write(self.cmd.dir, order_file, agent_image_diff_order);
         defer self.cmd.dir.deleteFile(order_file) catch {};
         const order = try io.fmt(a, "-O{s}/{s}", .{ self.cmd.cwd, order_file });
-        var timer = try std.time.Timer.start();
-        for (before, after, 0..) |old, new, i| {
-            if (eq(u8, old, new)) continue;
-            for (before[0..i], after[0..i]) |earlier_old, earlier_new| {
-                if (eq(u8, old, earlier_old) and eq(u8, new, earlier_new)) break;
-            } else {
-                const base_commit = commits.get(old);
-                const head_commit = commits.get(new);
-                if (base_commit == null or head_commit == null or remaining < 512) {
-                    try coverage.append(a, "Some relayer image changes lacked comparable pinned build source.");
-                    continue;
-                }
-                const args = diff_flags ++ [_][]const u8{ order, base_commit.?, head_commit.?, "--" } ++ agent_image_diff_paths ++ excluded_paths;
-                const seconds = agent_image.remainingSeconds(&timer, 20) catch {
-                    try coverage.append(a, "Relayer image source comparisons exceeded the time budget.");
-                    return;
-                };
-                const patch = self.gitWithin(path, &args, "", seconds) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    else => {
-                        try coverage.append(a, "Could not compare the pinned build source for an agent image change.");
-                        continue;
-                    },
-                };
-                const prefix = patch[0..core.safePrefix(patch, @min(remaining, agent_image_diff_limit / 3))];
-                const clip = prefix.len != patch.len;
-                const textual = std.unicode.utf8ValidateSlice(prefix);
-                if (clip or !textual or std.mem.indexOf(u8, patch, "\nBinary files ") != null or
-                    std.mem.indexOf(u8, patch, "\n+Subproject commit ") != null or std.mem.indexOf(u8, patch, "\n-Subproject commit ") != null)
-                {
-                    try coverage.append(a, try io.fmt(a, "Pinned build source from {s} to {s} exceeded the review budget or contained non-text content.", .{ old, new }));
-                }
-                const excerpt = if (!textual) "" else if (clip) prefix[0..(std.mem.lastIndexOfScalar(u8, prefix, '\n') orelse 0)] else prefix;
-                remaining -= excerpt.len;
-                try evidence.writer(a).print("\nPinned agent build-source diff {s} to {s} ({s} to {s}){s}:\n{s}\n", .{
-                    old, new, base_commit.?, head_commit.?, if (clip or !textual) " (excerpt)" else "", excerpt,
-                });
-            }
+        const patch_limit = agent_image_diff_limit / pairs.items.len;
+        for (pairs.items) |pair| {
+            const args = diff_flags ++ [_][]const u8{ order, pair.base, pair.head, "--" } ++ agent_image_diff_paths ++ excluded_paths;
+            const seconds = agent_image.remainingSeconds(&timer, 20) catch break;
+            const patch = self.gitWithin(path, &args, "", seconds) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => continue,
+            };
+            const prefix = patch[0..core.safePrefix(patch, patch_limit)];
+            if (!std.unicode.utf8ValidateSlice(prefix)) continue;
+            const clipped = prefix.len != patch.len;
+            const excerpt = if (clipped) prefix[0..(std.mem.lastIndexOfScalar(u8, prefix, '\n') orelse 0)] else prefix;
+            try writer.print("\nPinned agent build-source diff {s} to {s}{s}:\n{s}\n", .{
+                pair.old, pair.new, if (clipped) " (excerpt)" else "", excerpt,
+            });
         }
+        return if (excerpt_start < evidence.items.len) excerpt_start else null;
     }
 
     fn pin(self: Git, repo_dir: std.fs.Dir, path: []const u8, pr: core.Pull) !void {
@@ -864,6 +883,36 @@ fn registryPatchComplete(file: github.File) bool {
     return left == 0 and right == 0 and added == additions and deleted == deletions;
 }
 
+fn appendAgentInventory(a: A, evidence: *std.ArrayList(u8), inventory: []const u8, remaining: *usize) !bool {
+    if (inventory.len == 0) {
+        try evidence.appendSlice(a, "No build inputs changed.\n");
+        return true;
+    }
+    var complete = inventory[inventory.len - 1] == 0;
+    var records = std.mem.tokenizeScalar(u8, inventory, 0);
+    while (records.next()) |record| {
+        var fields = std.mem.splitScalar(u8, record, '\t');
+        const added = fields.next() orelse unreachable;
+        const deleted = fields.next() orelse "";
+        const path = fields.rest();
+        const binary = eq(u8, added, "-") and eq(u8, deleted, "-");
+        if ((!binary and (!gitLineCount(added) or !gitLineCount(deleted))) or !core.validPath(path) or sensitive(path)) {
+            complete = false;
+            continue;
+        }
+        if (record.len + 1 > remaining.*) return false;
+        try evidence.writer(a).print("{s}\n", .{record});
+        remaining.* -= record.len + 1;
+    }
+    return complete;
+}
+
+fn gitLineCount(text: []const u8) bool {
+    if (text.len == 0) return false;
+    for (text) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
 fn appendRegistryFiles(a: A, evidence: *std.ArrayList(u8), coverage: *std.ArrayList([]const u8), files: []const github.File) !void {
     if (files.len >= github.registry_compare_file_limit) try coverage.append(a, "The registry pin comparison reached GitHub's changed file limit.");
     const start = evidence.items.len;
@@ -1127,6 +1176,20 @@ test "registry evidence retains exact text patches and withholds approval on omi
     try appendRegistryFiles(a, &evidence, &coverage, &oversized);
     try t.expect(evidence.items.len < registry_diff_limit);
     try t.expectEqualStrings("Registry changes exceeded the review byte limit for 1 path.", coverage.items[1]);
+}
+
+test "agent build inventory retains every available path and detects gaps" {
+    const t = std.testing;
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(t.allocator);
+    var remaining: usize = 1024;
+    const records = "2\t4\trust/main/config/mainnet.json\x00-\t-\trust/main/fixture.bin\x00";
+    try t.expect(try appendAgentInventory(t.allocator, &output, records, &remaining));
+    try t.expectEqualStrings("2\t4\trust/main/config/mainnet.json\n-\t-\trust/main/fixture.bin\n", output.items);
+    try t.expect(!try appendAgentInventory(t.allocator, &output, "1\t2\trust/main/.env.secret\x00", &remaining));
+    try t.expect(std.mem.indexOf(u8, output.items, ".env.secret") == null);
+    remaining = 1;
+    try t.expect(!try appendAgentInventory(t.allocator, &output, records, &remaining));
 }
 
 test "batch blobs use size framing and reject mismatched responses" {

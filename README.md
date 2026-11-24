@@ -166,7 +166,7 @@ When a PR in `hyperlane-xyz/hyperlane-monorepo` changes `.registryrc`, Talos rea
 
 ### Review relayer image pins
 
-For PRs targeting `hyperlane-xyz/hyperlane-monorepo` main, Talos recognizes relayer image tags of the form `abcdef0-20261124-185322` in `typescript/infra/config/docker.ts`. It reads the pinned deployment selectors, hashes the public GHCR manifests, and matches each tagged digest to a successful main build log for the exact source commit. The prompt includes a bounded diff of the image build inputs, with bundled runtime configuration first. These read-only observations describe the tags at review time. Missing build records or incomplete source comparisons withhold automatic approval.
+For PRs targeting `hyperlane-xyz/hyperlane-monorepo` main, Talos recognizes relayer image tags of the form `abcdef0-20261124-185322` in `typescript/infra/config/docker.ts`. It reads the pinned deployment selectors, hashes the public GHCR manifests, and matches each tagged digest to a successful main build log for the exact source commit. Reviewers receive the changed build input inventory for each image pair and bounded patch excerpts, with bundled runtime configuration first. These read-only observations describe the tags at review time. Missing build records, an incomplete inventory, or a material gap identified by a reviewer withhold automatic approval.
 
 ### Configure each repo
 
