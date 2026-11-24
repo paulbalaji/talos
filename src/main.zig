@@ -751,8 +751,7 @@ const Main = struct {
         const current = try core.ReviewInput.init(self.a, repo, pull, merge_base, discussion);
         const legacy_changed = saved == null and job.receipt != null and
             job.legacyDiscussionChanged(repo.login, discussion, try client.reviews(pull.number));
-        if (!repo.approvals) job.awaiting_checks = false;
-        job.observeReviewInput(current, legacy_changed);
+        job.observeReviewInput(current, legacy_changed, repo.approvals);
     }
 
     fn tick(self: Main, state: *store.State) !void {

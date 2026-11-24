@@ -171,13 +171,13 @@ test "same-head discussion changes get one new receipt and survive an ambiguous 
 
     fake.discussion = &.{thread};
     fake.comments = &.{bot};
-    job.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false);
+    job.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false, repo.approvals);
     try t.expectEqual(core.Phase.complete, job.phase);
 
     thread.isResolved = true;
     thread.replies = &.{ own, author };
     fake.discussion = &.{thread};
-    job.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false);
+    job.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false, repo.approvals);
     try t.expectEqual(core.Phase.pending, job.phase);
     fake.lose_response = true;
     fake.result = clean;
@@ -194,12 +194,12 @@ test "same-head discussion changes get one new receipt and survive an ambiguous 
     try t.expectEqual(@as(usize, 2), fake.posts);
     const first_followup = fake.offered.?;
     const first_id = recovered.followup_id;
-    recovered.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false);
+    recovered.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false, repo.approvals);
     try t.expectEqual(core.Phase.complete, recovered.phase);
 
     thread.isResolved = false;
     fake.discussion = &.{thread};
-    recovered.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false);
+    recovered.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false, repo.approvals);
     try t.expectEqual(core.Phase.pending, recovered.phase);
     var entry: core.Entry = .{ .repo = repo, .jobs = (&recovered)[0..1] };
     const pending_id = recovered.followup_id;
@@ -217,7 +217,7 @@ test "same-head discussion changes get one new receipt and survive an ambiguous 
     _ = (try core.run(a, &fake, repo, &recovered, .scheduled)).?;
     thread.isResolved = true;
     fake.discussion = &.{thread};
-    recovered.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false);
+    recovered.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false, repo.approvals);
     fake.offered = first_followup;
     _ = (try core.run(a, &fake, repo, &recovered, .scheduled)).?;
     try t.expectEqual(@as(usize, 4), fake.posts);
@@ -394,7 +394,7 @@ test "complete clean reviews approve independently of GitHub checks and mergeabi
 
         fake.target.statusCheckRollup = &.{.{ .status = "COMPLETED", .conclusion = "SUCCESS" }};
         fake.target.mergeStateStatus = "CLEAN";
-        job.observeReviewInput(try core.ReviewInput.init(a, configured, fake.target, base, .{}), false);
+        job.observeReviewInput(try core.ReviewInput.init(a, configured, fake.target, base, .{}), false, configured.approvals);
         try t.expectEqual(core.Phase.complete, job.phase);
         try t.expectEqual(@as(usize, 1), fake.posts);
     }
@@ -421,12 +421,17 @@ test "an old approval held for CI is reviewed once even while checks are pending
         .review_input = input,
         .awaiting_checks = true,
     }));
-    job.observeReviewInput(input, false);
+    job.observeReviewInput(input, false, false);
+    try t.expectEqual(core.Phase.complete, job.phase);
+    try t.expect(job.awaiting_checks);
+    job = try io.parse(a, core.Job, try io.json(a, job));
+
+    job.observeReviewInput(input, false, configured.approvals);
     try t.expectEqual(core.Phase.pending, job.phase);
     const result = (try core.run(a, &fake, configured, &job, .scheduled)).?;
     try t.expectEqual(core.Event.APPROVE, result.event);
     try t.expect(!job.awaiting_checks);
-    job.observeReviewInput(input, false);
+    job.observeReviewInput(input, false, configured.approvals);
     try t.expectEqual(core.Phase.complete, job.phase);
     try t.expectEqual(@as(usize, 1), fake.posts);
 }

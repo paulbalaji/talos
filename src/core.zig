@@ -313,10 +313,10 @@ pub const Job = struct {
         return baseline.len > 0 and discussion.changedAfter(login, baseline);
     }
 
-    pub fn observeReviewInput(self: *Job, current: ReviewInput, legacy_changed: bool) void {
+    pub fn observeReviewInput(self: *Job, current: ReviewInput, legacy_changed: bool, approvals_enabled: bool) void {
         if (self.phase != .complete) return;
         const discussion_or_diff = if (self.review_input) |old| !old.same(current) else legacy_changed;
-        const changed = discussion_or_diff or self.awaiting_checks;
+        const changed = discussion_or_diff or (self.awaiting_checks and approvals_enabled);
         if (!changed) {
             if (self.review_input) |*recorded| recorded.base = current.base else self.review_input = current;
             return;
@@ -1302,7 +1302,8 @@ pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?P
         if (comment.truncated) try snap.markLimited(a, "A PR conversation comment was truncated");
     }
     const review_input = try ReviewInput.init(a, repo, pr, snap.merge_base, discussion);
-    if (!dry and job.followup and !job.awaiting_checks and job.review_input != null and job.review_input.?.same(review_input)) {
+    const retry_held_approval = job.awaiting_checks and repo.approvals;
+    if (!dry and job.followup and !retry_held_approval and job.review_input != null and job.review_input.?.same(review_input)) {
         job.phase = .complete;
         job.analysis = null;
         job.route_progress = null;
@@ -1374,12 +1375,12 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
     if (supports_stacks) try adapter.checkStack(inherited);
     var reviewed = job.*;
     reviewed.review_input = prepared.review_input;
-    reviewed.awaiting_checks = false;
     if (job.followup) reviewed.receipt = null;
     const evaluated = try payload(a, adapter, latest, prepared, results);
     var result = evaluated.review;
     if (prepared.route_depth == .light) result.event = .COMMENT;
     const own_pr = if (latest.author) |author| eq(u8, author.login, repo.login) else true;
+    reviewed.awaiting_checks = job.awaiting_checks and !repo.approvals and !own_pr and result.event == .APPROVE;
     if (!prepared.dry and result.event == .APPROVE and (!repo.approvals or own_pr)) result.event = .COMMENT;
     reviewed.event = result.event;
     result.body = try io.fmt(a, "{s}\n\n{s}", .{ result.body, try marker(a, repo, reviewed) });
