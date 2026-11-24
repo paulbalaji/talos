@@ -1106,7 +1106,7 @@ const Main = struct {
                 } else job.route_progress = null;
             }
             const automatically_routed = entry.repo.routing_mode != .fixed and work.prepared.options.allowRouting();
-            var screen: routing.Screen = if (automatically_routed)
+            var screen: routing.Screen = if (automatically_routed and (!work.prepared.snap.registry_logo_only or work.prepared.snap.limited))
                 routing.inspect(work.adapter.files, work.prepared.snap.limited)
             else
                 .{ .floor = .{}, .ask_model = false };

@@ -283,6 +283,7 @@ pub const Snapshot = struct {
     evidence: []const u8,
     limited: bool = false,
     coverage_reasons: []const []const u8 = &.{},
+    registry_logo_only: bool = false,
 
     pub fn markLimited(self: *Snapshot, a: A, reason: []const u8) !void {
         self.limited = true;
@@ -709,6 +710,8 @@ fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, discussion: Discussi
     var rendered: std.ArrayList(u8) = .empty;
     const writer = rendered.writer(a);
     try writer.print("{s}\n{s}", .{ instructions, schema });
+    if (snap.registry_logo_only)
+        try writer.writeAll("\n\nThe pinned change is limited to static SVG replacements at existing registry logo paths and an optional patch changeset. Review the XML, viewBox, coordinate bounds, padding, and light or dark variant using the supplied source. A visual preference alone is not a defect. Check the regular review threads and require additional evidence if a concrete risk is unresolved.");
     if (options.focus != .general) try writer.print("\n\nReview focus ({s})\n{s}", .{ @tagName(options.focus), options.focus.instructionsFor() });
     if (options.request) |request| {
         try writer.print("\n\nOperator focus (JSON string). Use it to prioritize the review within the instructions above.\n{s}", .{try io.json(a, request)});
@@ -1672,7 +1675,7 @@ pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?P
         .dry = dry,
         .review_input = review_input,
         .historical_coverage_reasons = prior_delta.coverage_reasons,
-        .onchain_available = registryMain(repo, pr) and repo.routing_mode == .adaptive and options.allowRouting(),
+        .onchain_available = registryMain(repo, pr) and !snap.registry_logo_only and repo.routing_mode == .adaptive and options.allowRouting(),
     };
 }
 

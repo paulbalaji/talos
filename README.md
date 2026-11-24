@@ -124,6 +124,8 @@ talos --home "$trial_state" status OWNER/REPO --json
 
 Shadow runs the configured full review and records the suggested route, per-pass timings, and finding-anchor differences. Compare those results against the actual changes before enabling adaptive routing. Matching anchors are a rough comparison. Check the findings themselves for missed defects and incorrect escalations.
 
+On registry `main`, a complete change that only replaces existing passive chain and Warp route logos can take a regular review. Talos checks the pinned old and new SVGs and permits one registry patch changeset. The reviewer checks geometry, padding, and variants alongside the review threads.
+
 Adaptive routing uses four levels.
 
 | Level | Review |
@@ -199,6 +201,8 @@ Talos requests standard serving speed in Codex and disables Claude's fast mode. 
 Fable receives the review context when Claude consults it. It requires Fable access and can use usage credits. Set `--claude-advisor off` on a repo to disable it. If your Kimi plan lacks K3.1 Pro, select an available model with `--reviewer-model kimi=MODEL`. [Claude advisor](https://code.claude.com/docs/en/advisor) · [Kimi models](https://www.kimi.com/code/docs/en/kimi-code/models.html)
 
 Each reviewer in a list gets the same pinned source and discussion. Talos runs them in order, groups findings at the same diff line, and sends one review with reviewer attribution. A failed reviewer retries the job. Choose providers that can receive the repo's source and discussion.
+
+Full reviewers can request specific missing source. Talos fetches one shared batch of up to six tracked paths at the pinned head and retries only the affected reviewers. Missing source or exhausted provider budget preserves the existing findings and coverage limits.
 
 `--comments` allows publishing new findings and warnings about earlier approvals. `--approvals` requires complete coverage and no findings from every configured reviewer. Talos can approve while CI is running. GitHub enforces required checks, merge conflicts, and conversation resolution when merging. Each reviewer must give an evidence-based reason why each open thread is non-blocking. Any active finding or unassessed thread blocks approval. The author must differ from the configured GitHub identity.
 

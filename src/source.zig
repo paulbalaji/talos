@@ -5,6 +5,7 @@ const io = @import("io.zig");
 const cache = @import("cache.zig");
 const onchain = @import("onchain.zig");
 const routing = @import("routing.zig");
+const registry_logo = @import("registry_logo.zig");
 const A = io.A;
 const eq = io.eq;
 
@@ -273,7 +274,32 @@ pub const Git = struct {
         if (std.ascii.eqlIgnoreCase(self.object_cache.repo.name, github.registry_pin_source)) {
             try self.appendRegistryComparison(path, merge_base, pr.headRefOid, &evidence, &coverage);
         }
-        return .{ .merge_base = merge_base, .evidence = evidence.items, .limited = coverage.items.len != 0, .coverage_reasons = coverage.items };
+        const logo_only = core.registryMain(self.object_cache.repo, pr) and coverage.items.len == 0 and
+            registry_logo.candidate(files, patch) and try self.staticRegistryLogos(path, merge_base, pr.headRefOid, files);
+        return .{ .merge_base = merge_base, .evidence = evidence.items, .limited = coverage.items.len != 0, .coverage_reasons = coverage.items, .registry_logo_only = logo_only };
+    }
+
+    fn staticRegistryLogos(self: Git, path: []const u8, base: []const u8, head: []const u8, files: []const github.File) !bool {
+        for (files) |file| {
+            const new = try self.logoBlob(path, head, file.filename) orelse return false;
+            if (registry_logo.isLogo(file.filename)) {
+                const old = try self.logoBlob(path, base, file.filename) orelse return false;
+                if (!registry_logo.staticSvg(old) or !registry_logo.staticSvg(new)) return false;
+            } else if (!registry_logo.patchChangeset(new)) return false;
+        }
+        return true;
+    }
+
+    fn logoBlob(self: Git, path: []const u8, commit: []const u8, name: []const u8) !?[]const u8 {
+        const oid = self.pinnedOid(path, commit, name) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const blob = self.pinnedBlob(path, oid) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        return if (blob.len <= 8 * 1024) blob else null;
     }
 
     fn registryPinBlob(self: Git, path: []const u8, commit: []const u8) !?[]const u8 {
