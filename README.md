@@ -33,7 +33,7 @@ talos status                          # See scans, queue, errors, and cache size
 | Show or set the reviewer default for new repos | `talos defaults` or `talos defaults --engine claude` |
 | Queue a specific PR under the repo's publication policy | `talos queue OWNER/REPO 123` |
 | Queue a review with a focus | `talos queue OWNER/REPO 123 --mode perf-maxxing --prompt 'Check allocations on the request path.' --publish` |
-| Read the latest local review candidate for a PR | `talos result OWNER/REPO 123` |
+| Read the latest local verdict, its evidence gaps, and recent verdict history | `talos result OWNER/REPO 123` |
 | Open a draft for a deferred finding | `talos followup THREAD_URL` |
 | Preview a followup | `talos followup THREAD_URL --dry-run` |
 | Track drafts and merge readiness | `talos followup status` |
@@ -66,9 +66,11 @@ Performance covers hot paths and scaling. Reliability covers partial failure, re
 
 After a review, Talos checks for new human replies, closed or reopened threads, and changes to the base branch or merge base. It checks up to four completed PRs per repo per scan. A rereview includes the previous verdict on individual findings and a bounded diff from the last reviewed commit when available. Talos keeps up to 16 notes for each tracked PR. The review receipt prevents a duplicate post after a restart.
 
+Talos puts files with active review threads and risky code early in the bounded diff. It also reads pinned source around current right-side thread anchors. Incomplete current evidence and unassessed open threads prevent approval. Reviewers can still approve when the current head is fully covered and the only gap is a clipped historical delta.
+
 If a rereview finds an issue after an approval, its comment flags the earlier approval for a person to reassess. On upgrade, Talos uses newer human replies to catch up completed reviews. It tracks resolution changes from the first successful scan.
 
-`talos status OWNER/REPO` shows up to five completed jobs still tracked and links to verified GitHub reviews. `talos result OWNER/REPO 123` prints the last saved local candidate, including its reviewed commit. A review reconciled from GitHub can have a receipt without a local candidate.
+`talos status OWNER/REPO` shows up to five completed jobs still tracked and links to verified GitHub reviews. `talos result OWNER/REPO 123` prints the last saved local candidate and up to seven previous verdict explanations, including after the PR closes. The explanation records the head and base, reviewer-specific gaps, requested evidence, approval blockers, and the GitHub review ID after readback. Older local candidates keep their original JSON fields. A review reconciled from GitHub can have a receipt without a local candidate.
 
 ### Follow up on a deferred finding
 
@@ -150,9 +152,13 @@ Every model start also counts against the per-tick budget. Adaptive routing rese
 
 ### Verify on-chain claims
 
-For adaptive reviews of PRs targeting `hyperlane-xyz/hyperlane-registry` main, the screening reviewer can request up to six public EVM reads. Talos uses `curl` and the HTTPS RPC URLs at the pinned base commit. It checks the chain ID, reads at a specific block, and gives the full reviewers the observed values alongside GitHub check statuses. Reviewers can request `owner()`, Safe `getOwners()` and `getThreshold()`, `paused()`, and whether an address has contract code.
+For adaptive reviews of PRs targeting `hyperlane-xyz/hyperlane-registry` main, the screening reviewer can request up to six public EVM reads. Talos uses `curl` and the HTTPS RPC URLs at the pinned base commit. It checks the chain ID, reads at a specific block, and gives the full reviewers the observed values alongside GitHub check statuses. Reviewers can request `owner()`, Safe `getOwners()` and `getThreshold()`, `paused()`, and whether an address has contract code. The RPC requests share a 30-second budget per review.
 
 Configure a [lightweight model](#route-reviews-by-risk) to enable these requests. A numbered `run-once` preview includes the observations in its JSON output. Scheduled reviews retain the observations and block heights in `status --json`. Unavailable requested evidence limits coverage and blocks automatic approval. The review checks specific claims about live state. A green CI status by itself does not prove those claims.
+
+### Review registry pin changes
+
+When a PR in `hyperlane-xyz/hyperlane-monorepo` changes `.registryrc`, Talos reads the old and new pins from the PR merge base and head. It adds a bounded GitHub comparison from `hyperlane-xyz/hyperlane-registry`, so reviewers can see the intended metadata update and other changes pulled in by the same bump. Talos withholds automatic approval when the pins diverge or comparison evidence is incomplete.
 
 ### Configure each repo
 
