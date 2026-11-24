@@ -1359,6 +1359,7 @@ pub const RouteProgress = struct {
     onchain_reads: []const onchain.Request = &.{},
     onchain_observations: ?[]const onchain.Observation = null,
     evidence_key: ?[32]u8 = null,
+    initial_evidence_limited: bool = false,
     completion_requests: ?[]const EvidenceRequest = null,
     completion_attempted: u8 = 0,
     completion_done: u8 = 0,

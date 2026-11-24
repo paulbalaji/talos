@@ -1136,6 +1136,7 @@ const Main = struct {
                     if (!eq(u8, &prior, &evidence_key)) {
                         progress.results = &.{};
                         progress.review_ms = 0;
+                        progress.initial_evidence_limited = false;
                         progress.completion_requests = null;
                         progress.completion_attempted = 0;
                         progress.completion_done = 0;
@@ -1370,7 +1371,7 @@ const Main = struct {
             .start_limit = @intCast(results.len),
             .completion_evidence = evidence,
         });
-        prepared.additional_evidence_limited = preview.evidence_limited;
+        prepared.additional_evidence_limited = prepared.additional_evidence_limited or preview.evidence_limited;
         prepared.evidence_requests = requests;
         return preview.progress.results;
     }
