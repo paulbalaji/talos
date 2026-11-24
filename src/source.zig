@@ -291,7 +291,8 @@ pub const Git = struct {
         defer env.deinit();
         var command = self.cmd;
         command.env = &env;
-        const client: onchain.Client = .{ .cmd = command, .curl = curl };
+        var timer = try std.time.Timer.start();
+        const client: onchain.Client = .{ .cmd = command, .curl = curl, .timer = &timer };
         var pins = std.StringHashMap(?onchain.Pin).init(a);
         defer pins.deinit();
         for (results) |*result| {

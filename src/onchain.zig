@@ -3,6 +3,7 @@ const io = @import("io.zig");
 
 pub const max_reads = 6;
 pub const registry_repo = "hyperlane-xyz/hyperlane-registry";
+const rpc_budget_seconds = 30;
 
 pub const Operation = enum {
     owner,
@@ -78,10 +79,16 @@ pub const Pin = struct { metadata: Metadata, url: []const u8, block: []const u8,
 pub const Client = struct {
     cmd: io.Command,
     curl: []const u8,
+    timer: *std.time.Timer,
 
     fn rpc(self: Client, url: []const u8, method: []const u8, params: anytype) ![]const u8 {
+        const remaining = rpc_budget_seconds * std.time.ns_per_s -| self.timer.read();
+        const seconds = @min(5, remaining / std.time.ns_per_s);
+        if (seconds == 0) return error.OnchainBudgetExhausted;
+        var timeout_buffer: [1]u8 = undefined;
+        const timeout = try std.fmt.bufPrint(&timeout_buffer, "{d}", .{seconds});
         const request = try io.json(self.cmd.a, .{ .jsonrpc = "2.0", .id = @as(u32, 1), .method = method, .params = params });
-        const output = try self.cmd.run(&.{ self.curl, "--disable", "--silent", "--fail", "--globoff", "--proto", "=https", "--connect-timeout", "3", "--max-time", "5", "--max-filesize", "65536", "--header", "Content-Type: application/json", "--data-binary", "@-", "--url", url }, request, 6);
+        const output = try self.cmd.run(&.{ self.curl, "--disable", "--silent", "--fail", "--globoff", "--proto", "=https", "--connect-timeout", "3", "--max-time", timeout, "--max-filesize", "65536", "--header", "Content-Type: application/json", "--data-binary", "@-", "--url", url }, request, @intCast(seconds + 1));
         const response = try io.parse(self.cmd.a, struct { id: u32, result: []const u8 }, output);
         if (response.id != 1) return error.InvalidRpcReply;
         return response.result;
