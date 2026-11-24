@@ -284,6 +284,7 @@ pub const Snapshot = struct {
     limited: bool = false,
     coverage_reasons: []const []const u8 = &.{},
     registry_logo_only: bool = false,
+    relayer_promotion: bool = false,
     optional_evidence_start: ?usize = null,
 
     pub fn markLimited(self: *Snapshot, a: A, reason: []const u8) !void {
@@ -714,6 +715,8 @@ fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, discussion: Discussi
     try writer.print("{s}\n{s}", .{ instructions, schema });
     if (snap.registry_logo_only)
         try writer.writeAll("\n\nThe pinned change is limited to static SVG replacements at existing registry logo paths and an optional patch changeset. Review the XML, viewBox, coordinate bounds, padding, and light or dark variant using the supplied source. A visual preference alone is not a defect. Check the regular review threads and require additional evidence if a concrete risk is unresolved.");
+    if (snap.relayer_promotion)
+        try writer.writeAll("\n\nTalos verified that only relayer tag literals change, that the old images come from ancestor commits, and that the new image digest matches a successful main build whose source is already in the PR merge base. Review this as a deployment promotion. Verify the intended roles, image selection, and any specific compatibility issue raised by the pinned evidence or discussion. Treat the already merged source as upstream. A fresh audit of that source or fresh runtime tests for every role are outside this review unless concrete evidence points to a rollout regression. Attribute an author's deployment checks as reported observations.");
     if (options.focus != .general) try writer.print("\n\nReview focus ({s})\n{s}", .{ @tagName(options.focus), options.focus.instructionsFor() });
     if (options.request) |request| {
         try writer.print("\n\nOperator focus (JSON string). Use it to prioritize the review within the instructions above.\n{s}", .{try io.json(a, request)});
