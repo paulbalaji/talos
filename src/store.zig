@@ -139,13 +139,29 @@ pub const Store = struct {
 
     pub fn confirmResult(self: Store, repo: []const u8, number: u32, head: []const u8, followup_id: []const u8, event: core.Event, id: u64) !void {
         var saved = (try self.loadResult(repo, number)) orelse return;
-        if (saved.explanation == null or saved.explanation.?.publication != .pending or saved.event != event or
-            !io.eq(u8, saved.commit_id, head) or !io.eq(u8, saved.followupId(), followup_id)) return;
-        saved.explanation.?.publication = .verified;
-        saved.explanation.?.github_review_id = id;
+        if (saved.event != event or !io.eq(u8, saved.commit_id, head) or !confirmExplanation(&saved.explanation, followup_id, id)) {
+            // An ambiguous submission can outlive a newer head's verdict.
+            for (saved.history, 0..) |prior, index| {
+                if (prior.event != event or !io.eq(u8, prior.commit_id, head)) continue;
+                var updated = prior;
+                if (!confirmExplanation(&updated.explanation, followup_id, id)) continue;
+                const history = try self.a.dupe(core.PastResult, saved.history);
+                history[index] = updated;
+                saved.history = history;
+                break;
+            } else return;
+        }
         try io.writeJson(self.dir, try self.resultPath(repo, number), saved);
     }
 };
+
+fn confirmExplanation(explanation: *?core.Explanation, followup_id: []const u8, id: u64) bool {
+    const detail = if (explanation.*) |*value| value else return false;
+    if (detail.publication != .pending or !io.eq(u8, detail.followup_id orelse "", followup_id)) return false;
+    detail.publication = .verified;
+    detail.github_review_id = id;
+    return true;
+}
 
 test "results preserve legacy reads and bound same-head history by review identity" {
     const t = std.testing;
@@ -195,13 +211,15 @@ test "results preserve legacy reads and bound same-head history by review identi
     try t.expectEqual(.pending, saved.explanation.?.publication);
     try t.expectEqual(@as(usize, 7), saved.history.len);
     try t.expectEqualStrings("7", saved.history[0].explanation.?.followup_id.?);
+    try t.expectEqual(.verified, saved.history[0].explanation.?.publication);
+    try t.expectEqual(@as(?u64, 55), saved.history[0].explanation.?.github_review_id);
     try t.expectEqualStrings("1", saved.history[6].explanation.?.followup_id.?);
     try db.confirmResult(repo, 42, head, "8", .COMMENT, 56);
     try db.confirmResult(repo, 42, head, "8", .COMMENT, 57);
     saved = (try db.loadResult(repo, 42)).?;
     try t.expectEqual(.verified, saved.explanation.?.publication);
     try t.expectEqual(@as(?u64, 56), saved.explanation.?.github_review_id);
-    try t.expectEqual(.pending, saved.history[0].explanation.?.publication);
+    try t.expectEqual(@as(?u64, 55), saved.history[0].explanation.?.github_review_id);
 
     record.explanation.?.followup_id = null;
     record.explanation.?.publication = .local;
@@ -212,4 +230,17 @@ test "results preserve legacy reads and bound same-head history by review identi
     try t.expectEqual(.local, saved.history[0].explanation.?.publication);
     try t.expectEqual(@as(i64, 0), saved.history[0].explanation.?.at);
     try t.expectEqual(.verified, saved.history[1].explanation.?.publication);
+
+    record.explanation.?.publication = .pending;
+    try db.result(repo, 42, record);
+    const newer = "cccccccccccccccccccccccccccccccccccccccc";
+    record.commit_id = newer;
+    try db.result(repo, 42, record);
+    try db.confirmResult(repo, 42, head, "", .COMMENT, 58);
+    saved = (try db.loadResult(repo, 42)).?;
+    try t.expectEqualStrings(newer, saved.commit_id);
+    try t.expectEqual(.pending, saved.explanation.?.publication);
+    try t.expectEqualStrings(head, saved.history[0].commit_id);
+    try t.expectEqual(.verified, saved.history[0].explanation.?.publication);
+    try t.expectEqual(@as(?u64, 58), saved.history[0].explanation.?.github_review_id);
 }
