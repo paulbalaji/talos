@@ -365,40 +365,70 @@ test "effective diff changes and human conversation comments trigger review" {
     try t.expect(job.legacyDiscussionChanged(repo.login, discussion, &.{ earlier, manual }));
 }
 
-test "an otherwise clean same-head review can approve once checks pass" {
+test "complete clean reviews approve independently of GitHub checks and mergeability" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var configured = repo;
     configured.approvals = true;
-    const resolved = core.Thread{
-        .id = "accepted",
-        .isResolved = true,
-        .isOutdated = false,
-        .path = "src/watch.rs",
-        .line = 20,
-        .replies = &.{.{ .author = .{ .login = "author" }, .body = "Documented follow-up accepted.", .url = "accepted-reply" }},
+    const cases = [_]struct {
+        checks: @FieldType(core.Pull, "statusCheckRollup"),
+        merge_state: []const u8 = "BLOCKED",
+    }{
+        .{ .checks = &.{.{ .status = "QUEUED" }} },
+        .{ .checks = &.{.{ .status = "COMPLETED", .conclusion = "FAILURE" }} },
+        .{ .checks = null, .merge_state = "UNKNOWN" },
+        .{ .checks = &.{}, .merge_state = "DIRTY" },
     };
-    var fake: Fake = .{ .a = a, .result = clean, .discussion = &.{resolved} };
-    fake.target.statusCheckRollup = &.{.{ .name = "Build and test", .status = "QUEUED" }};
-    var job: core.Job = .{ .number = fixture_pull.number, .head = head };
-    const before = (try core.run(a, &fake, configured, &job, .scheduled)).?;
-    try t.expectEqual(core.Event.COMMENT, before.event);
-    try t.expect(std.mem.indexOf(u8, before.body, "Build and test · QUEUED") != null);
-    try t.expect(job.awaiting_checks);
-    job.observeReviewInput(try core.ReviewInput.init(a, configured, fake.target, base, try fake.reviewDiscussion(42)), false);
-    try t.expectEqual(core.Phase.complete, job.phase);
+    for (cases) |case| {
+        var fake: Fake = .{ .a = a, .result = clean };
+        fake.target.statusCheckRollup = case.checks;
+        fake.target.mergeStateStatus = case.merge_state;
+        try t.expect(!core.checksPassed(fake.target));
+        var job: core.Job = .{ .number = fixture_pull.number, .head = head };
+        const result = (try core.run(a, &fake, configured, &job, .scheduled)).?;
+        try t.expectEqual(core.Event.APPROVE, result.event);
+        try t.expectEqualStrings(head, result.commit_id);
+        try t.expect(std.mem.indexOf(u8, result.body, "Approval checks") == null);
+        try t.expect(!job.awaiting_checks);
 
-    fake.target.statusCheckRollup = &.{.{ .status = "COMPLETED", .conclusion = "SUCCESS" }};
-    job.observeReviewInput(try core.ReviewInput.init(a, configured, fake.target, base, try fake.reviewDiscussion(42)), false);
+        fake.target.statusCheckRollup = &.{.{ .status = "COMPLETED", .conclusion = "SUCCESS" }};
+        fake.target.mergeStateStatus = "CLEAN";
+        job.observeReviewInput(try core.ReviewInput.init(a, configured, fake.target, base, .{}), false);
+        try t.expectEqual(core.Phase.complete, job.phase);
+        try t.expectEqual(@as(usize, 1), fake.posts);
+    }
+}
+
+test "an old approval held for CI is reviewed once even while checks are pending" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var configured = repo;
+    configured.approvals = true;
+    var fake: Fake = .{
+        .a = a,
+        .result = clean,
+        .offered = .{ .id = 55, .commit_id = head, .state = "COMMENTED", .user = .{ .login = repo.login }, .body = "Old review." },
+    };
+    fake.target.statusCheckRollup = &.{.{ .status = "QUEUED" }};
+    const input = try core.ReviewInput.init(a, configured, fake.target, base, .{});
+    var job = try io.parse(a, core.Job, try io.json(a, core.Job{
+        .number = fixture_pull.number,
+        .head = head,
+        .phase = .complete,
+        .receipt = 55,
+        .review_input = input,
+        .awaiting_checks = true,
+    }));
+    job.observeReviewInput(input, false);
     try t.expectEqual(core.Phase.pending, job.phase);
-    const after = (try core.run(a, &fake, configured, &job, .scheduled)).?;
-    try t.expectEqual(core.Event.APPROVE, after.event);
-    try t.expectEqualStrings(head, after.commit_id);
+    const result = (try core.run(a, &fake, configured, &job, .scheduled)).?;
+    try t.expectEqual(core.Event.APPROVE, result.event);
     try t.expect(!job.awaiting_checks);
-    try t.expectEqual(@as(usize, 2), fake.posts);
-    job.observeReviewInput(try core.ReviewInput.init(a, configured, fake.target, base, try fake.reviewDiscussion(42)), false);
+    job.observeReviewInput(input, false);
     try t.expectEqual(core.Phase.complete, job.phase);
+    try t.expectEqual(@as(usize, 1), fake.posts);
 }
 
 test "a changed stack ancestor prevents publication and prompt distinguishes inherited evidence" {
