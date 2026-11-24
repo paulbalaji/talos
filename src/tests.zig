@@ -55,7 +55,7 @@ const Fake = struct {
     inline_readbacks: usize = 0,
     prompt_text: []const u8 = "",
     posted_result: ?core.Payload = null,
-    saved_result: ?core.Payload = null,
+    saved_result: ?core.Result = null,
 
     pub fn checkIdentity(_: *Fake) !void {}
 
@@ -161,8 +161,18 @@ const Fake = struct {
         if (self.db) |db| try db.save(self.state.?);
     }
 
-    pub fn saveResult(self: *Fake, _: u32, result: core.Payload) !void {
+    pub fn saveResult(self: *Fake, _: u32, result: core.Result) !void {
         self.saved_result = result;
+    }
+
+    pub fn confirmResult(self: *Fake, _: u32, commit: []const u8, followup_id: []const u8, event: core.Event, id: u64) !void {
+        if (self.saved_result) |*result| {
+            try t.expectEqualStrings(commit, result.commit_id);
+            try t.expectEqualStrings(followup_id, result.followupId());
+            try t.expectEqual(event, result.event);
+            result.explanation.?.publication = .verified;
+            result.explanation.?.github_review_id = id;
+        }
     }
 };
 
@@ -245,6 +255,8 @@ test "inline readback resumes from a persisted intent without posting again" {
     var job: core.Job = .{ .number = fixture_pull.number, .head = head };
     try t.expectError(error.ReviewInlineReadbackMismatch, core.run(a, &fake, repo, &job, .scheduled));
     try t.expectEqual(core.Phase.uncertain, job.phase);
+    try t.expectEqual(.pending, fake.saved_result.?.explanation.?.publication);
+    try t.expect(fake.saved_result.?.explanation.?.github_review_id == null);
     try t.expectEqual(@as(usize, 1), job.expected_inline.?.len);
     var recovered = try io.parse(a, core.Job, try io.json(a, job));
     fake.lose_inline_readback = false;
@@ -253,6 +265,31 @@ test "inline readback resumes from a persisted intent without posting again" {
     try t.expectEqual(@as(usize, 2), fake.inline_readbacks);
     try t.expectEqual(core.Phase.complete, recovered.phase);
     try t.expect(recovered.expected_inline == null);
+    try t.expectEqual(.verified, fake.saved_result.?.explanation.?.publication);
+    try t.expectEqual(@as(?u64, 55), fake.saved_result.?.explanation.?.github_review_id);
+}
+
+test "a multi-review result identifies the reviewer and exact missing evidence" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const incomplete =
+        \\{"complete":true,"coverage_gaps":["The pinned RPC read does not include the ProxyAdmin owner."],"summary":"Static review.","findings":[],"existing_open_findings":[],"non_blocking_threads":[]}
+    ;
+    var fake: Fake = .{ .a = a, .result = clean, .other_results = &.{incomplete} };
+    const configured: core.Repo = .{ .name = repo.name, .login = repo.login, .additional_engines = &.{.claude}, .approvals = true };
+    var job: core.Job = .{ .number = fixture_pull.number, .head = head };
+    const preview = (try core.run(a, &fake, configured, &job, .{ .preview = .{} })).?;
+    const detail = preview.explanation.?;
+    try t.expectEqual(.COMMENT, preview.event);
+    try t.expect(!detail.coverage.complete);
+    try t.expectEqualSlices(std.meta.Child(@FieldType(core.Explanation, "blockers")), &.{.limited_coverage}, detail.blockers);
+    try t.expect(detail.coverage.reviewers[0].complete);
+    try t.expectEqual(core.Engine.claude, detail.coverage.reviewers[1].engine);
+    try t.expectEqualStrings("The pinned RPC read does not include the ProxyAdmin owner.", detail.coverage.reviewers[1].gaps[0]);
+    try t.expect(std.mem.indexOf(u8, preview.body, "claude reported incomplete coverage") != null);
+    try t.expect(fake.saved_result == null);
+    try t.expectEqual(@as(usize, 0), fake.posts);
 }
 
 test "persisted findings and pending receipt anchors outlive a review worker" {
@@ -539,7 +576,7 @@ test "publishes one commit-bound comment, verifies it, and deduplicates a second
     try t.expectEqual(@as(u32, 20), payload.comments[0].line);
 
     work = .{ .number = fixture_pull.number, .head = head };
-    try t.expectEqual(@as(?core.Payload, null), try core.run(a, &fake, repo, &work, .scheduled));
+    try t.expectEqual(@as(?core.Result, null), try core.run(a, &fake, repo, &work, .scheduled));
     try t.expectEqual(@as(usize, 1), fake.posts);
     try t.expectEqual(@as(usize, 1), fake.reviews_run);
 }

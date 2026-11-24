@@ -305,8 +305,12 @@ const Adapter = struct {
         try self.db.save(self.state);
     }
 
-    pub fn saveResult(self: *Adapter, number: u32, payload: core.Payload) !void {
-        try self.db.result(self.repo.name, number, payload);
+    pub fn saveResult(self: *Adapter, number: u32, result: core.Result) !void {
+        try self.db.result(self.repo.name, number, result);
+    }
+
+    pub fn confirmResult(self: *Adapter, number: u32, head: []const u8, followup_id: []const u8, event: core.Event, id: u64) !void {
+        try self.db.confirmResult(self.repo.name, number, head, followup_id, event, id);
     }
 };
 
@@ -1049,6 +1053,8 @@ const Main = struct {
                 work.prepared.synthesis_provider = saved.synthesis_provider;
                 work.prepared.synthesis_summary = saved.synthesis_summary;
                 work.prepared.additional_evidence_limited = saved.additional_evidence_limited;
+                work.prepared.evidence_requests = saved.evidence_requests;
+                work.prepared.onchain_observations = saved.onchain_observations;
                 _ = try core.finish(self.a, &work.adapter, entry.repo, job, work.prepared, saved.results);
                 return;
             }
@@ -1145,6 +1151,8 @@ const Main = struct {
                 work.prepared.synthesis_provider = report.synthesis_provider;
                 work.prepared.synthesis_summary = outcome.synthesis_summary;
                 work.prepared.additional_evidence_limited = outcome.evidence_limited;
+                work.prepared.evidence_requests = outcome.progress.evidence_requests;
+                work.prepared.onchain_observations = report.onchain_observations;
                 work.job.route_report = report;
                 work.job.route_report.?.providers = try self.a.dupe(core.Engine, report.providers);
                 work.job.route_progress = null;
@@ -1288,6 +1296,7 @@ const Main = struct {
             var prepared = (try core.prepare(self.a, &live, entry.repo, &job, .{ .preview = preview })).?;
             const observations = try live.previewReads(prepared);
             prepared.additional_evidence_limited = try core.appendOnchain(self.a, &prepared.context, observations);
+            prepared.onchain_observations = observations;
             const results = try core.analyze(self.a, &live, prepared.engines, prepared.context);
             const payload = (try core.finish(self.a, &live, entry.repo, &job, prepared, results[0..prepared.engines.len])).?;
             if (observations.len == 0) {

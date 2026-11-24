@@ -97,6 +97,7 @@ pub fn synthesisPrompt(a: io.A, context: []const u8, results: []const core.Revie
 pub fn overCapacity(a: io.A, results: []const core.ReviewerResult) !Synthesis {
     const checked = try a.dupe(core.ReviewerResult, results);
     for (checked) |*result| {
+        result.complete_before_synthesis = result.review.complete;
         result.review.findings = &.{};
         result.review.complete = false;
     }
@@ -177,7 +178,10 @@ pub fn verify(a: io.A, output: []const u8, results: []const core.ReviewerResult,
         }
         result.review.findings = try findings.toOwnedSlice(a);
     }
-    for (checked) |*result| result.review.complete = result.review.complete and unresolved == 0;
+    if (unresolved != 0) for (checked) |*result| {
+        result.complete_before_synthesis = result.review.complete;
+        result.review.complete = false;
+    };
     const summary = if (unresolved == 0) judgments.summary else try io.fmt(a, "The pinned source could not resolve {d} candidate findings.", .{unresolved});
     return .{ .results = checked, .summary = summary };
 }
