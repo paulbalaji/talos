@@ -33,6 +33,10 @@ const Fake = struct {
     discussion: []const core.Thread = &.{},
     late_discussion: ?[]const core.Thread = null,
     comments: []const core.Reply = &.{},
+    snapshot_threads: []const core.Thread = &.{},
+    source_limited: bool = false,
+    previous_delta: []const u8 = "",
+    historical_coverage_reasons: []const []const u8 = &.{},
     thread_reads: usize = 0,
     result: []const u8 = finding,
     other_results: []const []const u8 = &.{},
@@ -71,8 +75,16 @@ const Fake = struct {
         };
     }
 
-    pub fn snapshot(_: *Fake, _: core.Pull) !core.Snapshot {
-        return .{ .merge_base = base, .evidence = "Diff in src/watch.rs" };
+    pub fn snapshot(self: *Fake, _: core.Pull, threads: []const core.Thread) !core.Snapshot {
+        self.snapshot_threads = threads;
+        return .{ .merge_base = base, .evidence = "Diff in src/watch.rs", .limited = self.source_limited };
+    }
+
+    pub fn supplement(self: *Fake, _: core.Pull, _: ?[]const u8, _: []const core.EvidenceRequest) !struct {
+        evidence: []const u8,
+        coverage_reasons: []const []const u8,
+    } {
+        return .{ .evidence = self.previous_delta, .coverage_reasons = self.historical_coverage_reasons };
     }
 
     pub fn stackContext(self: *Fake, _: core.Pull, _: bool) !stack.Context {
@@ -934,6 +946,39 @@ test "an approval is discarded when a thread opens before posting" {
     try t.expectEqual(@as(usize, 0), fake.posts);
     try t.expectEqual(core.Phase.pending, job.phase);
     try t.expect(fake.saved_result == null);
+}
+
+test "a clipped historical delta permits approval only with complete current evidence and assessed threads" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var configured = repo;
+    configured.approvals = true;
+    const cases = [_]struct { source_limited: bool, result: []const u8, event: core.Event }{
+        .{ .source_limited = false, .result = assessed, .event = .APPROVE },
+        .{ .source_limited = false, .result = clean, .event = .COMMENT },
+        .{ .source_limited = true, .result = assessed, .event = .COMMENT },
+    };
+    for (cases) |case| {
+        var fake: Fake = .{
+            .a = a,
+            .discussion = &.{open_nit},
+            .source_limited = case.source_limited,
+            .result = case.result,
+            .previous_delta = "Previous-head diff was truncated.",
+            .historical_coverage_reasons = &.{"The previous diff exceeded the byte limit."},
+        };
+        var job: core.Job = .{
+            .number = fixture_pull.number,
+            .head = head,
+            .last_review = .{ .head = changed, .base = .fromPull(fixture_pull), .merge_base = base, .notes = &.{} },
+        };
+        const result = (try core.run(a, &fake, configured, &job, .scheduled)).?;
+        try t.expectEqual(case.event, result.event);
+        try t.expectEqualStrings(open_nit.id, fake.snapshot_threads[0].id);
+        try t.expect(std.mem.indexOf(u8, fake.prompt_text, "\"historical_coverage_reasons\":[\"The previous diff exceeded the byte limit.\"]") != null);
+        if (case.event == .APPROVE) try t.expect(std.mem.indexOf(u8, result.body, "Review coverage was limited.") == null);
+    }
 }
 
 test "a queued focused review survives restart and publishes only with explicit authorization" {

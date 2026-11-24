@@ -160,9 +160,9 @@ const Adapter = struct {
         return self.github_client.discussion(number);
     }
 
-    pub fn snapshot(self: *Adapter, pr: core.Pull) !core.Snapshot {
+    pub fn snapshot(self: *Adapter, pr: core.Pull, threads: []const core.Thread) !core.Snapshot {
         self.files = try self.github_client.files(pr.number);
-        return self.git_source.snapshot(pr, self.files);
+        return self.git_source.snapshot(pr, self.files, threads);
     }
 
     pub fn supplement(self: *Adapter, pr: core.Pull, previous: ?[]const u8, requests: []const core.EvidenceRequest) !source.Supplement {
@@ -203,7 +203,7 @@ const Adapter = struct {
                 if (merged_pin or stack.samePin(member.pin, pin)) {
                     if (member.digest) |stored| break :digest stored;
                 }
-                const snapshot_value = try self.git_source.snapshot(ancestor_pr, &.{});
+                const snapshot_value = try self.git_source.snapshot(ancestor_pr, &.{}, &.{});
                 break :digest try stack.Digest.make(self.db.a, snapshot_value.evidence, try self.ancestorReview(pin));
             };
             ancestor.* = .{

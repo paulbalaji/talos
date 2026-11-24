@@ -4,6 +4,7 @@ const github = @import("github.zig");
 const io = @import("io.zig");
 const cache = @import("cache.zig");
 const onchain = @import("onchain.zig");
+const routing = @import("routing.zig");
 const A = io.A;
 const eq = io.eq;
 
@@ -11,6 +12,9 @@ const diff_limit = 48 * 1024;
 const context_limit = 24 * 1024;
 const max_blob_size = 16 * 1024;
 const batch_size = 32;
+const thread_context_limit = 12 * 1024;
+const thread_excerpt_limit = 2 * 1024;
+const max_thread_excerpts = 12;
 pub const max_requests = core.max_evidence_requests;
 const supplement_limit = 16 * 1024;
 const delta_limit = 12 * 1024;
@@ -83,6 +87,43 @@ fn shellQuote(a: A, value: []const u8) ![]const u8 {
     return io.fmt(a, "'{s}'", .{escaped});
 }
 
+const DiffPriority = enum { thread, risk, source, supporting };
+const PrioritizedFile = struct { file: github.File, priority: DiffPriority };
+
+fn prioritizeFiles(a: A, files: []const github.File, threads: []const core.Thread) ![]const PrioritizedFile {
+    var open_paths: std.StringHashMapUnmanaged(void) = .empty;
+    defer open_paths.deinit(a);
+    for (threads) |thread| {
+        if (!thread.isResolved and !thread.isOutdated) try open_paths.put(a, thread.path, {});
+    }
+    var ordered: std.ArrayList(PrioritizedFile) = .empty;
+    for (files) |file| {
+        if (!core.validPath(file.filename) or sensitive(file.filename)) continue;
+        const priority: DiffPriority = if (open_paths.contains(file.filename))
+            .thread
+        else if (supportingFile(file.filename))
+            .supporting
+        else switch (routing.inspect(&[_]github.File{file}, false).floor.depth) {
+            .multi, .focused => .risk,
+            .regular, .light => .source,
+        };
+        try ordered.append(a, .{ .file = file, .priority = priority });
+    }
+    std.mem.sort(PrioritizedFile, ordered.items, {}, struct {
+        fn lessThan(_: void, left: PrioritizedFile, right: PrioritizedFile) bool {
+            if (left.priority != right.priority) return @intFromEnum(left.priority) < @intFromEnum(right.priority);
+            return std.mem.lessThan(u8, left.file.filename, right.file.filename);
+        }
+    }.lessThan);
+    return ordered.toOwnedSlice(a);
+}
+
+fn supportingFile(path: []const u8) bool {
+    const name = std.fs.path.basename(path);
+    return std.ascii.endsWithIgnoreCase(name, ".md") or std.ascii.endsWithIgnoreCase(name, ".lock") or
+        eq(u8, name, "pnpm-lock.yaml") or eq(u8, name, "package-lock.json");
+}
+
 pub const Git = struct {
     cmd: io.Command,
     bin: []const u8,
@@ -139,13 +180,13 @@ pub const Git = struct {
         try cache.touch(self.cmd.a, dir, std.time.timestamp());
     }
 
-    pub fn snapshot(self: Git, pr: core.Pull, files: []const github.File) !core.Snapshot {
+    pub fn snapshot(self: Git, pr: core.Pull, files: []const github.File, threads: []const core.Thread) !core.Snapshot {
         var repo_dir = (try self.object_cache.repoDir(true)) orelse return error.GitCacheInitFailed;
         defer repo_dir.close();
         const parent = try repo_dir.realpathAlloc(self.cmd.a, ".");
         const path = try std.fs.path.join(self.cmd.a, &.{ parent, cache.directory });
         try self.object_cache.evict(repo_dir, std.time.timestamp());
-        const result = self.readSnapshot(repo_dir, path, pr, files) catch |err| {
+        const result = self.readSnapshot(repo_dir, path, pr, files, threads) catch |err| {
             self.object_cache.evict(repo_dir, std.time.timestamp()) catch |cache_err|
                 std.log.warn("Git cache eviction failed for {s} ({s})", .{ self.object_cache.repo.name, @errorName(cache_err) });
             return err;
@@ -154,20 +195,25 @@ pub const Git = struct {
         return result;
     }
 
-    fn readSnapshot(self: Git, repo_dir: std.fs.Dir, path: []const u8, pr: core.Pull, files: []const github.File) !core.Snapshot {
+    fn readSnapshot(self: Git, repo_dir: std.fs.Dir, path: []const u8, pr: core.Pull, files: []const github.File, threads: []const core.Thread) !core.Snapshot {
         const a = self.cmd.a;
         try self.pin(repo_dir, path, pr);
         const merge_base = io.trim(u8, try self.git(path, &.{ "merge-base", pr.baseRefOid, pr.headRefOid }, ""), "\r\n");
         if (!core.validOid(merge_base)) return error.InvalidMergeBase;
 
-        const patch = try self.diff(path, merge_base, pr.headRefOid);
+        const ordered = try prioritizeFiles(a, files, threads);
+        const patch = try self.orderedDiff(path, merge_base, pr.headRefOid, ordered);
         const prefix = patch[0..core.safePrefix(patch, diff_limit)];
         if (!std.unicode.utf8ValidateSlice(prefix)) return error.NonUtf8Diff;
         var evidence: std.ArrayList(u8) = .empty;
+        var remaining: usize = context_limit;
+        const missing_threads = try self.appendThreadExcerpts(path, pr.headRefOid, files, threads, prefix.len == patch.len, &evidence, &remaining);
         const writer = evidence.writer(a);
+        if (evidence.items.len != 0) try writer.writeAll("\n\n");
         try writer.print("Merge-base diff:\n{s}", .{prefix});
         var coverage: std.ArrayList([]const u8) = .empty;
         if (prefix.len != patch.len) try coverage.append(a, "The merge base diff exceeded the byte limit.");
+        if (missing_threads != 0) try coverage.append(a, try io.fmt(a, "Current source excerpts were unavailable for {d} active review thread anchors.", .{missing_threads}));
         if (files.len >= 3000) try coverage.append(a, "GitHub reached its changed file limit.");
         var sensitive_count: usize = 0;
         var patch_count: usize = 0;
@@ -178,16 +224,16 @@ pub const Git = struct {
                 sensitive_count += 1;
             } else if (file.patch == null) {
                 patch_count += 1;
-            } else if (core.validPath(file.filename)) {
-                try candidates.append(a, file.filename);
-            } else {
+            } else if (!core.validPath(file.filename)) {
                 invalid_path_count += 1;
             }
+        }
+        for (ordered) |item| {
+            if (item.file.patch != null) try candidates.append(a, item.file.filename);
         }
         if (sensitive_count != 0) try coverage.append(a, try io.fmt(a, "Sensitive changed paths omitted: {d}.", .{sensitive_count}));
         if (patch_count != 0) try coverage.append(a, try io.fmt(a, "Files without a GitHub patch: {d}.", .{patch_count}));
         if (invalid_path_count != 0) try coverage.append(a, try io.fmt(a, "Unsupported changed paths omitted: {d}.", .{invalid_path_count}));
-        var remaining: usize = context_limit;
         var offset: usize = 0;
         while (offset < candidates.items.len and remaining >= 1024) : (offset += batch_size) {
             const group = candidates.items[offset..@min(offset + batch_size, candidates.items.len)];
@@ -307,6 +353,59 @@ pub const Git = struct {
         return self.git(cache_path, &args, "") catch return error.GitDiffFailed;
     }
 
+    fn orderedDiff(self: Git, cache_path: []const u8, base: []const u8, head: []const u8, files: []const PrioritizedFile) ![]const u8 {
+        if (files.len == 0) return self.diff(cache_path, base, head);
+        const a = self.cmd.a;
+        const order_file = "diff-order";
+        var patterns: std.ArrayList(u8) = .empty;
+        for (files) |item| {
+            for (item.file.filename, 0..) |byte, i| {
+                // Git treats order-file lines as glob patterns and leading # as a comment.
+                if (byte == '*' or byte == '?' or byte == '[' or (byte == '#' and i == 0)) try patterns.append(a, '\\');
+                try patterns.append(a, byte);
+            }
+            try patterns.append(a, '\n');
+        }
+        try io.write(self.cmd.dir, order_file, patterns.items);
+        defer self.cmd.dir.deleteFile(order_file) catch {};
+        const option = try io.fmt(a, "-O{s}/{s}", .{ self.cmd.cwd, order_file });
+        const args = diff_flags ++ [_][]const u8{ option, base, head, "--" } ++ excluded_paths;
+        return self.git(cache_path, &args, "") catch return error.GitDiffFailed;
+    }
+
+    fn appendThreadExcerpts(self: Git, cache_path: []const u8, head: []const u8, files: []const github.File, threads: []const core.Thread, diff_complete: bool, evidence: *std.ArrayList(u8), remaining: *usize) !usize {
+        var seen: [max_thread_excerpts]struct { path: []const u8, line: u32 } = undefined;
+        var attempted: usize = 0;
+        var missing: usize = 0;
+        var thread_remaining: usize = @min(thread_context_limit, remaining.*);
+        for (threads) |thread| {
+            if (thread.isResolved or thread.isOutdated or thread.diffSide != .RIGHT) continue;
+            const line = thread.line orelse continue;
+            const duplicate = for (seen[0..attempted]) |target| {
+                if (target.line == line and eq(u8, target.path, thread.path)) break true;
+            } else false;
+            if (duplicate) continue;
+            if (line != 0 and attempted < seen.len and thread_remaining > thread.path.len + 160 and
+                core.validPath(thread.path) and !sensitive(thread.path))
+            {
+                seen[attempted] = .{ .path = thread.path, .line = line };
+                attempted += 1;
+                const budget: usize = @min(thread_remaining, thread_excerpt_limit);
+                var left = budget;
+                const request: core.EvidenceRequest = .{ .path = thread.path, .start_line = @max(1, line -| 8), .end_line = line +| 8 };
+                const complete = self.appendExcerpt(cache_path, head, request, line, evidence, &left) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => false,
+                };
+                thread_remaining -= budget - left;
+                remaining.* -= budget - left;
+                if (complete) continue;
+            }
+            if (!diff_complete or !anchor(files, thread.path, line)) missing += 1;
+        }
+        return missing;
+    }
+
     pub fn supplement(self: Git, pr: core.Pull, previous_head: ?[]const u8, requests: []const core.EvidenceRequest) !Supplement {
         const a = self.cmd.a;
         const previous = if (previous_head) |oid| if (eq(u8, oid, pr.headRefOid)) null else oid else null;
@@ -407,7 +506,7 @@ pub const Git = struct {
         var remaining: usize = supplement_limit;
         var requests_incomplete = requests.len > max_requests;
         for (requests[0..@min(requests.len, max_requests)], 1..) |request, index| {
-            if (self.appendExcerpt(cache_path, head, request, &evidence, &remaining)) |complete| {
+            if (self.appendExcerpt(cache_path, head, request, null, &evidence, &remaining)) |complete| {
                 requests_incomplete = requests_incomplete or !complete;
             } else |err| {
                 if (err == error.OutOfMemory) return err;
@@ -422,13 +521,16 @@ pub const Git = struct {
         return .{ .evidence = evidence.items, .limited = coverage.items.len != 0, .coverage_reasons = coverage.items };
     }
 
-    fn appendExcerpt(self: Git, cache_path: []const u8, head: []const u8, request: core.EvidenceRequest, evidence: *std.ArrayList(u8), remaining: *usize) !bool {
+    fn appendExcerpt(self: Git, cache_path: []const u8, head: []const u8, request: core.EvidenceRequest, anchor_line: ?u32, evidence: *std.ArrayList(u8), remaining: *usize) !bool {
         const a = self.cmd.a;
         if (!core.validPath(request.path) or sensitive(request.path)) return error.DisallowedExcerptPath;
         const lines = try excerptRange(request.start_line, request.end_line);
         if (remaining.* <= request.path.len + 160) return error.ExcerptBudget;
         const blob = try self.pinnedBlob(cache_path, try self.pinnedOid(cache_path, head, request.path));
         const excerpt = try excerptLines(blob, lines);
+        if (anchor_line) |line| {
+            if (excerpt.end < line) return error.ExcerptPastEnd;
+        }
         const prefix = excerpt.text[0..core.safePrefix(excerpt.text, remaining.* - request.path.len - 160)];
         const complete = !(excerpt.more and (lines.clipped or request.end_line == null)) and prefix.len == excerpt.text.len;
         const start = evidence.items.len;
@@ -635,10 +737,11 @@ fn takeBlob(input: *[]const u8, expected: BlobHeader) ![]const u8 {
 }
 
 fn appendBlob(evidence: *std.ArrayList(u8), a: A, name: []const u8, blob: []const u8, remaining: *usize) !void {
-    if (blob.len > @min(remaining.*, max_blob_size) or !std.unicode.utf8ValidateSlice(blob) or
+    const overhead = name.len + 40;
+    if (blob.len > max_blob_size or blob.len + overhead > remaining.* or !std.unicode.utf8ValidateSlice(blob) or
         std.mem.indexOfScalar(u8, blob, 0) != null) return;
     try evidence.writer(a).print("\n\nHead file {s}:\n{s}", .{ name, blob });
-    remaining.* -|= blob.len + name.len + 40;
+    remaining.* -= blob.len + overhead;
 }
 
 // GitHub's files API provides the hunks GitHub can attach to. Count right-side
@@ -784,7 +887,7 @@ test "batch blobs use size framing and reject mismatched responses" {
     try testing.expectError(error.InvalidGitBatch, blobHeader(oid ++ " blob 1 extra"));
 }
 
-test "pinned source reads use the requested trees and reject invalid requests" {
+test "pinned source reads exact trees and prioritizes active review anchors in a large diff" {
     const t = std.testing;
     const bin = "/usr/bin/git";
     std.fs.accessAbsolute(bin, .{}) catch return error.SkipZigTest;
@@ -842,6 +945,52 @@ test "pinned source reads use the requested trees and reject invalid requests" {
     try t.expectEqualStrings(old_pin, pins.before);
     try t.expectEqualStrings(new_pin, pins.after);
     try t.expect((try git.registryPins(path, commits[1], commits[1])) == null);
+
+    const active_path = "z-active[?]*.zig";
+    const risky_path = "zz-owner.yaml";
+    const docs = "#doc.md";
+    const files = [_]github.File{
+        .{ .filename = docs },
+        .{ .filename = risky_path, .patch = "@@ -0,0 +1 @@\n+owner: new\n" },
+        .{ .filename = active_path, .patch = "@@ -0,0 +1,3 @@\n+start\n+active anchor\n+end\n" },
+    };
+    const current = core.Thread{ .id = "current", .isResolved = false, .isOutdated = false, .path = active_path, .line = 2, .diffSide = .RIGHT, .replies = &.{} };
+    var duplicate = current;
+    duplicate.id = "duplicate";
+    var stale = current;
+    stale.isOutdated = true;
+    stale.path = ".env.local";
+    var left = current;
+    left.path = "linked.zig";
+    left.diffSide = .LEFT;
+    var missing = current;
+    missing.line = 9;
+    const threads: []const core.Thread = &.{ current, duplicate, stale, left, missing };
+
+    const docs_blob = io.trim(u8, try git.git(path, &.{ "hash-object", "-w", "--stdin" }, "large docs\n" ** 5000), "\n");
+    const risk_blob = io.trim(u8, try git.git(path, &.{ "hash-object", "-w", "--stdin" }, "owner: new\n"), "\n");
+    const active_blob = io.trim(u8, try git.git(path, &.{ "hash-object", "-w", "--stdin" }, "start\nactive anchor\nend\n"), "\n");
+    const new_tree = try io.fmt(a, "100644 blob {s}\t{s}\n100644 blob {s}\t{s}\n100644 blob {s}\t{s}\n", .{
+        docs_blob, docs, risk_blob, risky_path, active_blob, active_path,
+    });
+    const tree_oid = io.trim(u8, try git.git(path, &.{"mktree"}, new_tree), "\n");
+    const new_head = io.trim(u8, try git.git(path, &.{ "commit-tree", tree_oid, "-p", commits[0], "-m", "review" }, ""), "\n");
+    const full = try git.diff(path, commits[0], new_head);
+    try t.expect(std.mem.indexOf(u8, full[0..diff_limit], "+active anchor") == null);
+    const ordered = try prioritizeFiles(a, &files, threads);
+    try t.expectEqualStrings(active_path, ordered[0].file.filename);
+    try t.expectEqualStrings(risky_path, ordered[1].file.filename);
+    try t.expectEqualStrings(docs, ordered[2].file.filename);
+    const diff = try git.orderedDiff(path, commits[0], new_head, ordered);
+    const active_offset = std.mem.indexOf(u8, diff[0..diff_limit], "+active anchor") orelse return error.TestExpectedEqual;
+    const risk_offset = std.mem.indexOf(u8, diff[0..diff_limit], "+owner: new") orelse return error.TestExpectedEqual;
+    const docs_offset = std.mem.indexOf(u8, diff[0..diff_limit], "+large docs") orelse return error.TestExpectedEqual;
+    try t.expect(active_offset < risk_offset and risk_offset < docs_offset);
+    var evidence: std.ArrayList(u8) = .empty;
+    var remaining: usize = context_limit;
+    try t.expectEqual(@as(usize, 1), try git.appendThreadExcerpts(path, new_head, &files, threads, false, &evidence, &remaining));
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, evidence.items, "active anchor"));
+    try t.expect(std.mem.indexOf(u8, evidence.items, "DO NOT PRESENT") == null);
 }
 
 test "source excerpts cap requested lines and preserve the last line without a newline" {

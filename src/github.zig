@@ -20,6 +20,7 @@ const RawThread = struct {
     isOutdated: bool,
     path: []const u8,
     line: ?u32,
+    diffSide: ?core.DiffSide = null,
     comments: Connection(core.Reply),
 };
 
@@ -448,7 +449,7 @@ pub const Client = struct {
         \\      nodes { author { login kind: __typename } body url updatedAt association: authorAssociation }
         \\    }
         \\    reviewThreads(first: 50, after: $cursor) { pageInfo { hasNextPage endCursor }
-        \\      nodes { id isResolved isOutdated path line
+        \\      nodes { id isResolved isOutdated path line diffSide
         \\        comments(first: 50) { pageInfo { hasNextPage endCursor }
         \\          nodes { author { login kind: __typename } body url updatedAt association: authorAssociation originalCommit { oid } }
         \\        }
@@ -509,6 +510,7 @@ pub const Client = struct {
             .isOutdated = raw.isOutdated,
             .path = raw.path,
             .line = raw.line,
+            .diffSide = raw.diffSide,
             .replies = replies.items,
             .truncated = truncated,
         };

@@ -128,12 +128,15 @@ pub const Reply = struct {
     originalCommit: ?struct { oid: []const u8 } = null,
 };
 
+pub const DiffSide = enum { LEFT, RIGHT };
+
 pub const Thread = struct {
     id: []const u8,
     isResolved: bool,
     isOutdated: bool,
     path: []const u8,
     line: ?u32,
+    diffSide: ?DiffSide = null,
     replies: []const Reply,
     truncated: bool = false,
 };
@@ -541,7 +544,7 @@ const instructions =
     \\Assess every unresolved thread on the current head. List a thread in non_blocking_threads only when the evidence supports a verified fix, a valid rebuttal, a nit with no corrective work required, or a defensible deferral. Give its exact thread ID and a one-sentence reason under 400 bytes. Leave uncertain threads out of that list. Omit resolved threads from both lists.
     \\Classify each nonblocking assessment as fixed, rebutted, nit, or deferred. A deferred finding still applies and has a justified followup.
     \\Evaluate a rebuttal against the current code regardless of who wrote it. For a deferral, assess the remaining impact and whether delaying the fix is reasonable. Use GitHub author association as context for who can accept that tradeoff. A PR author can also be a maintainer and can accept a tradeoff without a second maintainer repeating the decision. A bare promise to follow up, a refusal to change the code, or an outdated line alone cannot clear a finding, regardless of who replied.
-    \\When prior review notes are present, use them as leads. Check the previous-to-current delta and current code before carrying forward findings or accepting fixes. A GitHub resolution is a discussion event, not proof of a code change.
+    \\When prior review notes are present, use them as leads. Check the current code and use any available previous-to-current delta before carrying forward findings or accepting fixes. If the historical delta is partial, assess the current head and its merge-base diff directly. A GitHub resolution is a discussion event, not proof of a code change.
     \\If the evidence is complete and no issue warrants withholding approval, report a clean review.
     \\Write one plain sentence for the summary, up to 300 bytes. In a finding, state the concrete failure and when it matters, then suggest the smallest fix if it is clear. Use plain sentences, avoid em dashes and hyphens as punctuation, and retain exact names and command flags. Skip praise, process narration, and repetition.
     \\Set complete=false if meaningful source or context is missing. Include coverage limits in the summary and never claim tests ran. Output one JSON object matching the schema, without Markdown fences.
@@ -594,7 +597,12 @@ pub fn registryMain(repo: Repo, pr: Pull) bool {
     return std.ascii.eqlIgnoreCase(repo.name, onchain.registry_repo) and eq(u8, pr.baseRefName, "main");
 }
 
-fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, discussion: Discussion, previous: ?[]const u8, last_review: ?ReviewRecord, prior_delta: []const u8, inherited: stack.Context, options: ReviewOptions) ![]const u8 {
+const PriorDelta = struct {
+    evidence: []const u8 = "",
+    coverage_reasons: []const []const u8 = &.{},
+};
+
+fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, discussion: Discussion, previous: ?[]const u8, last_review: ?ReviewRecord, prior_delta: PriorDelta, inherited: stack.Context, options: ReviewOptions) ![]const u8 {
     var rendered: std.ArrayList(u8) = .empty;
     const writer = rendered.writer(a);
     try writer.print("{s}\n{s}", .{ instructions, schema });
@@ -619,7 +627,8 @@ fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, discussion: Discussi
         .merge_base = snap.merge_base,
         .previous_review_commit = previous,
         .previous_review = last_review,
-        .previous_to_current_delta = prior_delta,
+        .previous_to_current_delta = prior_delta.evidence,
+        .historical_coverage_reasons = prior_delta.coverage_reasons,
         .coverage_limited = snap.limited,
         .coverage_reasons = snap.coverage_reasons,
         .github_checks = if (registryMain(repo, pr)) checks[0..@min(checks.len, 20)] else null,
@@ -1091,6 +1100,7 @@ pub const Prepared = struct {
     synthesis_provider: ?Engine = null,
     synthesis_summary: ?[]const u8 = null,
     additional_evidence_limited: bool = false,
+    historical_coverage_reasons: []const []const u8 = &.{},
     onchain_available: bool = false,
 };
 
@@ -1335,8 +1345,8 @@ pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?P
     if (pr.number != job.number or !isReady(pr) or !eq(u8, pr.headRefOid, job.head)) return error.TargetChanged;
     if (!validOid(pr.headRefOid) or !validOid(pr.baseRefOid)) return error.InvalidCommit;
     const inherited: stack.Context = if (supports_stacks) try adapter.stackContext(pr, dry) else .{};
-    var snap = try adapter.snapshot(pr);
     const discussion = try adapter.reviewDiscussion(pr.number);
+    var snap = try adapter.snapshot(pr, discussion.threads);
     if (discussion.comments.len > 6) try snap.markLimited(a, "PR conversation exceeded the excerpt budget");
     for (discussion.comments) |comment| {
         if (comment.truncated) try snap.markLimited(a, "A PR conversation comment was truncated");
@@ -1352,14 +1362,12 @@ pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?P
         return null;
     }
     const previous = if (job.last_review) |record| record.head else previousCommit(earlier_reviews orelse try adapter.reviews(pr.number), repo.login);
-    var prior_delta: []const u8 = "";
+    var prior_delta: PriorDelta = .{};
     if (@hasDecl(std.meta.Child(@TypeOf(adapter)), "supplement")) {
         if (previous) |commit| {
             if (!eq(u8, commit, pr.headRefOid)) {
                 const extra = try adapter.supplement(pr, commit, &.{});
-                prior_delta = extra.evidence;
-                if (extra.limited) snap.limited = true;
-                for (extra.coverage_reasons) |reason| try snap.markLimited(a, reason);
+                prior_delta = .{ .evidence = extra.evidence, .coverage_reasons = extra.coverage_reasons };
             }
         }
     }
@@ -1367,10 +1375,13 @@ pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?P
     try validateEngines(engines);
     var context = try reviewPrompt(a, repo, pr, snap, discussion, previous, job.last_review, prior_delta, inherited, options);
     const context_limit: usize = if (repo.routing_mode == .adaptive and options.allowRouting()) review_context_limit - 4096 else review_context_limit;
-    if (context.len > context_limit and prior_delta.len != 0) {
-        try snap.markLimited(a, "Previous to current delta exceeded the review context budget");
-        context = try reviewPrompt(a, repo, pr, snap, discussion, previous, job.last_review, "", inherited, options);
-        prior_delta = "";
+    if (context.len > context_limit and prior_delta.evidence.len != 0) {
+        prior_delta.evidence = "";
+        prior_delta.coverage_reasons = try std.mem.concat(a, []const u8, &.{
+            prior_delta.coverage_reasons,
+            &.{"Previous to current delta exceeded the review context budget"},
+        });
+        context = try reviewPrompt(a, repo, pr, snap, discussion, previous, job.last_review, prior_delta, inherited, options);
     }
     if (context.len > context_limit and snap.evidence.len != 0) {
         const remaining = snap.evidence.len -| (context.len - context_limit);
@@ -1390,6 +1401,7 @@ pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?P
         .options = options,
         .dry = dry,
         .review_input = review_input,
+        .historical_coverage_reasons = prior_delta.coverage_reasons,
         .onchain_available = registryMain(repo, pr) and repo.routing_mode == .adaptive and options.allowRouting(),
     };
 }
