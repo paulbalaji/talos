@@ -119,6 +119,7 @@ const Local = struct {
             .bin = try self.bin(.git),
             .gh = try self.bin(.gh),
             .object_cache = .{ .a = self.a, .root = db.dir, .repo = repo },
+            .github_calls = if (self.counts) |counts| &counts.github_commands else null,
         };
     }
 

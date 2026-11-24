@@ -16,6 +16,8 @@ const supplement_limit = 16 * 1024;
 const delta_limit = 12 * 1024;
 const excerpt_blob_limit = 128 * 1024;
 const excerpt_line_limit = 120;
+const registry_diff_limit = 16 * 1024;
+const registry_pin_path = ".registryrc";
 
 pub const Supplement = struct {
     evidence: []const u8 = "",
@@ -86,6 +88,7 @@ pub const Git = struct {
     bin: []const u8,
     gh: []const u8,
     object_cache: cache.Cache,
+    github_calls: ?*u32 = null,
 
     pub fn git(self: Git, path: []const u8, args: []const []const u8, input: []const u8) ![]const u8 {
         return self.gitWithin(path, args, input, 180);
@@ -220,7 +223,59 @@ pub const Git = struct {
                 route_bytes -= config.len + excerpt.len + 64;
             }
         }
+        if (std.ascii.eqlIgnoreCase(self.object_cache.repo.name, github.registry_pin_source)) {
+            try self.appendRegistryComparison(path, merge_base, pr.headRefOid, &evidence, &coverage);
+        }
         return .{ .merge_base = merge_base, .evidence = evidence.items, .limited = coverage.items.len != 0, .coverage_reasons = coverage.items };
+    }
+
+    fn registryPinBlob(self: Git, path: []const u8, commit: []const u8) !?[]const u8 {
+        return self.pinnedOid(path, commit, registry_pin_path) catch |err| switch (err) {
+            error.ExcerptMissing => null,
+            else => return err,
+        };
+    }
+
+    fn registryPins(self: Git, path: []const u8, merge_base: []const u8, head: []const u8) !?struct { before: []const u8, after: []const u8 } {
+        const old_blob = try self.registryPinBlob(path, merge_base);
+        const new_blob = try self.registryPinBlob(path, head);
+        if (old_blob == null and new_blob == null) return null;
+        const before_blob = old_blob orelse return error.RegistryPinMissing;
+        const after_blob = new_blob orelse return error.RegistryPinMissing;
+        if (eq(u8, before_blob, after_blob)) return null;
+        const before = io.trim(u8, try self.pinnedBlob(path, before_blob), " \t\r\n");
+        const after = io.trim(u8, try self.pinnedBlob(path, after_blob), " \t\r\n");
+        if (!core.validOid(before) or !core.validOid(after)) return error.InvalidRegistryPins;
+        return if (eq(u8, before, after)) null else .{ .before = before, .after = after };
+    }
+
+    fn appendRegistryComparison(self: Git, path: []const u8, merge_base: []const u8, head: []const u8, evidence: *std.ArrayList(u8), coverage: *std.ArrayList([]const u8)) !void {
+        const a = self.cmd.a;
+        const pins = (self.registryPins(path, merge_base, head) catch |err| {
+            const reason = switch (err) {
+                error.OutOfMemory => return err,
+                error.RegistryPinMissing => ".registryrc is missing on one side of the pin change.",
+                error.InvalidRegistryPins => "Registry pin comparison requires one full commit SHA in .registryrc on both sides of the change.",
+                error.DisallowedTreeEntry => ".registryrc must be a regular tracked file.",
+                else => "Could not read .registryrc at the pinned pull request commits.",
+            };
+            try coverage.append(a, reason);
+            return;
+        }) orelse return;
+        const client: github.Client = .{ .cmd = self.cmd, .gh = self.gh, .repo = self.object_cache.repo.name, .calls = self.github_calls };
+        const files = client.registryFiles(pins.before, pins.after) catch |err| {
+            const reason = switch (err) {
+                error.OutOfMemory, error.GitHubRateLimited => return err,
+                error.RegistryPinNotFastForward => "The new registry revision does not descend from the previous pin.",
+                error.RegistryCompareIncomplete => "GitHub omitted commits from the registry pin comparison.",
+                error.RegistryCompareMismatch => "GitHub did not confirm the exact registry pins.",
+                else => "The exact registry pin comparison was unavailable.",
+            };
+            try coverage.append(a, reason);
+            return;
+        };
+        try evidence.writer(a).print("\n\nPinned {s} dependency diff, {s} to {s} ({d} paths returned):\n", .{ onchain.registry_repo, pins.before, pins.after, files.len });
+        try appendRegistryFiles(a, evidence, coverage, files);
     }
 
     fn pin(self: Git, repo_dir: std.fs.Dir, path: []const u8, pr: core.Pull) !void {
@@ -435,6 +490,61 @@ pub const Git = struct {
     }
 };
 
+fn registryPatchComplete(file: github.File) bool {
+    const additions = file.additions orelse return false;
+    const deletions = file.deletions orelse return false;
+    const patch = file.patch orelse return eq(u8, file.status, "renamed") and file.previous_filename != null and additions == 0 and deletions == 0;
+    if (!std.mem.startsWith(u8, patch, "@@ -") or !std.unicode.utf8ValidateSlice(patch) or std.mem.indexOfScalar(u8, patch, 0) != null)
+        return false;
+    var lines = std.mem.splitScalar(u8, patch, '\n');
+    var added: u32 = 0;
+    var deleted: u32 = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        switch (line[0]) {
+            '+' => added +|= 1,
+            '-' => deleted +|= 1,
+            ' ', '@', '\\' => {},
+            else => return false,
+        }
+    }
+    return added == additions and deleted == deletions;
+}
+
+fn appendRegistryFiles(a: A, evidence: *std.ArrayList(u8), coverage: *std.ArrayList([]const u8), files: []const github.File) !void {
+    if (files.len >= github.registry_compare_file_limit) try coverage.append(a, "The registry pin comparison reached GitHub's changed file limit.");
+    const start = evidence.items.len;
+    var unavailable: usize = 0;
+    var omitted: usize = 0;
+    for (files) |file| {
+        const original = file.previous_filename orelse file.filename;
+        if (!core.validPath(file.filename) or !core.validPath(original) or sensitive(file.filename) or sensitive(original)) {
+            unavailable += 1;
+            continue;
+        }
+        if (evidence.items.len - start + file.filename.len + original.len + 4 > registry_diff_limit) {
+            omitted += 1;
+            continue;
+        }
+        const writer = evidence.writer(a);
+        if (!eq(u8, original, file.filename)) try writer.print("{s} -> ", .{original});
+        try writer.print("{s}\n", .{file.filename});
+        if (!registryPatchComplete(file)) {
+            unavailable += 1;
+            continue;
+        }
+        if (file.patch) |patch| {
+            if (evidence.items.len - start + patch.len + 1 > registry_diff_limit) {
+                omitted += 1;
+                continue;
+            }
+            try writer.print("{s}\n", .{patch});
+        }
+    }
+    if (unavailable != 0) try coverage.append(a, try io.fmt(a, "Registry changes unavailable, partial, or excluded for {d} path{s}.", .{ unavailable, if (unavailable == 1) "" else "s" }));
+    if (omitted != 0) try coverage.append(a, try io.fmt(a, "Registry changes exceeded the review byte limit for {d} path{s}.", .{ omitted, if (omitted == 1) "" else "s" }));
+}
+
 fn excerptOid(entry: []const u8, path: []const u8) ![]const u8 {
     if (entry.len == 0) return error.ExcerptMissing;
     const separator = std.mem.indexOfScalar(u8, entry, '\t') orelse return error.InvalidTreeEntry;
@@ -623,6 +733,39 @@ test "right-side anchors honor deletions, context, and truncated hunks" {
     try testing.expect(!anchor(&.{.{ .filename = ".env.local", .patch = "@@ -0,0 +1 @@\n+secret" }}, ".env.local", 1));
 }
 
+test "registry evidence retains exact text patches and withholds approval on omitted content" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const example = "@@ -1 +1 @@\n-old\n+new";
+    const input = [_]github.File{
+        .{ .filename = "chains/apechain/metadata.yaml", .patch = example, .additions = 1, .deletions = 1 },
+        .{ .filename = "chains/renamed.yaml", .status = "renamed", .previous_filename = "chains/old.yaml", .additions = 0, .deletions = 0 },
+        .{ .filename = "chains/partial.yaml", .patch = example, .additions = 2, .deletions = 1 },
+        .{ .filename = "chains/credentials.yaml", .status = "renamed", .previous_filename = ".env.local", .patch = "hidden" },
+        .{ .filename = "chains/missing.yaml", .additions = 1, .deletions = 1 },
+    };
+    var evidence: std.ArrayList(u8) = .empty;
+    var coverage: std.ArrayList([]const u8) = .empty;
+    try appendRegistryFiles(a, &evidence, &coverage, input[0..2]);
+    try t.expectEqualStrings("chains/apechain/metadata.yaml\n" ++ example ++ "\nchains/old.yaml -> chains/renamed.yaml\n", evidence.items);
+    try t.expectEqual(@as(usize, 0), coverage.items.len);
+    evidence.clearRetainingCapacity();
+    try appendRegistryFiles(a, &evidence, &coverage, input[2..]);
+    try t.expectEqualStrings("chains/partial.yaml\nchains/missing.yaml\n", evidence.items);
+    try t.expectEqualStrings("Registry changes unavailable, partial, or excluded for 3 paths.", coverage.items[0]);
+    const oversized = [_]github.File{.{
+        .filename = "big.yaml",
+        .patch = "@@ -0,0 +1 @@\n+" ++ "x" ** registry_diff_limit,
+        .additions = 1,
+        .deletions = 0,
+    }};
+    try appendRegistryFiles(a, &evidence, &coverage, &oversized);
+    try t.expect(evidence.items.len < registry_diff_limit);
+    try t.expectEqualStrings("Registry changes exceeded the review byte limit for 1 path.", coverage.items[1]);
+}
+
 test "batch blobs use size framing and reject mismatched responses" {
     const testing = std.testing;
     const oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -641,7 +784,7 @@ test "batch blobs use size framing and reject mismatched responses" {
     try testing.expectError(error.InvalidGitBatch, blobHeader(oid ++ " blob 1 extra"));
 }
 
-test "supplement reads a pinned caller and a previous-head delta and rejects invalid requests" {
+test "pinned source reads use the requested trees and reject invalid requests" {
     const t = std.testing;
     const bin = "/usr/bin/git";
     std.fs.accessAbsolute(bin, .{}) catch return error.SkipZigTest;
@@ -669,10 +812,13 @@ test "supplement reads a pinned caller and a previous-head delta and rejects inv
     _ = try git.cmd.run(&.{ bin, "init", "--bare", "--template=", path }, "", 10);
     const unchanged = io.trim(u8, try git.git(path, &.{ "hash-object", "-w", "--stdin" }, "skip\ncaller evidence\nskip too\n"), "\n");
     const secret = io.trim(u8, try git.git(path, &.{ "hash-object", "-w", "--stdin" }, "DO NOT PRESENT THIS VALUE"), "\n");
+    const old_pin = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const new_pin = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     var commits: [2][]const u8 = undefined;
-    for (&commits, [_][]const u8{ "old behavior\n", "new behavior\n" }) |*commit, content| {
+    for (&commits, [_][]const u8{ "old behavior\n", "new behavior\n" }, [_][]const u8{ old_pin ++ "\n", new_pin ++ "\n" }) |*commit, content, pin| {
         const blob = io.trim(u8, try git.git(path, &.{ "hash-object", "-w", "--stdin" }, content), "\n");
-        const input = try io.fmt(a, "100644 blob {s}\tcaller.zig\n100644 blob {s}\tchange.zig\n100644 blob {s}\t.env.local\n120000 blob {s}\tlinked.zig\n", .{ unchanged, blob, secret, secret });
+        const pin_blob = io.trim(u8, try git.git(path, &.{ "hash-object", "-w", "--stdin" }, pin), "\n");
+        const input = try io.fmt(a, "100644 blob {s}\tcaller.zig\n100644 blob {s}\tchange.zig\n100644 blob {s}\t.env.local\n120000 blob {s}\tlinked.zig\n100644 blob {s}\t.registryrc\n", .{ unchanged, blob, secret, secret, pin_blob });
         const tree = io.trim(u8, try git.git(path, &.{"mktree"}, input), "\n");
         commit.* = io.trim(u8, try git.git(path, &.{ "commit-tree", tree, "-m", "fixture" }, ""), "\n");
     }
@@ -692,6 +838,10 @@ test "supplement reads a pinned caller and a previous-head delta and rejects inv
     for ([_][]const u8{ "skip too", "DO NOT PRESENT", "over-budget.zig" }) |part| {
         try t.expect(std.mem.indexOf(u8, result.evidence, part) == null);
     }
+    const pins = (try git.registryPins(path, commits[0], commits[1])).?;
+    try t.expectEqualStrings(old_pin, pins.before);
+    try t.expectEqualStrings(new_pin, pins.after);
+    try t.expect((try git.registryPins(path, commits[1], commits[1])) == null);
 }
 
 test "source excerpts cap requested lines and preserve the last line without a newline" {
