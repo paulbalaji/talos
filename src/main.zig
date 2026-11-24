@@ -169,6 +169,23 @@ const Adapter = struct {
         return self.git_source.supplement(pr, previous, requests);
     }
 
+    fn reviewEvidence(self: *Adapter, pr: core.Pull, requests: []const core.EvidenceRequest, capacity: usize) !adaptive.PinnedEvidence {
+        if (capacity == 0) return .{ .limited = true };
+        const supplement_result = try self.supplement(pr, null, requests);
+        const clipped = capacity < supplement_result.evidence.len;
+        const prefix = supplement_result.evidence[0..core.safePrefix(supplement_result.evidence, capacity)];
+        const excerpt = if (clipped) prefix[0..(if (std.mem.lastIndexOfScalar(u8, prefix, '\n')) |index| index + 1 else 0)] else prefix;
+        var provided: std.ArrayList(core.EvidenceRequest) = .empty;
+        for (supplement_result.excerpts) |provided_excerpt| {
+            if (provided_excerpt.end_offset <= excerpt.len) try provided.append(self.db.a, provided_excerpt.request);
+        }
+        return .{
+            .source = excerpt,
+            .provided = provided.items,
+            .limited = supplement_result.limited or clipped,
+        };
+    }
+
     pub fn stackContext(self: *Adapter, pr: core.Pull, preview: bool) !stack.Context {
         const position = stack.find(self.entry.stacks, pr.number) orelse return .{};
         const item = self.entry.stacks[position.stack_index];
@@ -357,6 +374,22 @@ const ReviewBatch = struct {
 
     fn deferRepo(self: *ReviewBatch, index: usize) void {
         if (self.deferred_repo == null) self.deferred_repo = index;
+    }
+};
+
+const PreviewReviewer = struct {
+    adapter: *Adapter,
+
+    pub fn available(_: PreviewReviewer, _: core.Engine) bool {
+        return true;
+    }
+
+    pub fn starts(_: PreviewReviewer) u32 {
+        return 0;
+    }
+
+    pub fn routeReview(self: PreviewReviewer, engine: core.Engine, _: ?[]const u8, schema: []const u8, prompt: []const u8) ![]const u8 {
+        return invokeReviewer(self.adapter.tools, engine, reviewerProfile(self.adapter.repo, engine), schema, prompt);
     }
 };
 
@@ -775,7 +808,7 @@ const Main = struct {
         else
             try client.mergeBase(pull.baseRefOid, pull.headRefOid);
         const current = try core.ReviewInput.init(self.a, repo, pull, merge_base, discussion);
-        const legacy_changed = saved == null and job.receipt != null and
+        const legacy_changed = (saved == null or saved.?.material_discussion == null) and job.receipt != null and
             job.legacyDiscussionChanged(repo.login, discussion, try client.reviews(pull.number));
         job.observeReviewInput(current, legacy_changed, repo.approvals);
     }
@@ -1063,7 +1096,7 @@ const Main = struct {
             try self.db.save(state);
         }
         work.policy = state.queue_budget;
-        if (entry.repo.usesRouting()) {
+        {
             const fingerprint = try core.SavedAnalysis.key(self.a, entry.repo, work.prepared);
             var progress: core.RouteProgress = .{ .fingerprint = fingerprint, .base = .fromPull(work.prepared.pr) };
             if (job.route_progress) |saved| {
@@ -1073,7 +1106,7 @@ const Main = struct {
                 } else job.route_progress = null;
             }
             const automatically_routed = entry.repo.routing_mode != .fixed and work.prepared.options.allowRouting();
-            var screen: routing.Screen = if (automatically_routed)
+            var screen: routing.Screen = if (automatically_routed and (!work.prepared.snap.registry_logo_only or work.prepared.snap.limited))
                 routing.inspect(work.adapter.files, work.prepared.snap.limited)
             else
                 .{ .floor = .{}, .ask_model = false };
@@ -1092,16 +1125,9 @@ const Main = struct {
             var evidence: ?[]const u8 = null;
             var evidence_limited = false;
             if (progress.evidence_requests.len != 0) {
-                const capacity = adaptive.evidenceCapacity(work.prepared);
-                if (capacity == 0) {
-                    evidence = "";
-                    evidence_limited = true;
-                } else {
-                    const supplement = try work.adapter.supplement(work.prepared.pr, null, progress.evidence_requests);
-                    const excerpt = supplement.evidence[0..core.safePrefix(supplement.evidence, capacity)];
-                    evidence_limited = supplement.limited or excerpt.len < supplement.evidence.len;
-                    evidence = if (excerpt.len == supplement.evidence.len) excerpt else excerpt[0..(std.mem.lastIndexOfScalar(u8, excerpt, '\n') orelse 0)];
-                }
+                const pinned = try work.adapter.reviewEvidence(work.prepared.pr, progress.evidence_requests, adaptive.evidenceCapacity(work.prepared));
+                evidence = pinned.source;
+                evidence_limited = pinned.limited;
                 var hash = std.crypto.hash.sha2.Sha256.init(.{});
                 hash.update(evidence.?);
                 hash.update(&.{@intFromBool(evidence_limited)});
@@ -1110,9 +1136,20 @@ const Main = struct {
                     if (!eq(u8, &prior, &evidence_key)) {
                         progress.results = &.{};
                         progress.review_ms = 0;
+                        progress.initial_evidence_limited = false;
+                        progress.completion_requests = null;
+                        progress.completion_attempted = 0;
+                        progress.completion_done = 0;
                     }
                 }
                 progress.evidence_key = evidence_key;
+            }
+            var completion_evidence: ?adaptive.PinnedEvidence = null;
+            if (progress.completion_requests) |requests| {
+                if (requests.len != 0) {
+                    const capacity = try adaptive.completionCapacity(work.prepared, evidence orelse "", progress.onchain_observations orelse &.{}, self.a);
+                    completion_evidence = try work.adapter.reviewEvidence(work.prepared.pr, requests, capacity);
+                }
             }
             work.plan = .{
                 .repo = entry.repo,
@@ -1123,6 +1160,7 @@ const Main = struct {
                 .start_limit = queue.reviewerCost(entry.repo),
                 .evidence = evidence,
                 .evidence_limited = evidence_limited,
+                .completion_evidence = completion_evidence,
             };
         }
         if (!state.queue_budget.canReview(entry.repo, job.route_progress, std.time.timestamp(), batch.limited.load(.monotonic), batch.usageSnapshot()))
@@ -1151,7 +1189,9 @@ const Main = struct {
                 work.prepared.synthesis_provider = report.synthesis_provider;
                 work.prepared.synthesis_summary = outcome.synthesis_summary;
                 work.prepared.additional_evidence_limited = outcome.evidence_limited;
-                work.prepared.evidence_requests = outcome.progress.evidence_requests;
+                work.prepared.evidence_requests = try std.mem.concat(self.a, core.EvidenceRequest, &.{
+                    outcome.progress.evidence_requests, outcome.progress.completion_requests orelse &.{},
+                });
                 work.prepared.onchain_observations = report.onchain_observations;
                 work.job.route_report = report;
                 work.job.route_report.?.providers = try self.a.dupe(core.Engine, report.providers);
@@ -1295,16 +1335,45 @@ const Main = struct {
             var live = try self.adapter(entry, state, &gh_env);
             var prepared = (try core.prepare(self.a, &live, entry.repo, &job, .{ .preview = preview })).?;
             const observations = try live.previewReads(prepared);
-            prepared.additional_evidence_limited = try core.appendOnchain(self.a, &prepared.context, observations);
+            var context = prepared.context;
+            prepared.additional_evidence_limited = try core.appendOnchain(self.a, &context, observations);
             prepared.onchain_observations = observations;
-            const results = try core.analyze(self.a, &live, prepared.engines, prepared.context);
-            const payload = (try core.finish(self.a, &live, entry.repo, &job, prepared, results[0..prepared.engines.len])).?;
+            const results = try core.analyze(self.a, &live, prepared.engines, context);
+            const reviewed = try self.completePreview(&live, &prepared, results[0..prepared.engines.len]);
+            const payload = (try core.finish(self.a, &live, entry.repo, &job, prepared, reviewed)).?;
             if (observations.len == 0) {
                 try self.out("{s}\n", .{try io.json(self.a, .{ .repo = entry.repo.name, .pr = job.number, .review = payload })});
             } else {
                 try self.out("{s}\n", .{try io.json(self.a, .{ .repo = entry.repo.name, .pr = job.number, .review = payload, .onchain_observations = observations })});
             }
         }
+    }
+
+    fn completePreview(self: Main, adapter_: *Adapter, prepared: *core.Prepared, results: []const core.ReviewerResult) ![]const core.ReviewerResult {
+        const requests = try adaptive.completionRequests(self.a, results, &.{});
+        if (requests.len == 0) return results;
+        const capacity = try adaptive.completionCapacity(prepared.*, "", prepared.onchain_observations, self.a);
+        const evidence = try adapter_.reviewEvidence(prepared.pr, requests, capacity);
+        var repo = adapter_.repo;
+        repo.routing_mode = .fixed;
+        const preview = try adaptive.run(self.a, PreviewReviewer{ .adapter = adapter_ }, .{
+            .repo = repo,
+            .providers = prepared.engines,
+            .prepared = prepared.*,
+            .screen = .{ .floor = .{}, .ask_model = false },
+            .progress = .{
+                .fingerprint = @splat(0),
+                .screen_waiting = false,
+                .results = results,
+                .completion_requests = requests,
+                .onchain_observations = prepared.onchain_observations,
+            },
+            .start_limit = @intCast(results.len),
+            .completion_evidence = evidence,
+        });
+        prepared.additional_evidence_limited = prepared.additional_evidence_limited or preview.evidence_limited;
+        prepared.evidence_requests = requests;
+        return preview.progress.results;
     }
 
     fn status(self: Main, state: *store.State, args: []const []const u8) !void {

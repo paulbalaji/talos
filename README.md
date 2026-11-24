@@ -64,11 +64,13 @@ talos run-once OWNER/REPO 123 --mode security-maxxing
 
 Performance covers hot paths and scaling. Reliability covers partial failure, retries, and recovery. Security checks trust boundaries and mitigations from static source. With no mode, Talos runs the general review. Talos saves queued prompts locally and sends them to the configured reviewers. Keep credentials out of them. A review with a custom prompt stays local by default. Add `--publish` to allow its result to appear on GitHub when the repo allows comments. Review modes without a custom prompt follow the repo’s comment policy. Focused reviews publish as comments. Queue the same head again with no flags to retry with its saved options.
 
-After a review, Talos checks for new human replies, closed or reopened threads, and changes to the base branch or merge base. It checks up to four completed PRs per repo per scan. A rereview includes the previous verdict on individual findings and a bounded diff from the last reviewed commit when available. Talos keeps up to 16 notes for each tracked PR. The review receipt prevents a duplicate post after a restart.
+After a review, Talos checks for substantive PR conversation, human replies to review threads, closed or reopened threads, and changes to the base branch or merge base. A standalone “thanks” or “thank you” does not schedule a review or consume the conversation excerpt budget. Talos checks up to four completed PRs per repo per scan. A rereview includes the previous verdict on individual findings and starts with the bounded diff from the last reviewed commit when that delta is complete. Talos keeps up to 16 notes for each tracked PR. The review receipt prevents a duplicate post after a restart.
 
 Talos puts files with active review threads and risky code early in the bounded diff. It also reads pinned source around current right-side thread anchors. Incomplete current evidence and unassessed open threads prevent approval. Reviewers can still approve when the current head is fully covered and the only gap is a clipped historical delta.
 
 If a rereview finds an issue after an approval, its comment flags the earlier approval for a person to reassess. On upgrade, Talos uses newer human replies to catch up completed reviews. It tracks resolution changes from the first successful scan.
+
+Rereviews update the local verdict. Talos posts new actionable findings, an approval for a commit that does not already have one from the configured GitHub account, or a warning when an earlier approval needs reassessing. See summaries and coverage details in `talos result`. A custom review with `--publish` can post its requested summary.
 
 `talos status OWNER/REPO` shows up to five completed jobs still tracked and links to verified GitHub reviews. `talos result OWNER/REPO 123` prints the last saved local candidate and up to seven previous verdict explanations, including after the PR closes. The explanation records the head and base, reviewer-specific gaps, requested evidence, approval blockers, and the GitHub review ID after readback. Older local candidates keep their original JSON fields. A review reconciled from GitHub can have a receipt without a local candidate.
 
@@ -122,11 +124,13 @@ talos --home "$trial_state" status OWNER/REPO --json
 
 Shadow runs the configured full review and records the suggested route, per-pass timings, and finding-anchor differences. Compare those results against the actual changes before enabling adaptive routing. Matching anchors are a rough comparison. Check the findings themselves for missed defects and incorrect escalations.
 
+On registry `main`, a complete change that only replaces existing passive chain and Warp route logos can take a regular review. Talos checks the pinned old and new SVGs and permits one registry patch changeset. The reviewer checks geometry, padding, and variants alongside the review threads.
+
 Adaptive routing uses four levels.
 
 | Level | Review |
 | --- | --- |
-| Light | One lightweight review of a complete, narrowly mechanical image patch bump. Any finding, unclear discussion, or missing evidence sends it to full review. A light review can post a comment. |
+| Light | One lightweight review of a complete, narrowly mechanical image patch bump. Talos saves a clean light review locally. Any finding, unclear discussion, or missing evidence sends it to full review. |
 | Regular | The configured reviewer or reviewer group. |
 | Focused | The regular reviewers receive the relevant performance, reliability, or defensive security prompts. |
 | Multi | At least two providers with distinct briefs. A synthesis pass checks reported issues against the source and combines duplicates. Talos waits if the provider pool cannot supply both reviewers. |
@@ -159,6 +163,10 @@ Configure a [lightweight model](#route-reviews-by-risk) to enable these requests
 ### Review registry pin changes
 
 When a PR in `hyperlane-xyz/hyperlane-monorepo` changes `.registryrc`, Talos reads the old and new pins from the PR merge base and head. It adds a bounded GitHub comparison from `hyperlane-xyz/hyperlane-registry`, so reviewers can see the intended metadata update and other changes pulled in by the same bump. Talos withholds automatic approval when the pins diverge or comparison evidence is incomplete.
+
+### Review relayer image pins
+
+For PRs targeting `hyperlane-xyz/hyperlane-monorepo` main, Talos recognizes relayer image tags of the form `abcdef0-20261124-185322` in `typescript/infra/config/docker.ts`. It reads the pinned deployment selectors, hashes the public GHCR manifests, and matches each tagged digest to a successful main build log for the exact source commit. The prompt includes a bounded diff of the image build inputs, with bundled runtime configuration first. These read-only observations describe the tags at review time. Missing build records or incomplete source comparisons withhold automatic approval.
 
 ### Configure each repo
 
@@ -196,9 +204,11 @@ Talos requests standard serving speed in Codex and disables Claude's fast mode. 
 
 Fable receives the review context when Claude consults it. It requires Fable access and can use usage credits. Set `--claude-advisor off` on a repo to disable it. If your Kimi plan lacks K3.1 Pro, select an available model with `--reviewer-model kimi=MODEL`. [Claude advisor](https://code.claude.com/docs/en/advisor) · [Kimi models](https://www.kimi.com/code/docs/en/kimi-code/models.html)
 
-Each reviewer in a list gets the same pinned source and discussion. Talos runs them in order, groups findings at the same diff line, and sends one review with reviewer attribution. A failed reviewer retries the job. Choose providers that can receive the repo's source and discussion.
+Each reviewer in a list starts with the same pinned source and discussion. Talos runs them in order, groups findings at the same diff line, and sends one review. Choose providers that can receive the repo's source and discussion.
 
-`--comments` allows publishing a comment review. `--approvals` requires complete coverage and no findings from every configured reviewer. Talos can approve while CI is running. GitHub enforces required checks, merge conflicts, and conversation resolution when merging. Each reviewer must give an evidence-based reason why each open thread is non-blocking. Any active finding or unassessed thread blocks approval. The author must differ from the configured GitHub identity. A clean candidate can become a comment when only comments are enabled.
+Full reviewers can request specific missing source. Talos fetches one shared batch of up to six tracked paths at the pinned head and retries only the affected reviewers. Missing source or exhausted provider budget preserves the existing findings and coverage limits.
+
+`--comments` allows publishing new findings and warnings about earlier approvals. `--approvals` requires complete coverage and no findings from every configured reviewer. Talos can approve while CI is running. GitHub enforces required checks, merge conflicts, and conversation resolution when merging. Each reviewer must give an evidence-based reason why each open thread is non-blocking. Any active finding or unassessed thread blocks approval. The author must differ from the configured GitHub identity.
 
 ### macOS build fallback
 
@@ -233,7 +243,7 @@ flowchart TD
 
 Talos pins the PR head and base, computes their merge base, and sends bounded source and review threads to the reviewer. The context includes resolved threads and author replies. Repo content and GitHub discussion are untrusted input. Each reviewer runs in a temporary directory with local tools disabled. Codex also uses its read-only sandbox. Use provider accounts approved to receive that repo's source and discussion. Kimi Code may retain its own sessions.
 
-Talos publishes one short review with concrete findings inline and links to existing threads that still matter. It checks the head, base, and discussion before publication and reads back the review and posted inline locations. Partial coverage rules out automatic approval. The review names any material evidence gaps or checks holding up approval.
+Talos publishes new findings inline or in the review body when GitHub lacks an anchor. It checks the head, base, and discussion before publication and reads back the review and posted inline locations. Missing current source, incomplete reviewer coverage, and truncated open threads can block approval. Talos records the verdict and coverage details locally, including when replies on resolved threads were clipped.
 
 ## Operate Talos
 

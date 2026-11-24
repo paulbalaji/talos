@@ -4,6 +4,7 @@
   "required": [
     "complete",
     "coverage_gaps",
+    "evidence_requests",
     "summary",
     "findings",
     "existing_open_findings",
@@ -16,6 +17,19 @@
     "coverage_gaps": {
       "type": "array",
       "items": { "type": "string" }
+    },
+    "evidence_requests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "start_line", "end_line"],
+        "properties": {
+          "path": { "type": "string" },
+          "start_line": { "type": ["integer", "null"] },
+          "end_line": { "type": ["integer", "null"] }
+        }
+      }
     },
     "summary": {
       "type": "string"
