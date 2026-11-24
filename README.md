@@ -86,7 +86,7 @@ talos followup "$thread" --merge-when-ready
 
 The scheduler waits for the original PR to merge, then checks the finding against the current target branch. If it can make a small fix, Talos pushes a branch and opens a draft linked to the thread. It reuses the same draft on retry. The command grants permission to open that draft, including in a repo whose reviews stay local. The dry run prints the proposed replacement and skips the branch and draft.
 
-Talos uses the configured reviewer CLIs to propose changes to the file named in the thread. It can read up to three more source files from the pinned commit for context. It applies the replacement in an isolated Git index and leaves code execution to GitHub CI. Followups share the review budget and respect repo pauses.
+Talos uses the configured reviewer CLIs to propose changes to the file named in the thread. It can read up to three more source files from the pinned commit, within 24 KiB of extra context. It applies the replacement in an isolated Git index and leaves code execution to GitHub CI. Followups share the review budget and respect repo pauses.
 
 Talos watches the draft from creation. It verifies feedback on the current head, pushes up to three scoped updates, and marks the draft ready when GitHub checks pass. Feedback outside the original fix and changes from another author can require a human decision. Use `talos followup status --json` for the tracked head and state.
 

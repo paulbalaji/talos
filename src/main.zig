@@ -501,14 +501,18 @@ const FollowupService = struct {
         try self.work.fetch(branch, parent);
         const file = try self.work.read(parent, job.path);
         var evidence: std.ArrayList(followup.Evidence) = .empty;
+        var remaining: usize = 24 * 1024;
         for (job.evidence_paths[0..@min(job.evidence_paths.len, 3)]) |path| {
             var item: followup.Evidence = .{ .path = path, .text = null };
-            if (self.work.read(parent, path)) |extra| {
-                const length = core.safePrefix(extra.text, 8 * 1024);
-                item.text = extra.text[0..length];
-                item.clipped = length < extra.text.len;
-            } else |err| {
-                if (err == error.OutOfMemory) return err;
+            if (remaining != 0) {
+                if (self.work.read(parent, path)) |extra| {
+                    const length = core.safePrefix(extra.text, remaining);
+                    item.text = extra.text[0..length];
+                    item.clipped = length < extra.text.len;
+                    remaining -= length;
+                } else |err| {
+                    if (err == error.OutOfMemory) return err;
+                }
             }
             try evidence.append(a, item);
         }
