@@ -59,10 +59,11 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "reason"],
+        "required": ["id", "reason", "disposition"],
         "properties": {
           "id": { "type": "string" },
-          "reason": { "type": "string" }
+          "reason": { "type": "string" },
+          "disposition": { "type": "string", "enum": ["fixed", "rebutted", "nit", "deferred"] }
         }
       }
     }

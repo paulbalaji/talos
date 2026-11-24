@@ -69,7 +69,7 @@ const excluded_paths = specs: {
     break :specs result;
 };
 
-fn sensitive(path: []const u8) bool {
+pub fn sensitive(path: []const u8) bool {
     const name = std.fs.path.basename(path);
     for (sensitive_names) |rule| if (rule.matches(name)) return true;
     return false;
@@ -86,7 +86,7 @@ pub const Git = struct {
     gh: []const u8,
     object_cache: cache.Cache,
 
-    fn git(self: Git, path: []const u8, args: []const []const u8, input: []const u8) ![]const u8 {
+    pub fn git(self: Git, path: []const u8, args: []const []const u8, input: []const u8) ![]const u8 {
         return self.gitWithin(path, args, input, 180);
     }
 

@@ -34,6 +34,10 @@ talos status                          # See scans, queue, errors, and cache size
 | Queue a specific PR under the repo's publication policy | `talos queue OWNER/REPO 123` |
 | Queue a review with a focus | `talos queue OWNER/REPO 123 --mode perf-maxxing --prompt 'Check allocations on the request path.' --publish` |
 | Read the latest local review candidate for a PR | `talos result OWNER/REPO 123` |
+| Open a draft for a deferred finding | `talos followup THREAD_URL` |
+| Preview a followup | `talos followup THREAD_URL --dry-run` |
+| Track drafts and merge readiness | `talos followup status` |
+| Pause or resume a followup | `talos followup pause THREAD_URL` or `talos followup resume THREAD_URL` |
 | Queue a numbered GitHub stack | `talos stack OWNER/REPO 10088` |
 | Queue branches as an explicit stack | `talos stack OWNER/REPO feature 123 124 125` |
 | Remove an explicit local stack definition | `talos unstack OWNER/REPO feature` |
@@ -67,6 +71,26 @@ When approvals are enabled and CI is the only reason Talos withheld approval, pa
 If a rereview finds an issue after an approval, its comment flags the earlier approval for a person to reassess. On upgrade, Talos uses newer human replies to catch up completed reviews. It tracks resolution changes from the first successful scan.
 
 `talos status OWNER/REPO` shows up to five completed jobs still tracked and links to verified GitHub reviews. `talos result OWNER/REPO 123` prints the last saved local candidate, including its reviewed commit. A review reconciled from GitHub can have a receipt without a local candidate.
+
+### Follow up on a deferred finding
+
+Copy the link to an inline review comment in a registered repo.
+
+```sh
+thread='https://github.com/OWNER/REPO/pull/123#discussion_r456'
+talos followup "$thread" --dry-run
+talos followup "$thread"
+talos followup status
+talos followup "$thread" --merge-when-ready
+```
+
+The scheduler waits for the original PR to merge, then checks the finding against the current target branch. If it can make a small fix, Talos pushes a branch and opens a draft linked to the thread. It reuses the same draft on retry. The command grants permission to open that draft, including in a repo whose reviews stay local. The dry run prints the proposed replacement and skips the branch and draft.
+
+Talos uses the configured reviewer CLIs to propose changes to the file named in the thread. It can read up to three more source files from the pinned commit, within 24 KiB of extra context. It applies the replacement in an isolated Git index and leaves code execution to GitHub CI. Followups share the review budget and respect repo pauses.
+
+Talos watches the draft from creation. It verifies feedback on the current head, pushes up to three scoped updates, and marks the draft ready when GitHub checks pass. Feedback outside the original fix and changes from another author can require a human decision. Use `talos followup status --json` for the tracked head and state.
+
+With `--merge-when-ready`, Talos submits the current head for normal GitHub merge after an independent approval and passing checks. The same flag also opts in an existing followup. Use the thread link shown by `status` to pause or resume. Pausing a followup stops Talos actions. GitHub handles any merge already submitted.
 
 ### Review a PR stack
 
