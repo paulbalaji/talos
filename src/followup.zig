@@ -67,6 +67,7 @@ pub const Job = struct {
     feedback: ?[32]u8 = null,
     updates: u8 = 0,
     evidence_paths: []const []const u8 = &.{},
+    evidence_head: ?[]const u8 = null,
     next: i64 = 0,
     attempts: u8 = 0,
     note: []const u8 = "",
@@ -203,12 +204,22 @@ fn hold(job: *Job, note: []const u8) void {
     job.note = note;
 }
 
-fn requestSource(job: *Job, proposal_value: Proposal) void {
+pub fn clearEvidence(job: *Job) void {
+    job.evidence_paths = &.{};
+    job.evidence_head = null;
+}
+
+fn checkEvidence(job: *Job, head: []const u8) void {
+    if (job.evidence_head == null or !eq(u8, job.evidence_head.?, head)) clearEvidence(job);
+}
+
+fn requestSource(job: *Job, head: []const u8, proposal_value: Proposal) void {
     if (job.evidence_paths.len != 0) {
         hold(job, "The requested source did not provide enough evidence.");
         return;
     }
     job.evidence_paths = proposal_value.evidence_paths;
+    job.evidence_head = head;
     job.note = "Queued additional source for the followup.";
 }
 
@@ -221,7 +232,7 @@ fn reconcilePush(service: anytype, job: *Job, remote: ?[]const u8) !bool {
                 job.feedback = key;
                 job.updates += 1;
             }
-            job.evidence_paths = &.{};
+            clearEvidence(job);
             job.pending = null;
             try service.persist();
             return true;
@@ -281,7 +292,13 @@ pub fn advance(a: A, service: anytype, job: *Job) !void {
             return;
         }
         if (!eq(u8, draft.pull.headRefOid, job.head.?)) return error.FollowupDraftHeadPending;
-        if (previous_stage == .queued_to_merge) return;
+        if (previous_stage == .queued_to_merge) {
+            if (try service.mergeActive(draft.pull.number)) return;
+            job.stage = .ready;
+            job.paused = true;
+            job.note = "GitHub no longer has this merge queued. Resume to recheck it.";
+            return;
+        }
         if (previous_stage == .ready and draft.pull.isDraft) {
             job.stage = .draft;
             job.paused = true;
@@ -301,10 +318,11 @@ pub fn advance(a: A, service: anytype, job: *Job) !void {
         }
         if (previous_stage == .needs_input) return;
         const base = try service.baseHead(job.*);
+        checkEvidence(job, base);
         const update = try service.prepare(job.*, origin, base, "");
         switch (update.change.action) {
             .request_source => {
-                requestSource(job, update.change);
+                requestSource(job, base, update.change);
                 return;
             },
             .obsolete => {
@@ -347,10 +365,11 @@ fn shepherd(service: anytype, job: *Job, origin: core.Pull, pull: core.Pull) !vo
             hold(job, "Three feedback updates are complete. Further changes need a human.");
             return;
         }
+        checkEvidence(job, job.head.?);
         const update = try service.prepare(job.*, origin, job.head.?, feedback.text);
         switch (update.change.action) {
             .request_source => {
-                requestSource(job, update.change);
+                requestSource(job, job.head.?, update.change);
                 return;
             },
             .fix => {
@@ -360,14 +379,14 @@ fn shepherd(service: anytype, job: *Job, origin: core.Pull, pull: core.Pull) !vo
                 return;
             },
             .needs_input => {
-                job.evidence_paths = &.{};
+                clearEvidence(job);
                 job.feedback = feedback.key;
                 hold(job, update.change.note);
                 return;
             },
             .no_change, .obsolete => {
                 job.feedback = feedback.key;
-                job.evidence_paths = &.{};
+                clearEvidence(job);
             },
         }
     } else if (job.stage == .needs_input) return;
@@ -419,7 +438,7 @@ pub fn collectFeedback(a: A, job: Job, pull: core.Pull, reviews: []const core.Pr
             result.approved = result.approved or (approved and member(review.author_association));
             blocking = blocking or changes;
         }
-        if (!changes and !eq(u8, review.state, "COMMENTED")) continue;
+        if (!approved and !changes and !eq(u8, review.state, "COMMENTED")) continue;
         const body = io.trim(u8, review.body orelse "", " \n\r\t");
         if (body.len == 0) continue;
         if (!member(review.author_association) or body.len > 1800 or messages.items.len == 8) {
@@ -543,6 +562,10 @@ const TestService = struct {
         self.merges += 1;
         self.merge_done = true;
     }
+
+    pub fn mergeActive(_: *TestService, _: u32) !bool {
+        return false;
+    }
 };
 
 fn testJob() !Job {
@@ -610,6 +633,33 @@ test "an existing branch without a receipt cannot be overwritten or adopted" {
     try t.expectEqual(@as(u32, 0), service.creations);
 }
 
+test "a canceled merge pauses the followup without resubmitting it" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var job = try testJob();
+    job.stage = .queued_to_merge;
+    job.merge = true;
+    job.pr = 43;
+    job.head = first_head;
+    var service: TestService = .{ .a = a, .merged_source = true, .created = true, .remote_head = first_head, .draft_open = false };
+    try advance(a, &service, &job);
+    try t.expectEqual(Stage.ready, job.stage);
+    try t.expect(job.paused);
+    try t.expectEqual(@as(u32, 0), service.merges);
+}
+
+test "a new parent invalidates the old source request" {
+    var job = try testJob();
+    job.evidence_head = base_head;
+    job.evidence_paths = &.{"src/old.zig"};
+    checkEvidence(&job, base_head);
+    try t.expectEqual(@as(usize, 1), job.evidence_paths.len);
+    checkEvidence(&job, first_head);
+    try t.expect(job.evidence_head == null);
+    try t.expectEqual(@as(usize, 0), job.evidence_paths.len);
+}
+
 test "a reply URL identifies the root thread and edits apply once" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
@@ -651,6 +701,11 @@ test "feedback uses the latest exact head and holds comments on another path" {
     const result = try collectFeedback(a, job, pr, reviews, .{});
     try t.expect(!result.approved and !result.needs_human);
     try t.expectEqualStrings("[\"Keep retry state when persistence fails.\"]", result.text);
+    var approval = reviews[2];
+    approval.state = "APPROVED";
+    const approved = try collectFeedback(a, job, pr, &.{approval}, .{});
+    try t.expect(approved.approved);
+    try t.expectEqualStrings(result.text, approved.text);
 
     const wrong_file: core.Thread = .{
         .id = "inline",

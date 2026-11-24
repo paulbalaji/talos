@@ -167,6 +167,27 @@ pub const Client = struct {
             return transportFailure(err, error.FollowupMergeUnconfirmed);
     }
 
+    pub fn followupMergeActive(self: Client, number: u32) !bool {
+        const query =
+            \\query($owner:String!, $name:String!, $number:Int!) {
+            \\  repository(owner:$owner, name:$name) {
+            \\    pullRequest(number:$number) { number autoMergeRequest { enabledAt } mergeQueueEntry { id } }
+            \\  }
+            \\}
+        ;
+        const a = self.cmd.a;
+        const fields = (try self.repoFields()) ++ [_][]const u8{ "-F", try io.fmt(a, "number={d}", .{number}) };
+        const Data = struct { repository: struct { pullRequest: struct {
+            number: u32,
+            autoMergeRequest: ?struct { enabledAt: []const u8 },
+            mergeQueueEntry: ?struct { id: []const u8 },
+        } } };
+        const data = try self.graph(Data, query, &fields, null);
+        const result = data.repository.pullRequest;
+        if (result.number != number) return error.GitHubTargetMismatch;
+        return result.autoMergeRequest != null or result.mergeQueueEntry != null;
+    }
+
     pub fn stackPulls(self: Client, numbers: []const u32) ![]stack.Pin {
         if (numbers.len == 0) return &.{};
         const a = self.cmd.a;

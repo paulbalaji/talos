@@ -5,6 +5,7 @@ const source = @import("source.zig");
 const io = @import("io.zig");
 const A = io.A;
 const eq = io.eq;
+const file_limit = 48 * 1024;
 
 pub fn allowed(path: []const u8) bool {
     if (!core.validPath(path) or source.sensitive(path)) return false;
@@ -85,7 +86,7 @@ pub const Work = struct {
         if (!core.validOid(oid) or meta.next() != null) return error.FollowupPathDisallowed;
         const size_text = try self.call(&.{ "cat-file", "-s", oid }, "");
         const size = try std.fmt.parseUnsigned(usize, io.trim(u8, size_text, "\r\n"), 10);
-        if (size > 48 * 1024) return error.FollowupContextLimit;
+        if (size > file_limit) return error.FollowupContextLimit;
         const text = try self.call(&.{ "cat-file", "blob", oid }, "");
         if (text.len != size or !std.unicode.utf8ValidateSlice(text) or std.mem.indexOfScalar(u8, text, 0) != null)
             return error.FollowupPathDisallowed;
@@ -93,6 +94,7 @@ pub const Work = struct {
     }
 
     pub fn commit(self: *Work, job: followup.Job, parent: []const u8, mode: []const u8, new_content: []const u8, title: []const u8) ![]const u8 {
+        if (new_content.len > file_limit) return error.FollowupContextLimit;
         const a = self.git.cmd.a;
         _ = try self.call(&.{ "read-tree", parent }, "");
         const blob_text = try self.call(&.{ "hash-object", "-w", "--stdin" }, new_content);
@@ -164,6 +166,8 @@ test "authoring an exact replacement changes one file in a bare Git tree" {
     try t.expectEqualStrings("var retries = 0;\n", file.text);
     try t.expectError(error.FollowupPathDisallowed, work.read(parent, "src/link.zig"));
     try t.expectError(error.FollowupPathDisallowed, work.read(parent, ".github/workflows/retry.js"));
+    const too_large = try a.alloc(u8, file_limit + 1);
+    try t.expectError(error.FollowupContextLimit, work.commit(job, parent, file.mode, too_large, "fix: oversized edit"));
     const head = try work.commit(job, parent, file.mode, "var retries = 1;\n", "fix: keep one retry");
     try t.expectEqualStrings("var retries = 1;\n", (try work.read(head, job.path)).text);
     const actual_parent = try work.call(&.{ "rev-parse", try io.fmt(a, "{s}^", .{head}) }, "");

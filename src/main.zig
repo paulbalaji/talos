@@ -522,7 +522,16 @@ const FollowupService = struct {
         if (change.action != .fix) return .{ .head = parent, .change = change };
         const revised = try followup.edit(a, file.text, change);
         const title = if (feedback_run) "fix: address followup review feedback" else try io.fmt(a, "fix: {s}", .{change.title});
-        const head = try self.work.commit(job, parent, file.mode, revised, title);
+        const head = self.work.commit(job, parent, file.mode, revised, title) catch |err| switch (err) {
+            error.FollowupContextLimit => return .{ .head = parent, .change = .{
+                .action = .needs_input,
+                .title = "",
+                .note = "The edited file would exceed the followup size limit.",
+                .before = "",
+                .after = "",
+            } },
+            else => return err,
+        };
         return .{ .head = head, .change = change };
     }
 
@@ -574,6 +583,10 @@ const FollowupService = struct {
         const latest = try self.verifiedDraft(job);
         if (latest.isDraft or !core.checksPassed(latest) or !eq(u8, latest.baseRefOid, pull.baseRefOid)) return error.FollowupChecksChanged;
         try self.client.mergeFollowup(latest.number, latest.headRefOid);
+    }
+
+    pub fn mergeActive(self: *FollowupService, number: u32) !bool {
+        return self.client.followupMergeActive(number);
     }
 };
 
@@ -827,7 +840,7 @@ const Main = struct {
                 job.next = 0;
                 if (job.stage == .needs_input and job.pr == null) {
                     job.stage = .waiting;
-                    job.evidence_paths = &.{};
+                    followup.clearEvidence(job);
                 }
             }
             try self.db.save(state);
@@ -854,6 +867,7 @@ const Main = struct {
             var prepared = try service.prepare(job, source_pr, parent, "");
             if (prepared.change.action == .request_source) {
                 job.evidence_paths = prepared.change.evidence_paths;
+                job.evidence_head = parent;
                 prepared = try service.prepare(job, source_pr, parent, "");
             }
             return self.out("{s}\n", .{try io.json(self.a, .{ .path = job.path, .base = parent, .proposal = prepared.change })});
