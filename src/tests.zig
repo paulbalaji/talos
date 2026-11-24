@@ -37,6 +37,7 @@ const Fake = struct {
     late_comments: ?[]const core.Reply = null,
     snapshot_threads: []const core.Thread = &.{},
     source_limited: bool = false,
+    optional_source: []const u8 = "",
     previous_delta: []const u8 = "",
     historical_coverage_reasons: []const []const u8 = &.{},
     thread_reads: usize = 0,
@@ -80,7 +81,13 @@ const Fake = struct {
 
     pub fn snapshot(self: *Fake, _: core.Pull, threads: []const core.Thread) !core.Snapshot {
         self.snapshot_threads = threads;
-        return .{ .merge_base = base, .evidence = "Diff in src/watch.rs", .limited = self.source_limited };
+        const required = "Diff in src/watch.rs";
+        return .{
+            .merge_base = base,
+            .evidence = if (self.optional_source.len == 0) required else try std.mem.concat(self.a, u8, &.{ required, self.optional_source }),
+            .limited = self.source_limited,
+            .optional_evidence_start = if (self.optional_source.len == 0) null else required.len,
+        };
     }
 
     pub fn supplement(self: *Fake, _: core.Pull, _: ?[]const u8, _: []const core.EvidenceRequest) !struct {
@@ -416,6 +423,21 @@ test "coverage-only rereviews and findings already on an open thread stay local"
     try t.expectEqual(.open_findings, quiet.explanation.?.blockers[0]);
     try t.expectEqual(@as(usize, 0), quiet.comments.len);
     try t.expectEqual(@as(usize, 0), fake.posts);
+}
+
+test "dropping optional image patch excerpts does not veto a covered approval" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const extra = try a.alloc(u8, core.review_context_limit);
+    @memset(extra, 'Z');
+    var fake: Fake = .{ .a = a, .optional_source = extra, .result = clean };
+    var job: core.Job = .{ .number = 42, .head = head };
+    const review = (try core.run(a, &fake, repo, &job, .{ .preview = .{} })).?;
+    try t.expectEqual(.APPROVE, review.event);
+    try t.expect(review.explanation.?.coverage.complete);
+    try t.expect(std.mem.indexOf(u8, fake.prompt_text, "Diff in src/watch.rs") != null);
+    try t.expect(std.mem.indexOf(u8, fake.prompt_text, "ZZZZ") == null);
 }
 
 test "a same-head approval and its warning are not posted twice" {
