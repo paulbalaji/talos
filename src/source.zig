@@ -26,6 +26,8 @@ const registry_diff_limit = 16 * 1024;
 const registry_pin_path = ".registryrc";
 const agent_image_diff_limit = 16 * 1024;
 const agent_image_inventory_limit = 24 * 1024;
+const AgentEvidence = struct { promotion: bool = false, optional_start: ?usize = null };
+const AgentPromotion = struct { tag: []const u8, commit: []const u8, previous: []const u8 };
 const agent_image_diff_paths = [_][]const u8{ ".dockerignore", ".github/workflows/rust-docker.yml", "rust/Dockerfile", "rust/main", "rust/sealevel" };
 const agent_image_diff_order =
     \\.github/workflows/rust-docker.yml
@@ -287,18 +289,18 @@ pub const Git = struct {
                 route_bytes -= config.len + excerpt.len + 64;
             }
         }
-        var optional_evidence_start: ?usize = null;
+        var image: AgentEvidence = .{};
         if (std.ascii.eqlIgnoreCase(self.object_cache.repo.name, github.registry_pin_source)) {
             try self.appendRegistryComparison(path, merge_base, pr.headRefOid, &evidence, &coverage);
             if (eq(u8, pr.baseRefName, "main")) {
                 for (files) |file| {
                     if (!eq(u8, file.filename, agent_image.pin_path) or !eq(u8, file.status, "modified")) continue;
-                    optional_evidence_start = try self.appendAgentImages(path, merge_base, pr.headRefOid, &evidence, &coverage);
+                    image = try self.appendAgentImages(path, pr, merge_base, files.len == 1, &evidence, &coverage);
                     break;
                 }
             }
         }
-        return .{ .merge_base = merge_base, .evidence = evidence.items, .limited = coverage.items.len != 0, .coverage_reasons = coverage.items, .registry_logo_only = logo_only, .optional_evidence_start = optional_evidence_start };
+        return .{ .merge_base = merge_base, .evidence = evidence.items, .limited = coverage.items.len != 0, .coverage_reasons = coverage.items, .registry_logo_only = logo_only, .relayer_promotion = image.promotion, .optional_evidence_start = image.optional_start };
     }
 
     fn appendStaticRegistryLogos(self: Git, path: []const u8, base: []const u8, head: []const u8, files: []const github.File, evidence: *std.ArrayList(u8), remaining: usize) !bool {
@@ -381,23 +383,28 @@ pub const Git = struct {
         try appendRegistryFiles(a, evidence, coverage, files);
     }
 
-    fn readAgentPins(self: Git, path: []const u8, commit: []const u8) !agent_image.Pins {
-        const blob = try self.pinnedBlob(path, try self.pinnedOid(path, commit, agent_image.pin_path));
-        return agent_image.pins(blob) orelse error.UnrecognizedAgentImagePins;
+    fn readAgentPinFile(self: Git, path: []const u8, commit: []const u8) ![]const u8 {
+        return self.pinnedBlob(path, try self.pinnedOid(path, commit, agent_image.pin_path));
     }
 
-    fn appendAgentImages(self: Git, path: []const u8, base: []const u8, head: []const u8, evidence: *std.ArrayList(u8), coverage: *std.ArrayList([]const u8)) !?usize {
+    fn appendAgentImages(self: Git, path: []const u8, pr: core.Pull, base: []const u8, single_file: bool, evidence: *std.ArrayList(u8), coverage: *std.ArrayList([]const u8)) !AgentEvidence {
         const a = self.cmd.a;
-        const before = self.readAgentPins(path, base) catch |err| switch (err) {
+        const before_file = self.readAgentPinFile(path, base) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            else => return null,
+            else => return .{},
         };
-        const after = self.readAgentPins(path, head) catch |err| switch (err) {
+        const after_file = self.readAgentPinFile(path, pr.headRefOid) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            else => return null,
+            else => return .{},
         };
+        const before = agent_image.pins(before_file) orelse return .{};
+        const after = agent_image.pins(after_file) orelse return .{};
+        const target = if (single_file) agent_image.promotionTag(before_file, after_file, before, after) else null;
+        const promotion = if (target) |tag| try self.agentPromotion(path, pr, base, before, after, tag) else null;
         var tags: std.ArrayList([]const u8) = .empty;
-        for (before, after) |old, new| {
+        if (promotion) |rollout| {
+            try tags.append(a, rollout.tag);
+        } else for (before, after) |old, new| {
             if (eq(u8, old, new)) continue;
             for ([_][]const u8{ old, new }) |tag| {
                 if (!agent_image.validTag(tag)) continue;
@@ -406,13 +413,13 @@ pub const Git = struct {
                 } else try tags.append(a, tag);
             }
         }
-        if (tags.items.len == 0) return null;
+        if (tags.items.len == 0) return .{};
         const writer = evidence.writer(a);
         try writer.writeAll("\n\nHyperlane Rust agent image evidence. GHCR observations describe the tags at review time. Successful main workflow logs corroborate the published manifest digests. Image layers were not opened.\n");
-        try self.appendAgentSelectors(path, head, before, after, evidence, coverage);
+        try self.appendAgentSelectors(path, pr.headRefOid, before, after, evidence, coverage);
         if (tags.items.len > agent_image.max_tags) {
             try coverage.append(a, "Relayer image tags exceeded the verification budget.");
-            return null;
+            return .{};
         }
         var timer = try std.time.Timer.start();
         const client: github.Client = .{ .cmd = self.cmd, .gh = self.gh, .repo = self.object_cache.repo.name, .calls = self.github_calls };
@@ -432,7 +439,7 @@ pub const Git = struct {
         var commits: std.StringHashMapUnmanaged([]const u8) = .empty;
         defer commits.deinit(a);
         for (tags.items) |tag| {
-            const commit = self.resolveAgentCommit(path, tag) catch |err| switch (err) {
+            const commit = if (promotion) |rollout| rollout.commit else self.resolveAgentCommit(path, tag) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => {
                     try coverage.append(a, try io.fmt(a, "Could not resolve an exact source commit for agent image {s}.", .{tag}));
@@ -454,7 +461,73 @@ pub const Git = struct {
             } else false;
             if (!verified) try coverage.append(a, try io.fmt(a, "Could not verify the published digest against a main build log for agent image {s}.", .{tag}));
         }
-        return self.appendAgentDiff(path, before, after, commits, evidence, coverage);
+        if (promotion) |rollout| {
+            if (coverage.items.len != 0) return .{};
+            try writer.print("The PR merge base {s} already includes the promoted image source {s}. The changed slots previously used ancestor builds.\n", .{ base, rollout.commit });
+            return .{ .promotion = true, .optional_start = try self.appendPromotionConfig(path, rollout.previous, rollout.commit, evidence) };
+        }
+        return .{ .optional_start = try self.appendAgentDiff(path, before, after, commits, evidence, coverage) };
+    }
+
+    fn agentPromotion(self: Git, path: []const u8, pr: core.Pull, base: []const u8, before: agent_image.Pins, after: agent_image.Pins, tag: []const u8) !?AgentPromotion {
+        const change = self.gitWithin(path, &.{ "diff", "--raw", "--no-renames", "-z", base, pr.headRefOid, "--" }, "", 5) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        if (!agent_image.onlyPinFile(change)) return null;
+        const promoted = self.resolveAgentCommit(path, tag) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        if (!try self.imageAncestor(path, promoted, base)) return null;
+        if (!eq(u8, base, pr.baseRefOid)) {
+            _ = self.gitWithin(path, &.{
+                "diff",                                                   "--quiet",                                                base, pr.baseRefOid, "--", agent_image.pin_path,
+                "typescript/infra/config/environments/mainnet3/agent.ts", "typescript/infra/config/environments/testnet4/agent.ts",
+            }, "", 5) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return null,
+            };
+        }
+        var previous: ?[]const u8 = null;
+        for (before, after, 0..) |old, new, i| {
+            if (eq(u8, old, new)) continue;
+            for (before[0..i], after[0..i]) |earlier_old, earlier_new| {
+                if (!eq(u8, earlier_old, earlier_new) and eq(u8, earlier_old, old)) break;
+            } else {
+                const commit = self.resolveAgentCommit(path, old) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return null,
+                };
+                if (!try self.imageAncestor(path, commit, promoted)) return null;
+                if (previous == null) previous = commit;
+            }
+        }
+        return .{ .tag = tag, .commit = promoted, .previous = previous orelse return null };
+    }
+
+    fn imageAncestor(self: Git, path: []const u8, before: []const u8, after: []const u8) !bool {
+        _ = self.gitWithin(path, &.{ "merge-base", "--is-ancestor", before, after }, "", 5) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return false,
+        };
+        return true;
+    }
+
+    fn appendPromotionConfig(self: Git, path: []const u8, before: []const u8, after: []const u8, evidence: *std.ArrayList(u8)) !?usize {
+        const args = diff_flags ++ [_][]const u8{ before, after, "--", "rust/main/config" } ++ excluded_paths;
+        const patch = self.gitWithin(path, &args, "", 5) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        if (patch.len == 0) return null;
+        const prefix = patch[0..core.safePrefix(patch, 8 * 1024)];
+        if (!std.unicode.utf8ValidateSlice(prefix)) return null;
+        const start = evidence.items.len;
+        try evidence.writer(self.cmd.a).print("\nBundled chain configuration diff from the first changed slot's previous image source{s}:\n{s}\n", .{
+            if (prefix.len < patch.len) " (excerpt)" else "", prefix,
+        });
+        return start;
     }
 
     fn resolveAgentCommit(self: Git, path: []const u8, tag: []const u8) ![]const u8 {

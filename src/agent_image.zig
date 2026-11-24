@@ -47,6 +47,36 @@ pub fn validTag(tag: []const u8) bool {
     return true;
 }
 
+pub fn onlyPinFile(raw: []const u8) bool {
+    if (!std.mem.endsWith(u8, raw, "\x00")) return false;
+    var fields = std.mem.splitScalar(u8, raw, 0);
+    const header = fields.next() orelse return false;
+    return std.mem.startsWith(u8, header, ":100644 100644 ") and std.mem.endsWith(u8, header, " M") and
+        eq(u8, fields.next() orelse return false, pin_path) and eq(u8, fields.rest(), "");
+}
+
+pub fn promotionTag(before: []const u8, after: []const u8, old_pins: Pins, new_pins: Pins) ?[]const u8 {
+    var old_end: usize = 0;
+    var new_end: usize = 0;
+    var target: ?[]const u8 = null;
+    for (old_pins, new_pins) |old, new| {
+        // The parsed tags are slices into the original files. All intervening
+        // bytes must match, including comments, selectors, and other roles.
+        const old_start = @intFromPtr(old.ptr) - @intFromPtr(before.ptr);
+        const new_start = @intFromPtr(new.ptr) - @intFromPtr(after.ptr);
+        if (old_start < old_end or new_start < new_end or !eq(u8, before[old_end..old_start], after[new_end..new_start])) return null;
+        old_end = old_start + old.len;
+        new_end = new_start + new.len;
+        if (eq(u8, old, new)) continue;
+        if (!validTag(old) or !validTag(new)) return null;
+        if (std.mem.order(u8, new[8..], old[8..]) != .gt) return null;
+        if (target) |tag| {
+            if (!eq(u8, tag, new)) return null;
+        } else target = new;
+    }
+    return if (eq(u8, before[old_end..], after[new_end..])) target else null;
+}
+
 pub fn remainingSeconds(timer: *std.time.Timer, limit: u32) !u32 {
     const elapsed = timer.read() / std.time.ns_per_s;
     if (elapsed >= limit) return error.ImageEvidenceTimeout;
@@ -152,6 +182,37 @@ test "relayer pins read only the recognized environment exports" {
     try std.testing.expect(!validTag("30b039z-20261124-095058"));
     try std.testing.expect(!validTag("30b039c-20261124&095058"));
     try std.testing.expect(pins(blob[0 .. blob.len - 50]) == null);
+}
+
+test "only pure forward relayer pins to a single build qualify" {
+    const t = std.testing;
+    const before =
+        \\export const mainnetDockerTags: MainnetDockerTags = {
+        \\  relayer: 'abcdef0-20261124-100000',
+        \\  relayerRC: 'abcdef0-20261124-100000',
+        \\  relayerFastPath: 'abcdef0-20261124-100000',
+        \\  validator: 'abcdef0-20261124-100000',
+        \\};
+        \\export const testnetDockerTags: BaseDockerTags = {
+        \\  relayer: 'abcdef0-20261124-100000',
+        \\  relayerRC: 'abcdef0-20261124-100000',
+        \\  relayerFastPath: 'abcdef0-20261124-100000',
+        \\};
+    ;
+    const after = try std.mem.replaceOwned(u8, t.allocator, before, "relayer: 'abcdef0-20261124-100000'", "relayer: '1234567-20261124-110000'");
+    defer t.allocator.free(after);
+    try t.expectEqualStrings("1234567-20261124-110000", promotionTag(before, after, pins(before).?, pins(after).?).?);
+    try t.expect(promotionTag(after, before, pins(after).?, pins(before).?) == null);
+    const mixed = try std.mem.replaceOwned(u8, t.allocator, after, "relayerRC: 'abcdef0-20261124-100000'", "relayerRC: '1234567-20261124-120000'");
+    defer t.allocator.free(mixed);
+    try t.expect(promotionTag(before, mixed, pins(before).?, pins(mixed).?) == null);
+    const other_role = try std.mem.replaceOwned(u8, t.allocator, after, "validator: 'abcdef0-20261124-100000'", "validator: '1234567-20261124-110000'");
+    defer t.allocator.free(other_role);
+    try t.expect(promotionTag(before, other_role, pins(before).?, pins(other_role).?) == null);
+    const raw = ":100644 100644 1234abcd abcd1234 M\x00" ++ pin_path ++ "\x00";
+    try t.expect(onlyPinFile(raw));
+    try t.expect(!onlyPinFile(raw ++ ":100644 100644 1234abcd abcd1234 M\x00.gitignore\x00"));
+    try t.expect(!onlyPinFile(":100644 100755 1234abcd abcd1234 M\x00" ++ pin_path ++ "\x00"));
 }
 
 test "verified build evidence requires the exact tagged digest in the build step" {

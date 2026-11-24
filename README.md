@@ -168,6 +168,8 @@ When a PR in `hyperlane-xyz/hyperlane-monorepo` changes `.registryrc`, Talos rea
 
 For PRs targeting `hyperlane-xyz/hyperlane-monorepo` main, Talos recognizes relayer image tags of the form `abcdef0-20261124-185322` in `typescript/infra/config/docker.ts`. It reads the pinned deployment selectors, hashes the public GHCR manifests, and matches each tagged digest to a successful main build log for the exact source commit. Reviewers receive the changed build input inventory for each image pair and bounded patch excerpts, with bundled runtime configuration first. These read-only observations describe the tags at review time. Missing build records, an incomplete inventory, or a material gap identified by a reviewer withhold automatic approval.
 
+When the entire change advances only relayer pins to one verified build already in the PR merge base, Talos reviews the deployment promotion in a regular pass. It checks that the previous builds are ancestors and verifies the affected deployment selectors. The reviewer checks the rollout and any concrete compatibility concerns. Normal discussion and approval rules apply.
+
 ### Configure each repo
 
 Talos starts with Codex as the default. To use Claude Code on a Claude-only machine, run `talos defaults --engine claude` once. New repos use that setting unless you pass `--engine`. Existing repos keep their reviewer settings.
