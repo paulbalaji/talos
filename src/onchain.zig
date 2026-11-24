@@ -1,0 +1,187 @@
+const std = @import("std");
+const io = @import("io.zig");
+
+pub const max_reads = 6;
+pub const registry_repo = "hyperlane-xyz/hyperlane-registry";
+
+pub const Operation = enum {
+    owner,
+    safe_owners,
+    safe_threshold,
+    paused,
+    has_code,
+
+    fn selector(self: Operation) []const u8 {
+        return switch (self) {
+            .owner => "0x8da5cb5b",
+            .safe_owners => "0xa0e67e2b",
+            .safe_threshold => "0xe75235b8",
+            .paused => "0x5c975abb",
+            .has_code => unreachable,
+        };
+    }
+};
+
+pub const Request = struct {
+    chain: []const u8,
+    address: []const u8,
+    operation: Operation,
+
+    pub fn valid(self: Request) bool {
+        if (self.chain.len == 0 or self.chain.len > 48) return false;
+        for (self.chain) |ch| if (!std.ascii.isLower(ch) and !std.ascii.isDigit(ch)) return false;
+        return self.address.len == 42 and hex(self.address) != null;
+    }
+};
+
+pub const Observation = struct {
+    request: Request,
+    block: ?u64 = null,
+    value: ?[]const u8 = null,
+};
+
+const Metadata = struct {
+    chain_id: u64,
+    urls: [4]?[]const u8,
+};
+
+fn parseMetadata(text: []const u8) ?Metadata {
+    var chain_id: ?u64 = null;
+    var evm = false;
+    var urls: [4]?[]const u8 = @splat(null);
+    var url_count: usize = 0;
+    var in_rpc_urls = false;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, " \r");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (line[0] != ' ') {
+            in_rpc_urls = io.eq(u8, line, "rpcUrls:");
+            if (std.mem.startsWith(u8, line, "chainId: ")) chain_id = std.fmt.parseInt(u64, line["chainId: ".len..], 10) catch return null;
+            evm = evm or io.eq(u8, line, "protocol: ethereum");
+            continue;
+        }
+        const prefix = "  - http: ";
+        if (!in_rpc_urls or !std.mem.startsWith(u8, line, prefix) or url_count == urls.len) continue;
+        const url = std.mem.trim(u8, line[prefix.len..], "\"'");
+        const uri = std.Uri.parse(url) catch continue;
+        if (!io.eq(u8, uri.scheme, "https") or uri.host == null or uri.user != null or uri.password != null or uri.fragment != null) continue;
+        urls[url_count] = url;
+        url_count += 1;
+    }
+    if (!evm or url_count == 0) return null;
+    return .{ .chain_id = chain_id orelse return null, .urls = urls };
+}
+
+pub const Pin = struct { metadata: Metadata, url: []const u8, block: []const u8, height: u64 };
+
+pub const Client = struct {
+    cmd: io.Command,
+    curl: []const u8,
+
+    fn rpc(self: Client, url: []const u8, method: []const u8, params: anytype) ![]const u8 {
+        const request = try io.json(self.cmd.a, .{ .jsonrpc = "2.0", .id = @as(u32, 1), .method = method, .params = params });
+        const output = try self.cmd.run(&.{ self.curl, "--disable", "--silent", "--fail", "--globoff", "--proto", "=https", "--connect-timeout", "3", "--max-time", "5", "--max-filesize", "65536", "--header", "Content-Type: application/json", "--data-binary", "@-", "--url", url }, request, 6);
+        const response = try io.parse(self.cmd.a, struct { id: u32, result: []const u8 }, output);
+        if (response.id != 1) return error.InvalidRpcReply;
+        return response.result;
+    }
+
+    pub fn pin(self: Client, text: []const u8) !Pin {
+        const metadata = parseMetadata(text) orelse return error.UnsupportedChainMetadata;
+        for (metadata.urls) |candidate| {
+            const url = candidate orelse continue;
+            const raw_chain = self.rpc(url, "eth_chainId", [0]u32{}) catch continue;
+            if (quantity(raw_chain) != metadata.chain_id) continue;
+            const block = self.rpc(url, "eth_blockNumber", [0]u32{}) catch continue;
+            const height = quantity(block) orelse continue;
+            return .{ .metadata = metadata, .url = url, .block = block, .height = height };
+        }
+        return error.RpcUnavailable;
+    }
+
+    pub fn read(self: Client, request: Request, pinned: Pin) ![]const u8 {
+        if (!request.valid()) return error.InvalidOnchainRequest;
+        if (self.readAt(request, pinned.url, pinned.block)) |value| return value else |_| {}
+        for (pinned.metadata.urls) |candidate| {
+            const url = candidate orelse continue;
+            if (io.eq(u8, url, pinned.url)) continue;
+            const raw_chain = self.rpc(url, "eth_chainId", [0]u32{}) catch continue;
+            if (quantity(raw_chain) != pinned.metadata.chain_id) continue;
+            return self.readAt(request, url, pinned.block) catch continue;
+        }
+        return error.RpcUnavailable;
+    }
+
+    fn readAt(self: Client, request: Request, url: []const u8, block: []const u8) ![]const u8 {
+        const result = if (request.operation == .has_code)
+            try self.rpc(url, "eth_getCode", .{ request.address, block })
+        else
+            try self.rpc(url, "eth_call", .{ .{ .to = request.address, .data = request.operation.selector() }, block });
+        return decode(self.cmd.a, request.operation, result);
+    }
+};
+
+fn hex(raw: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, raw, "0x")) return null;
+    for (raw[2..]) |ch| if (!std.ascii.isHex(ch)) return null;
+    return raw[2..];
+}
+
+fn quantity(raw: []const u8) ?u64 {
+    const digits = hex(raw) orelse return null;
+    if (digits.len == 0 or digits.len > 16 or (digits.len > 1 and digits[0] == '0')) return null;
+    return std.fmt.parseInt(u64, digits, 16) catch null;
+}
+
+fn addressWord(a: io.A, word: []const u8) ![]const u8 {
+    if (word.len != 64 or !io.eq(u8, word[0..24], "0" ** 24)) return error.InvalidRpcReply;
+    return io.fmt(a, "0x{s}", .{word[24..]});
+}
+
+fn decode(a: io.A, operation: Operation, raw: []const u8) ![]const u8 {
+    const data = hex(raw) orelse return error.InvalidRpcReply;
+    switch (operation) {
+        .owner => return addressWord(a, data),
+        .safe_threshold, .paused => {
+            if (data.len != 64) return error.InvalidRpcReply;
+            const number = std.fmt.parseInt(u64, data, 16) catch return error.InvalidRpcReply;
+            if (operation == .paused) return switch (number) {
+                0 => "false",
+                1 => "true",
+                else => error.InvalidRpcReply,
+            };
+            return io.fmt(a, "{d}", .{number});
+        },
+        .has_code => {
+            if (data.len % 2 != 0) return error.InvalidRpcReply;
+            return if (data.len == 0) "false" else "true";
+        },
+        .safe_owners => {
+            if (data.len < 128) return error.InvalidRpcReply;
+            const offset = std.fmt.parseInt(u32, data[0..64], 16) catch return error.InvalidRpcReply;
+            const count = std.fmt.parseInt(u32, data[64..128], 16) catch return error.InvalidRpcReply;
+            if (offset != 32 or count > 16 or data.len != 128 + 64 * count) return error.InvalidRpcReply;
+            var owners: [16][]const u8 = undefined;
+            for (owners[0..count], 0..) |*owner, i| owner.* = try addressWord(a, data[128 + 64 * i ..][0..64]);
+            return std.mem.join(a, ", ", owners[0..count]);
+        },
+    }
+}
+
+test "on-chain reads validate requests and decode standard ABI return values" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const address = "1234567890abcdef1234567890abcdef12345678";
+    const request: Request = .{ .chain = "bsc", .address = "0x" ++ address, .operation = .owner };
+    try t.expect(request.valid());
+    try t.expect(!(Request{ .chain = "../bsc", .address = request.address, .operation = .owner }).valid());
+    try t.expectEqualStrings(request.address, try decode(arena.allocator(), .owner, "0x" ++ "0" ** 24 ++ address));
+    try t.expectEqualStrings("3", try decode(arena.allocator(), .safe_threshold, "0x" ++ "0" ** 63 ++ "3"));
+    try t.expectEqualStrings(request.address, try decode(arena.allocator(), .safe_owners, "0x" ++ "0" ** 62 ++ "20" ++ "0" ** 63 ++ "1" ++ "0" ** 24 ++ address));
+    try t.expectError(error.InvalidRpcReply, decode(arena.allocator(), .paused, "0x" ++ "0" ** 63 ++ "2"));
+    const metadata = parseMetadata("chainId: 56\nprotocol: ethereum\nrpcUrls:\n  - http: http://example.com\n  - http: https://example.com\n").?;
+    try t.expectEqual(@as(u64, 56), metadata.chain_id);
+    try t.expectEqualStrings("https://example.com", metadata.urls[0].?);
+}

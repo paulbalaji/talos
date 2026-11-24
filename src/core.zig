@@ -1,4 +1,5 @@
 const std = @import("std");
+const onchain = @import("onchain.zig");
 const io = @import("io.zig");
 const stack = @import("stack.zig");
 const routing = @import("routing.zig");
@@ -110,6 +111,8 @@ pub const Pull = struct {
 };
 
 const Check = struct {
+    name: ?[]const u8 = null,
+    context: ?[]const u8 = null,
     status: ?[]const u8 = null,
     state: ?[]const u8 = null,
     conclusion: ?[]const u8 = null,
@@ -586,6 +589,10 @@ pub fn validateReviewRequest(request: []const u8) !void {
     if (!textValid(request, 4000)) return error.InvalidReviewPrompt;
 }
 
+pub fn registryMain(repo: Repo, pr: Pull) bool {
+    return std.ascii.eqlIgnoreCase(repo.name, onchain.registry_repo) and eq(u8, pr.baseRefName, "main");
+}
+
 fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, discussion: Discussion, previous: ?[]const u8, last_review: ?ReviewRecord, prior_delta: []const u8, inherited: stack.Context, options: ReviewOptions) ![]const u8 {
     var rendered: std.ArrayList(u8) = .empty;
     const writer = rendered.writer(a);
@@ -598,6 +605,7 @@ fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, discussion: Discussi
         if (eq(u8, commit, pr.headRefOid))
             try writer.writeAll("\n\nThis is a same-head rereview. Check what the conversation or base change means for the prior findings. Carry forward accepted or verified resolutions unless the current evidence specifically invalidates them.");
     }
+    const checks = pr.statusCheckRollup orelse &.{};
     const evidence = try io.json(a, .{
         .repository = repo.name,
         .number = pr.number,
@@ -613,6 +621,7 @@ fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, discussion: Discussi
         .previous_to_current_delta = prior_delta,
         .coverage_limited = snap.limited,
         .coverage_reasons = snap.coverage_reasons,
+        .github_checks = if (registryMain(repo, pr)) checks[0..@min(checks.len, 20)] else null,
         .threads = discussion.threads,
         .conversation_comments = discussion.comments[discussion.comments.len -| 6..],
         .source = snap.evidence,
@@ -961,7 +970,7 @@ fn payload(a: A, adapter: anytype, pr: Pull, prepared: Prepared, results: []cons
     if (!complete) {
         try fmt.writeAll("\n\nReview coverage was limited.");
         for (snap.coverage_reasons) |reason| try fmt.print("\n- {s}", .{reason});
-        if (prepared.additional_evidence_limited) try fmt.writeAll("\n- Some requested source was unavailable or exceeded the review budget");
+        if (prepared.additional_evidence_limited) try fmt.writeAll("\n- Some requested evidence was unavailable or exceeded the review budget");
         for (threads) |thread| {
             if (!thread.truncated) continue;
             try fmt.writeAll("\n- Some review thread replies were truncated");
@@ -1081,7 +1090,18 @@ pub const Prepared = struct {
     synthesis_provider: ?Engine = null,
     synthesis_summary: ?[]const u8 = null,
     additional_evidence_limited: bool = false,
+    onchain_available: bool = false,
 };
+
+pub fn appendOnchain(a: A, context: *[]const u8, observations: []const onchain.Observation) !bool {
+    if (observations.len == 0) return false;
+    const heading = "\n\nPublic EVM observations collected by Talos (JSON; null value means unverified). Compare the values against the pinned source and any CI claim. An observation proves only the requested value at its block.\n";
+    const encoded = try io.json(a, observations);
+    if (context.len + heading.len + encoded.len + 1300 > review_context_limit) return true;
+    context.* = try std.mem.concat(a, u8, &.{ context.*, heading, encoded });
+    for (observations) |observation| if (observation.value == null) return true;
+    return false;
+}
 
 pub const RouteProgress = struct {
     fingerprint: [32]u8,
@@ -1090,6 +1110,8 @@ pub const RouteProgress = struct {
     screen_waiting: bool = true,
     screen_result: ?ReviewerResult = null,
     evidence_requests: []const EvidenceRequest = &.{},
+    onchain_reads: []const onchain.Request = &.{},
+    onchain_observations: ?[]const onchain.Observation = null,
     evidence_key: ?[32]u8 = null,
     screen_ms: u64 = 0,
     results: []const ReviewerResult = &.{},
@@ -1113,14 +1135,16 @@ pub const RouteReport = struct {
     light_findings: ?usize = null,
     full_findings: ?usize = null,
     full_only_anchors: ?usize = null,
+    onchain_observations: []const onchain.Observation = &.{},
 };
 
 pub const screen_schema =
-    \\{"type":"object","additionalProperties":false,"required":["decision","review","evidence_requests"],"properties":{
+    \\{"type":"object","additionalProperties":false,"required":["decision","review","evidence_requests","onchain_reads"],"properties":{
     \\"decision":{"type":"object","additionalProperties":false,"required":["depth","performance","reliability","security"],"properties":{
     \\"depth":{"type":"string","enum":["light","regular","focused","multi"]},"performance":{"type":"boolean"},
     \\"reliability":{"type":"boolean"},"security":{"type":"boolean"}}},
-    \\"evidence_requests":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","start_line","end_line"],"properties":{"path":{"type":"string"},"start_line":{"type":["integer","null"]},"end_line":{"type":["integer","null"]}}}},"review":
+    \\"evidence_requests":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","start_line","end_line"],"properties":{"path":{"type":"string"},"start_line":{"type":["integer","null"]},"end_line":{"type":["integer","null"]}}}},
+    \\"onchain_reads":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["chain","address","operation"],"properties":{"chain":{"type":"string"},"address":{"type":"string"},"operation":{"type":"string","enum":["owner","safe_owners","safe_threshold","paused","has_code"]}}}},"review":
 ++ schema ++ "}}";
 
 const screen_instructions =
@@ -1129,12 +1153,17 @@ const screen_instructions =
     \\Focused covers a material performance, reliability, or defensive security concern within one subsystem. Use multi for a change that affects who controls production assets, who can authorize or sign transactions, how contracts verify cross-chain messages, or which policy gates allow an operation. Use multi for changes that combine those risks or cross trust boundaries, including migrations and new production routes. A one-line diff can change these guarantees.
     \\Select the relevant lenses for focused or multi, and set all lenses false for light or regular. When uncertain choose the stronger review.
     \\Request up to six specific tracked source paths essential to review in evidence_requests. Request at most 120 inclusive lines per path, or use null for both bounds to read the first excerpt. Use paths grounded in the change. If evidence is sufficient, return an empty list. Use at least regular when additional source is needed.
+    \\Return an empty onchain_reads list unless this prompt offers on-chain reads.
     \\Return the wrapper schema. Its review field is your static first-pass review. Assess any open thread using the normal review rules. Do not execute code, use tools, or provide exploit or reproduction instructions.
     \\
 ;
 
 pub fn screenPrompt(a: A, prepared: Prepared) ![]const u8 {
-    return io.fmt(a, "{s}\n{s}\n{s}\n{s}", .{ instructions, screen_instructions, screen_schema, prepared.context[prepared.evidence_offset..] });
+    const offer = if (prepared.onchain_available)
+        "Request up to six public EVM reads in onchain_reads when the review depends on current live state. If a PR claims to sync a configured owner to live ownership, request owner for each changed owner with a known target. Use the contract whose owner changed, such as proxyAdmin.address, rather than the proposed owner's address. Use safe_threshold and safe_owners to check a Safe's threshold or signer set when relevant. A CI check status or an author report cannot substitute for these observations. Specify the registry chain name, contract address, and operation from the schema. Use targets grounded in the provided source. Talos will collect the observations for the full reviewers."
+    else
+        "";
+    return io.fmt(a, "{s}\n{s}\n{s}\n{s}\n{s}", .{ instructions, screen_instructions, offer, screen_schema, prepared.context[prepared.evidence_offset..] });
 }
 
 pub fn routedPrompt(a: A, context: []const u8, decision: routing.Decision) ![]const u8 {
@@ -1157,6 +1186,7 @@ pub const ScreenResult = struct {
     decision: routing.Decision,
     review: Review,
     evidence_requests: []const EvidenceRequest = &.{},
+    onchain_reads: []const onchain.Request = &.{},
 };
 
 pub fn parseScreen(a: A, output: []const u8) !ScreenResult {
@@ -1165,6 +1195,7 @@ pub fn parseScreen(a: A, output: []const u8) !ScreenResult {
         decision: struct { depth: routing.Depth, performance: bool, reliability: bool, security: bool },
         review: std.json.Value,
         evidence_requests: []const EvidenceRequest = &.{},
+        onchain_reads: []const onchain.Request = &.{},
     }, a, output, .{}) catch return error.InvalidReview;
     var decision: routing.Decision = .{
         .depth = raw.decision.depth,
@@ -1190,7 +1221,15 @@ pub fn parseScreen(a: A, output: []const u8) !ScreenResult {
                 return error.InvalidReview;
         }
     }
-    return .{ .decision = decision, .review = try parseReview(a, try io.json(a, raw.review)), .evidence_requests = raw.evidence_requests };
+    if (raw.onchain_reads.len > onchain.max_reads) return error.InvalidReview;
+    for (raw.onchain_reads, 0..) |read, index| {
+        if (!read.valid()) return error.InvalidReview;
+        for (raw.onchain_reads[0..index]) |prior| {
+            if (eq(u8, prior.chain, read.chain) and std.ascii.eqlIgnoreCase(prior.address, read.address) and prior.operation == read.operation)
+                return error.InvalidReview;
+        }
+    }
+    return .{ .decision = decision, .review = try parseReview(a, try io.json(a, raw.review)), .evidence_requests = raw.evidence_requests, .onchain_reads = raw.onchain_reads };
 }
 
 pub fn compareRoute(report: *RouteReport, light: Review, combined: []const ReviewerResult) void {
@@ -1350,6 +1389,7 @@ pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?P
         .options = options,
         .dry = dry,
         .review_input = review_input,
+        .onchain_available = registryMain(repo, pr) and repo.routing_mode == .adaptive and options.allowRouting(),
     };
 }
 

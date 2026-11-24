@@ -3,6 +3,7 @@ const core = @import("core.zig");
 const github = @import("github.zig");
 const io = @import("io.zig");
 const cache = @import("cache.zig");
+const onchain = @import("onchain.zig");
 const A = io.A;
 const eq = io.eq;
 
@@ -202,6 +203,23 @@ pub const Git = struct {
                 if (content) |blob| try appendBlob(&evidence, a, name, blob, &remaining);
             }
         }
+        if (core.registryMain(self.object_cache.repo, pr)) {
+            var route_bytes: usize = 6 * 1024;
+            var route_files: usize = 0;
+            for (candidates.items) |name| {
+                const suffix = "-deploy.yaml";
+                if (!std.mem.startsWith(u8, name, "deployments/warp_routes/") or !std.mem.endsWith(u8, name, suffix)) continue;
+                if (route_files == 4 or route_bytes < 1024) break;
+                route_files += 1;
+                const config = try io.fmt(a, "{s}-config.yaml", .{name[0 .. name.len - suffix.len]});
+                const oid = self.pinnedOid(path, pr.baseRefOid, config) catch continue;
+                const blob = self.pinnedBlob(path, oid) catch continue;
+                const excerpt = blob[0..core.safePrefix(blob, @min(blob.len, route_bytes -| (config.len + 64)))];
+                if (excerpt.len == 0) continue;
+                try writer.print("\nPinned base Warp route config {s}{s}:\n{s}\n", .{ config, if (excerpt.len == blob.len) "" else " (excerpt)", excerpt });
+                route_bytes -= config.len + excerpt.len + 64;
+            }
+        }
         return .{ .merge_base = merge_base, .evidence = evidence.items, .limited = coverage.items.len != 0, .coverage_reasons = coverage.items };
     }
 
@@ -250,6 +268,46 @@ pub const Git = struct {
         const result = try self.readSupplement(cache_path, pr.headRefOid, previous, requests);
         try self.object_cache.evict(repo_dir, std.time.timestamp());
         return result;
+    }
+
+    pub fn onchainReads(self: Git, pr: core.Pull, requests: []const onchain.Request, search_path: []const u8) ![]const onchain.Observation {
+        if (!std.ascii.eqlIgnoreCase(self.object_cache.repo.name, onchain.registry_repo) or !eq(u8, pr.baseRefName, "main") or
+            requests.len > onchain.max_reads) return error.InvalidOnchainRequest;
+        const a = self.cmd.a;
+        const results = try a.alloc(onchain.Observation, requests.len);
+        for (results, requests) |*result, request| {
+            if (!request.valid()) return error.InvalidOnchainRequest;
+            result.* = .{ .request = request };
+        }
+        const curl = io.executable(a, search_path, "curl") catch return results;
+        var repo_dir = (try self.object_cache.repoDir(true)) orelse return error.GitCacheInitFailed;
+        defer repo_dir.close();
+        const cache_path = try std.fs.path.join(a, &.{ try repo_dir.realpathAlloc(a, "."), cache.directory });
+        defer self.object_cache.evict(repo_dir, std.time.timestamp()) catch |err|
+            std.log.warn("Git cache eviction failed for {s} ({s})", .{ self.object_cache.repo.name, @errorName(err) });
+        if (!try self.cachedPinsMatch(cache_path, pr)) try self.pin(repo_dir, cache_path, pr);
+
+        var env = std.process.EnvMap.init(a);
+        defer env.deinit();
+        var command = self.cmd;
+        command.env = &env;
+        const client: onchain.Client = .{ .cmd = command, .curl = curl };
+        var pins = std.StringHashMap(?onchain.Pin).init(a);
+        defer pins.deinit();
+        for (results) |*result| {
+            const chain = result.request.chain;
+            const entry = try pins.getOrPut(chain);
+            if (!entry.found_existing) entry.value_ptr.* = pinned: {
+                const file = try io.fmt(a, "chains/{s}/metadata.yaml", .{chain});
+                const oid = self.pinnedOid(cache_path, pr.baseRefOid, file) catch break :pinned null;
+                const metadata = self.pinnedBlob(cache_path, oid) catch break :pinned null;
+                break :pinned client.pin(metadata) catch null;
+            };
+            const read_pin = entry.value_ptr.* orelse continue;
+            result.block = read_pin.height;
+            result.value = client.read(result.request, read_pin) catch null;
+        }
+        return results;
     }
 
     fn previousDiff(self: Git, cache_path: []const u8, previous: []const u8, head: []const u8) ![]const u8 {
@@ -313,15 +371,7 @@ pub const Git = struct {
         if (!core.validPath(request.path) or sensitive(request.path)) return error.DisallowedExcerptPath;
         const lines = try excerptRange(request.start_line, request.end_line);
         if (remaining.* <= request.path.len + 160) return error.ExcerptBudget;
-        const pathspec = try io.fmt(a, ":(literal){s}", .{request.path});
-        const entry = try self.gitWithin(cache_path, &.{ "ls-tree", "-z", "--full-tree", head, "--", pathspec }, "", 20);
-        const oid = try excerptOid(entry, request.path);
-        const text = io.trim(u8, try self.gitWithin(cache_path, &.{ "cat-file", "-s", oid }, "", 30), "\r\n");
-        const size = try std.fmt.parseUnsigned(usize, text, 10);
-        if (size > excerpt_blob_limit) return error.ExcerptTooLarge;
-        const blob = try self.gitWithin(cache_path, &.{ "cat-file", "blob", oid }, "", 20);
-        if (blob.len != size or !std.unicode.utf8ValidateSlice(blob) or std.mem.indexOfScalar(u8, blob, 0) != null)
-            return error.ExcerptNotText;
+        const blob = try self.pinnedBlob(cache_path, try self.pinnedOid(cache_path, head, request.path));
         const excerpt = try excerptLines(blob, lines);
         const prefix = excerpt.text[0..core.safePrefix(excerpt.text, remaining.* - request.path.len - 160)];
         const complete = !(excerpt.more and (lines.clipped or request.end_line == null)) and prefix.len == excerpt.text.len;
@@ -331,6 +381,22 @@ pub const Git = struct {
         });
         remaining.* -= evidence.items.len - start;
         return complete;
+    }
+
+    fn pinnedOid(self: Git, cache_path: []const u8, head: []const u8, file: []const u8) ![]const u8 {
+        const pathspec = try io.fmt(self.cmd.a, ":(literal){s}", .{file});
+        const entry = try self.gitWithin(cache_path, &.{ "ls-tree", "-z", "--full-tree", head, "--", pathspec }, "", 20);
+        return excerptOid(entry, file);
+    }
+
+    fn pinnedBlob(self: Git, cache_path: []const u8, oid: []const u8) ![]const u8 {
+        const text = io.trim(u8, try self.gitWithin(cache_path, &.{ "cat-file", "-s", oid }, "", 30), "\r\n");
+        const size = try std.fmt.parseUnsigned(usize, text, 10);
+        if (size > excerpt_blob_limit) return error.ExcerptTooLarge;
+        const blob = try self.gitWithin(cache_path, &.{ "cat-file", "blob", oid }, "", 20);
+        if (blob.len != size or !std.unicode.utf8ValidateSlice(blob) or std.mem.indexOfScalar(u8, blob, 0) != null)
+            return error.ExcerptNotText;
+        return blob;
     }
 
     fn readBlob(self: Git, path: []const u8, head: []const u8, name: []const u8, remaining: usize) ![]const u8 {

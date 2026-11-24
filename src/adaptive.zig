@@ -74,6 +74,7 @@ pub fn run(a: io.A, reviewer: anytype, plan: Plan) !Outcome {
         return outcome;
     }
     if (progress.evidence_requests.len != 0 and plan.evidence == null) return outcome;
+    if (progress.onchain_reads.len != 0 and progress.onchain_observations == null) return outcome;
     var context = plan.prepared.context;
     var additional: []const u8 = "";
     outcome.evidence_limited = plan.evidence_limited;
@@ -85,6 +86,10 @@ pub fn run(a: io.A, reviewer: anytype, plan: Plan) !Outcome {
                 additional = evidence;
             } else outcome.evidence_limited = true;
         }
+    }
+    if (progress.onchain_observations) |observations| {
+        const limited = try core.appendOnchain(a, &context, observations);
+        outcome.evidence_limited = outcome.evidence_limited or limited;
     }
     for (plan.providers) |engine| {
         if (progress.results.len == required or reviewer.starts() >= plan.start_limit) break;
@@ -178,8 +183,9 @@ fn screen(a: io.A, reviewer: anytype, plan: Plan, progress: *core.RouteProgress)
             const result = core.parseScreen(a, raw) catch break;
             progress.screen_result = .{ .engine = engine, .review = result.review };
             if (plan.repo.routing_mode == .adaptive) progress.evidence_requests = result.evidence_requests;
+            if (plan.prepared.onchain_available) progress.onchain_reads = result.onchain_reads;
             var decision = plan.screen.floor.merge(result.decision);
-            if (decision.depth == .light and (plan.repo.reviewSize() > 1 or result.evidence_requests.len != 0 or !core.lightComplete(result.review, plan.prepared)))
+            if (decision.depth == .light and (plan.repo.reviewSize() > 1 or result.evidence_requests.len != 0 or progress.onchain_reads.len != 0 or !core.lightComplete(result.review, plan.prepared)))
                 decision.depth = .regular;
             progress.decision = decision;
             return;
@@ -201,6 +207,7 @@ fn report(a: io.A, plan: Plan, progress: core.RouteProgress, applied: routing.De
         .providers = providers,
         .screen_ms = progress.screen_ms,
         .review_ms = progress.review_ms,
+        .onchain_observations = progress.onchain_observations orelse &.{},
     };
     if (progress.screen_result) |candidate| {
         result.light_findings = candidate.review.findings.len;
@@ -397,6 +404,34 @@ test "requested evidence is checkpointed before the full review" {
     const preview = try run(a, &baseline, shadow);
     try t.expect(preview.report != null);
     try t.expectEqual(@as(usize, 0), preview.progress.evidence_requests.len);
+}
+
+test "requested on-chain reads reach the full review and incomplete responses limit approval" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var plan = sample_plan;
+    plan.prepared.onchain_available = true;
+    const output =
+        \\{"decision":{"depth":"regular","performance":false,"reliability":false,"security":false},"onchain_reads":[{"chain":"bsc","address":"0x1234567890abcdef1234567890abcdef12345678","operation":"owner"}],"review":
+    ++ clean_result ++ "}";
+    var screening: MockReviewer = .{ .screen_output = output };
+    const pending = try run(a, &screening, plan);
+    try t.expect(pending.report == null);
+    try t.expectEqual(@as(u32, 1), screening.count);
+    plan.progress = try io.parse(a, core.RouteProgress, try io.json(a, pending.progress));
+    const request = plan.progress.onchain_reads[0];
+    var reviewer: MockReviewer = .{};
+    plan.progress.onchain_observations = &.{.{ .request = request, .block = 42, .value = request.address }};
+    const completed = try run(a, &reviewer, plan);
+    try t.expect(!completed.evidence_limited);
+    try t.expectEqual(@as(?u64, 42), completed.report.?.onchain_observations[0].block);
+    try t.expect(std.mem.indexOf(u8, reviewer.prompts[0], "\"block\":42") != null);
+
+    plan.progress.onchain_observations = &.{.{ .request = request }};
+    var missing: MockReviewer = .{};
+    try t.expect((try run(a, &missing, plan)).evidence_limited);
 }
 
 test "an authorized light model takes over screening after a provider rate limit" {

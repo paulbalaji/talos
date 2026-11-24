@@ -16,6 +16,7 @@ const adaptive = @import("adaptive.zig");
 const usage_meter = @import("usage.zig");
 const followup = @import("followup.zig");
 const followup_git = @import("followup_git.zig");
+const onchain = @import("onchain.zig");
 
 const eq = io.eq;
 const A = io.A;
@@ -265,6 +266,26 @@ const Adapter = struct {
 
     pub fn review(self: *Adapter, engine: core.Engine, prompt: []const u8) ![]const u8 {
         return runReviewer(self.tools, self.repo, engine, prompt);
+    }
+
+    fn onchainReads(self: *Adapter, pr: core.Pull, reads: []const onchain.Request) ![]const onchain.Observation {
+        if (reads.len == 0) return &.{};
+        return self.git_source.onchainReads(pr, reads, self.tools.env.get("PATH") orelse "/usr/bin:/bin");
+    }
+
+    fn previewReads(self: *Adapter, prepared: core.Prepared) ![]const onchain.Observation {
+        if (!prepared.onchain_available or self.repo.light_models.len == 0) return &.{};
+        const screen = routing.inspect(self.files, prepared.snap.limited);
+        if (!screen.ask_model and screen.floor.depth != .multi) return &.{};
+        const a = self.db.a;
+        const prompt = try core.screenPrompt(a, prepared);
+        if (prompt.len > core.review_context_limit) return &.{};
+        for (self.repo.light_models) |reviewer| {
+            const response = invokeReviewer(self.tools, reviewer.engine, .{ .model = reviewer.model, .effort = .default }, core.screen_schema, prompt) catch continue;
+            const result = core.parseScreen(a, response) catch continue;
+            return self.onchainReads(prepared.pr, result.onchain_reads);
+        }
+        return &.{};
     }
 
     pub fn post(self: *Adapter, number: u32, payload: core.Payload) !u64 {
@@ -1057,6 +1078,10 @@ const Main = struct {
                 screen.floor = screen.floor.merge(.{ .depth = .focused, .reliability = true });
                 screen.ask_model = false;
             }
+            if (work.prepared.onchain_available and screen.floor.depth == .multi) screen.ask_model = true;
+            if (progress.onchain_reads.len != 0 and progress.onchain_observations == null) {
+                progress.onchain_observations = try work.adapter.onchainReads(work.prepared.pr, progress.onchain_reads);
+            }
             var evidence: ?[]const u8 = null;
             var evidence_limited = false;
             if (progress.evidence_requests.len != 0) {
@@ -1259,8 +1284,16 @@ const Main = struct {
             }
             var gh_env: std.process.EnvMap = undefined;
             var live = try self.adapter(entry, state, &gh_env);
-            const payload = (try core.run(self.a, &live, entry.repo, &job, .{ .preview = preview })).?;
-            try self.out("{s}\n", .{try io.json(self.a, .{ .repo = entry.repo.name, .pr = job.number, .review = payload })});
+            var prepared = (try core.prepare(self.a, &live, entry.repo, &job, .{ .preview = preview })).?;
+            const observations = try live.previewReads(prepared);
+            prepared.additional_evidence_limited = try core.appendOnchain(self.a, &prepared.context, observations);
+            const results = try core.analyze(self.a, &live, prepared.engines, prepared.context);
+            const payload = (try core.finish(self.a, &live, entry.repo, &job, prepared, results[0..prepared.engines.len])).?;
+            if (observations.len == 0) {
+                try self.out("{s}\n", .{try io.json(self.a, .{ .repo = entry.repo.name, .pr = job.number, .review = payload })});
+            } else {
+                try self.out("{s}\n", .{try io.json(self.a, .{ .repo = entry.repo.name, .pr = job.number, .review = payload, .onchain_observations = observations })});
+            }
         }
     }
 

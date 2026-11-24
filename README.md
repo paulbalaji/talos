@@ -148,6 +148,12 @@ List only providers approved to receive the repo’s source and discussions. Tal
 
 Every model start also counts against the per-tick budget. Adaptive routing reserves enough starts for its strongest possible route and releases unused starts after the job returns. Routing reports and accumulated passes are private local state. Screens use standard speed and skip advisor calls.
 
+### Verify on-chain claims
+
+For adaptive reviews of PRs targeting `hyperlane-xyz/hyperlane-registry` main, the screening reviewer can request up to six public EVM reads. Talos uses `curl` and the HTTPS RPC URLs at the pinned base commit. It checks the chain ID, reads at a specific block, and gives the full reviewers the observed values alongside GitHub check statuses. Reviewers can request `owner()`, Safe `getOwners()` and `getThreshold()`, `paused()`, and whether an address has contract code.
+
+Configure a [lightweight model](#route-reviews-by-risk) to enable these requests. A numbered `run-once` preview includes the observations in its JSON output. Scheduled reviews retain the observations and block heights in `status --json`. Unavailable requested evidence limits coverage and blocks automatic approval. The review checks specific claims about live state. A green CI status by itself does not prove those claims.
+
 ### Configure each repo
 
 Talos starts with Codex as the default. To use Claude Code on a Claude-only machine, run `talos defaults --engine claude` once. New repos use that setting unless you pass `--engine`. Existing repos keep their reviewer settings.
