@@ -274,6 +274,7 @@ const Coverage = struct {
     historical_reasons: []const []const u8 = &.{},
     supplemental_limited: bool,
     truncated_threads: usize,
+    truncated_open_threads: usize = 0,
     omitted_findings: usize,
     reviewers: []const ReviewerCoverage,
     unassessed_thread: ?UnassessedThread = null,
@@ -960,6 +961,8 @@ fn groupFindings(a: A, results: []const ReviewerResult) ![]const FindingGroup {
 
 const EvaluatedReview = struct {
     review: Payload,
+    public_body: []const u8,
+    has_new_findings: bool,
     has_findings: bool,
     blockers: std.EnumSet(ApprovalBlocker),
     coverage: Coverage,
@@ -992,8 +995,12 @@ fn payload(a: A, adapter: anytype, pr: Pull, prepared: Prepared, results: []cons
     var complete = !snap.limited and !prepared.additional_evidence_limited;
     for (results) |result| complete = complete and result.review.complete;
     var truncated_threads: usize = 0;
-    for (threads) |thread| truncated_threads += @intFromBool(thread.truncated);
-    complete = complete and truncated_threads == 0;
+    var truncated_open_threads: usize = 0;
+    for (threads) |thread| {
+        truncated_threads += @intFromBool(thread.truncated);
+        truncated_open_threads += @intFromBool(thread.truncated and !thread.isResolved);
+    }
+    complete = complete and truncated_open_threads == 0;
     const scope = switch (options.focus) {
         .general => "review",
         .@"perf-maxxing" => "performance review",
@@ -1001,12 +1008,9 @@ fn payload(a: A, adapter: anytype, pr: Pull, prepared: Prepared, results: []cons
         .@"security-maxxing" => "security review",
         .simplicity => "simplicity review",
     };
-    try fmt.print("Talos {s} of `{s}`.", .{ scope, pr.headRefOid[0..10] });
+    try fmt.print("{c}{s} of `{s}`.", .{ std.ascii.toUpper(scope[0]), scope[1..], pr.headRefOid[0..10] });
     if (groups.len == 0 and open_findings.len == 0) {
         try fmt.writeAll(if (complete) " No new findings." else " No verified new findings.");
-    }
-    if (groups.len != 0) {
-        try fmt.print(" {d} new finding{s}.", .{ groups.len, if (groups.len == 1) "" else "s" });
     }
     const summary = prepared.synthesis_summary orelse if (results.len == 1) results[0].review.summary else "";
     if (groups.len == 0 and open_findings.len == 0 and summary.len <= 300 and usefulSummary(summary)) {
@@ -1016,7 +1020,9 @@ fn payload(a: A, adapter: anytype, pr: Pull, prepared: Prepared, results: []cons
 
     // Leave room for decision details and for the publication receipt.
     const body_limit = 60 * 1024;
+    const details_start = body.items.len;
     var omitted: usize = 0;
+    var repeated: usize = 0;
     for (groups) |group| {
         var message: std.ArrayList(u8) = .empty;
         for (group.notes.items, 0..) |note, index| {
@@ -1025,7 +1031,14 @@ fn payload(a: A, adapter: anytype, pr: Pull, prepared: Prepared, results: []cons
             try reviewProse(a, &message, note.body);
         }
         if (try adapter.anchor(pr, snap, group.path, group.line)) {
-            try comments.append(a, .{ .path = group.path, .line = group.line, .body = message.items });
+            for (threads) |thread| {
+                if (!thread.isResolved and !thread.isOutdated and thread.diffSide == .RIGHT and thread.line == group.line and
+                    eq(u8, thread.path, group.path) and thread.replies.len != 0 and eq(u8, thread.replies[0].body, message.items)) break;
+            } else {
+                try comments.append(a, .{ .path = group.path, .line = group.line, .body = message.items });
+                continue;
+            }
+            repeated += 1;
         } else {
             const before = body.items.len;
             try fmt.writeAll("\n\n");
@@ -1037,6 +1050,7 @@ fn payload(a: A, adapter: anytype, pr: Pull, prepared: Prepared, results: []cons
             }
         }
     }
+    const details_end = body.items.len;
     if (open_findings.len != 0) {
         try fmt.print("\n\n{d} existing finding{s} still open. ", .{ open_findings.len, if (open_findings.len == 1) "" else "s" });
         for (open_findings[0..@min(open_findings.len, 5)], 0..) |thread, index| {
@@ -1046,13 +1060,14 @@ fn payload(a: A, adapter: anytype, pr: Pull, prepared: Prepared, results: []cons
         if (open_findings.len > 5) try fmt.writeAll(", and more");
         try body.append(a, '.');
     }
+    if (repeated != 0) try fmt.print("\n\n{d} finding{s} already covered by open threads.", .{ repeated, if (repeated == 1) " is" else "s are" });
     if (omitted != 0) try fmt.print("\n\n{d} findings exceeded the review body limit.", .{omitted});
     complete = complete and omitted == 0;
     if (!complete) {
         try fmt.writeAll("\n\nReview coverage was limited.");
         for (snap.coverage_reasons) |reason| try fmt.print("\n- {s}", .{reason});
         if (prepared.additional_evidence_limited) try fmt.writeAll("\n- Some requested evidence was unavailable or exceeded the review budget");
-        if (truncated_threads != 0) try fmt.writeAll("\n- Some review thread replies were truncated");
+        if (truncated_open_threads != 0) try fmt.writeAll("\n- Some open review thread replies were truncated");
         if (!snap.limited and !prepared.additional_evidence_limited) {
             for (reviewer_coverage) |reviewer| {
                 if (!reviewer.complete) try fmt.print("\n- {s} reported incomplete coverage", .{@tagName(reviewer.engine)});
@@ -1067,8 +1082,8 @@ fn payload(a: A, adapter: anytype, pr: Pull, prepared: Prepared, results: []cons
     var blockers: std.EnumSet(ApprovalBlocker) = .initEmpty();
     blockers.setPresent(.focused_review, !options.general());
     blockers.setPresent(.limited_coverage, !complete);
-    blockers.setPresent(.new_findings, groups.len != 0);
-    blockers.setPresent(.open_findings, open_findings.len != 0);
+    blockers.setPresent(.new_findings, groups.len != repeated);
+    blockers.setPresent(.open_findings, open_findings.len != 0 or repeated != 0);
     var clean = blockers.count() == 0;
     var unassessed_thread: ?UnassessedThread = null;
     if (clean) {
@@ -1100,6 +1115,21 @@ fn payload(a: A, adapter: anytype, pr: Pull, prepared: Prepared, results: []cons
             }
         }
     }
+    const unanchored = io.trim(u8, body.items[details_start..details_end], "\n");
+    var requested_summary: std.ArrayList(u8) = .empty;
+    if (options.publish_prompted and comments.items.len == 0 and unanchored.len == 0) {
+        if (summary.len <= 300 and usefulSummary(summary)) {
+            try reviewProse(a, &requested_summary, summary);
+        } else {
+            const status = if (!complete)
+                "Coverage was limited for the requested review."
+            else if (groups.len != 0 or open_findings.len != 0)
+                "Existing findings remain open."
+            else
+                "No findings in the requested scope.";
+            try requested_summary.appendSlice(a, status);
+        }
+    }
     return .{
         .review = .{
             .commit_id = pr.headRefOid,
@@ -1107,6 +1137,8 @@ fn payload(a: A, adapter: anytype, pr: Pull, prepared: Prepared, results: []cons
             .body = body.items,
             .comments = comments.items,
         },
+        .public_body = if (requested_summary.items.len != 0) requested_summary.items else unanchored,
+        .has_new_findings = unanchored.len != 0 or comments.items.len != 0,
         .has_findings = groups.len != 0 or open_findings.len != 0,
         .blockers = blockers,
         .coverage = .{
@@ -1116,6 +1148,7 @@ fn payload(a: A, adapter: anytype, pr: Pull, prepared: Prepared, results: []cons
             .historical_reasons = prepared.historical_coverage_reasons[0..@min(prepared.historical_coverage_reasons.len, 16)],
             .supplemental_limited = prepared.additional_evidence_limited,
             .truncated_threads = truncated_threads,
+            .truncated_open_threads = truncated_open_threads,
             .omitted_findings = omitted,
             .reviewers = reviewer_coverage,
             .unassessed_thread = unassessed_thread,
@@ -1150,6 +1183,45 @@ fn receipt(a: A, repo: Repo, job: Job, reviews: []const Prior) !?Prior {
 fn expected(job: Job, review: Prior) bool {
     return eq(u8, review.state, if (job.event.? == .APPROVE) "APPROVED" else "COMMENTED") or
         eq(u8, review.state, "DISMISSED");
+}
+
+const approval_warning = "Reassess the earlier approval before merging.";
+
+fn activeApproval(reviews: []const Prior, login: []const u8, head: []const u8) ?u64 {
+    var latest: ?Prior = null;
+    for (reviews) |review| {
+        const user = review.user orelse continue;
+        if (!std.ascii.eqlIgnoreCase(user.login, login) or !eq(u8, review.commit_id, head)) continue;
+        if (!eq(u8, review.state, "APPROVED") and !eq(u8, review.state, "CHANGES_REQUESTED") and !eq(u8, review.state, "DISMISSED")) continue;
+        if (latest == null or review.id > latest.?.id) latest = review;
+    }
+    if (latest) |review| if (eq(u8, review.state, "APPROVED")) return review.id;
+    return null;
+}
+
+fn warnedApproval(reviews: []const Prior, login: []const u8, head: []const u8, approval: u64) bool {
+    for (reviews) |review| {
+        const user = review.user orelse continue;
+        if (review.id <= approval or !std.ascii.eqlIgnoreCase(user.login, login) or !eq(u8, review.commit_id, head) or
+            !eq(u8, review.state, "COMMENTED")) continue;
+        const body = review.body orelse continue;
+        if (std.mem.indexOf(u8, body, approval_warning) != null or
+            std.mem.indexOf(u8, body, "Reassess that approval before merging.") != null) return true;
+    }
+    return false;
+}
+
+fn postedBody(reviews: []const Prior, login: []const u8, head: []const u8, text: []const u8) bool {
+    for (reviews) |review| {
+        const user = review.user orelse continue;
+        if (!std.ascii.eqlIgnoreCase(user.login, login) or !eq(u8, review.commit_id, head) or !eq(u8, review.state, "COMMENTED")) continue;
+        const body = review.body orelse continue;
+        const end = std.mem.lastIndexOf(u8, body, "<!-- talos:review:") orelse continue;
+        var visible = io.trim(u8, body[0..end], "\n");
+        if (std.mem.startsWith(u8, visible, approval_warning)) visible = io.trim(u8, visible[approval_warning.len..], "\n");
+        if (eq(u8, visible, text)) return true;
+    }
+    return false;
 }
 
 fn followupId(a: A, job: Job) !?[]const u8 {
@@ -1289,7 +1361,7 @@ pub fn routedPrompt(a: A, context: []const u8, decision: routing.Decision) ![]co
 
 pub fn lightComplete(review: Review, prepared: Prepared) bool {
     if (!review.complete or review.findings.len != 0 or review.existing_open_findings.len != 0 or prepared.snap.limited) return false;
-    for (prepared.threads) |thread| if (!thread.isResolved or thread.truncated) return false;
+    for (prepared.threads) |thread| if (!thread.isResolved) return false;
     return true;
 }
 
@@ -1532,7 +1604,6 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
     if (supports_stacks) try adapter.checkStack(inherited);
     var reviewed = job.*;
     reviewed.review_input = prepared.review_input;
-    if (job.followup) reviewed.receipt = null;
     const evaluated = try payload(a, adapter, latest, prepared, results);
     var result = evaluated.review;
     var blockers = evaluated.blockers;
@@ -1540,7 +1611,7 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
         blockers.insert(.light_review);
         result.event = .COMMENT;
     }
-    const own_pr = if (latest.author) |author| eq(u8, author.login, repo.login) else true;
+    const own_pr = if (latest.author) |author| std.ascii.eqlIgnoreCase(author.login, repo.login) else true;
     reviewed.awaiting_checks = job.awaiting_checks and !repo.approvals and !own_pr and result.event == .APPROVE;
     if (!prepared.dry and result.event == .APPROVE and (!repo.approvals or own_pr)) {
         blockers.setPresent(.approvals_disabled, !repo.approvals);
@@ -1548,11 +1619,28 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
         result.event = .COMMENT;
     }
     reviewed.event = result.event;
-    result.body = try io.fmt(a, "{s}\n\n{s}", .{ result.body, try marker(a, repo, reviewed) });
-    const permitted = !prepared.dry and if (result.event == .APPROVE)
+    const token = try marker(a, repo, reviewed);
+    const enabled = !prepared.dry and if (result.event == .APPROVE)
         repo.approvals
     else
         repo.comments and (prepared.options.request == null or prepared.options.publish_prompted);
+    const requested = prepared.options.publish_prompted;
+    const may_warn = result.event == .COMMENT and job.followup and evaluated.has_findings;
+    const wants_post = result.event == .APPROVE or evaluated.has_new_findings or (requested and evaluated.public_body.len != 0);
+    var permitted = false;
+    var warning = false;
+    if (enabled and (wants_post or may_warn)) {
+        const existing = try adapter.reviews(pr.number);
+        if (try receipt(a, repo, reviewed, existing)) |prior| {
+            try completeJob(a, adapter, repo, job, reviewed, prior.id);
+            return null;
+        }
+        const approval = activeApproval(existing, repo.login, job.head);
+        if (may_warn and approval != null) warning = !warnedApproval(existing, repo.login, job.head, approval.?);
+        const repeated_body = !requested and result.comments.len == 0 and evaluated.has_new_findings and
+            postedBody(existing, repo.login, job.head, evaluated.public_body);
+        permitted = if (result.event == .APPROVE) approval == null else warning or (wants_post and !repeated_body);
+    }
     const reasons = try a.alloc(ApprovalBlocker, blockers.count());
     var blocker_iter = blockers.iterator();
     for (reasons) |*reason| reason.* = blocker_iter.next().?;
@@ -1578,34 +1666,27 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
     };
     if (prepared.dry) return saved;
     if (permitted) {
-        const existing = try adapter.reviews(pr.number);
-        if (try receipt(a, repo, reviewed, existing)) |prior| {
-            try completeJob(a, adapter, repo, job, reviewed, prior.id);
-            return null;
-        }
-        if (job.followup and evaluated.has_findings) {
-            for (existing) |prior| {
-                const user = prior.user orelse continue;
-                if (std.ascii.eqlIgnoreCase(user.login, repo.login) and eq(u8, prior.commit_id, job.head) and eq(u8, prior.state, "APPROVED")) {
-                    result.body = try io.fmt(a, "{s}\n\nThis rereview found an issue after an earlier approval. Reassess that approval before merging.", .{result.body});
-                    break;
-                }
-            }
-        }
         try adapter.checkIdentity();
         const final = try adapter.pull(pr.number);
         if (!sameTarget(pr, final)) return error.TargetChanged;
         if (supports_stacks) try adapter.checkStackBeforePost(inherited, final);
         if (!eq(u8, original_discussion, try io.json(a, try adapter.reviewDiscussion(pr.number)))) return error.ThreadsChanged;
+        if (warning) saved.body = try io.fmt(a, "{s}\n\n{s}", .{ saved.body, approval_warning });
     }
-    saved.body = result.body;
     try adapter.saveResult(job.number, saved);
     if (supports_stacks) try adapter.saveStackContext(pr, snap, result);
     job.review_input = reviewed.review_input;
-    job.receipt = reviewed.receipt;
     job.awaiting_checks = reviewed.awaiting_checks;
     job.last_review = try recordReview(a, prepared, job.last_review, results);
     if (permitted) {
+        var public = result;
+        const body = evaluated.public_body;
+        public.body = if (warning)
+            if (body.len != 0) try io.fmt(a, "{s}\n\n{s}\n\n{s}", .{ approval_warning, body, token }) else try io.fmt(a, "{s}\n\n{s}", .{ approval_warning, token })
+        else if (body.len != 0)
+            try io.fmt(a, "{s}\n\n{s}", .{ body, token })
+        else
+            token;
         // Persist intent before making a network call. A restart can only reconcile this intent.
         job.phase = .uncertain;
         job.analysis = null;
@@ -1622,7 +1703,7 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
             job.expected_inline = anchors;
         }
         try adapter.persist();
-        const id = try adapter.post(pr.number, result);
+        const id = try adapter.post(pr.number, public);
         job.receipt = id;
         try adapter.persist();
         try completeJob(a, adapter, repo, job, job.*, id);

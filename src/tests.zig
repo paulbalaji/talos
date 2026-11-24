@@ -30,6 +30,7 @@ const Fake = struct {
     state: ?*const store.State = null,
     target: core.Pull = fixture_pull,
     offered: ?core.Prior = null,
+    previous_reviews: []const core.Prior = &.{},
     discussion: []const core.Thread = &.{},
     late_discussion: ?[]const core.Thread = null,
     comments: []const core.Reply = &.{},
@@ -64,7 +65,8 @@ const Fake = struct {
     }
 
     pub fn reviews(self: *Fake, _: u32) ![]const core.Prior {
-        return if (self.offered != null) @as(*const [1]core.Prior, @ptrCast(&self.offered.?)) else &.{};
+        if (self.offered) |latest| return std.mem.concat(self.a, core.Prior, &.{ self.previous_reviews, &.{latest} });
+        return self.previous_reviews;
     }
 
     pub fn reviewDiscussion(self: *Fake, _: u32) !core.Discussion {
@@ -202,7 +204,7 @@ test "same-head discussion changes get one new receipt and survive an ambiguous 
     job.observeReviewInput(try core.ReviewInput.init(a, repo, fixture_pull, base, try fake.reviewDiscussion(42)), false, repo.approvals);
     try t.expectEqual(core.Phase.pending, job.phase);
     fake.lose_response = true;
-    fake.result = clean;
+    fake.result = finding;
     try t.expectError(error.GitHubPostUnconfirmed, core.run(a, &fake, repo, &job, .scheduled));
     try t.expectEqual(core.Phase.uncertain, job.phase);
     try t.expectEqual(@as(usize, 2), fake.posts);
@@ -381,7 +383,122 @@ test "truncated discussion withholds approval and new findings flag an earlier a
     job.followup_id = @splat(1);
     const result = (try core.run(a, &fake, configured, &job, .scheduled)).?;
     try t.expectEqual(core.Event.COMMENT, result.event);
-    try t.expect(std.mem.indexOf(u8, result.body, "Reassess that approval before merging.") != null);
+    try t.expect(std.mem.indexOf(u8, result.body, "Reassess the earlier approval before merging.") != null);
+    try t.expect(std.mem.startsWith(u8, fake.posted_result.?.body, "Reassess the earlier approval before merging."));
+}
+
+test "coverage-only rereviews and findings already on an open thread stay local" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fake: Fake = .{ .a = a, .source_limited = true, .result = clean };
+    var job: core.Job = .{ .number = 42, .head = head, .followup = true, .receipt = 31 };
+    const partial = (try core.run(a, &fake, repo, &job, .scheduled)).?;
+    try t.expectEqual(.local, partial.explanation.?.publication);
+    try t.expect(!partial.explanation.?.coverage.complete);
+    try t.expectEqual(@as(?u64, 31), job.receipt);
+    try t.expectEqual(@as(usize, 0), fake.posts);
+
+    fake.source_limited = false;
+    fake.result = finding;
+    var existing = open_nit;
+    existing.diffSide = .RIGHT;
+    existing.replies = &.{.{ .author = null, .body = "**P2.** The cursor skips a height.", .url = "existing" }};
+    fake.discussion = &.{existing};
+    job = .{ .number = 42, .head = head, .followup = true };
+    const quiet = (try core.run(a, &fake, repo, &job, .scheduled)).?;
+    try t.expectEqual(.local, quiet.explanation.?.publication);
+    try t.expectEqual(@as(usize, 1), quiet.explanation.?.blockers.len);
+    try t.expectEqual(.open_findings, quiet.explanation.?.blockers[0]);
+    try t.expectEqual(@as(usize, 0), quiet.comments.len);
+    try t.expectEqual(@as(usize, 0), fake.posts);
+}
+
+test "a same-head approval and its warning are not posted twice" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var configured = repo;
+    configured.approvals = true;
+    const approval: core.Prior = .{ .id = 30, .commit_id = head, .state = "APPROVED", .user = .{ .login = repo.login }, .body = null };
+    var fake: Fake = .{ .a = a, .result = clean, .previous_reviews = &.{approval} };
+    var job: core.Job = .{ .number = 42, .head = head, .followup = true, .receipt = 30 };
+    const quiet = (try core.run(a, &fake, configured, &job, .scheduled)).?;
+    try t.expectEqual(.APPROVE, quiet.event);
+    try t.expectEqual(.local, quiet.explanation.?.publication);
+    try t.expectEqual(@as(?u64, 30), job.receipt);
+
+    const warning: core.Prior = .{
+        .id = 31,
+        .commit_id = head,
+        .state = "COMMENTED",
+        .user = .{ .login = repo.login },
+        .body = "Reassess the earlier approval before merging.",
+    };
+    fake.previous_reviews = &.{ approval, warning };
+    fake.discussion = &.{open_nit};
+    fake.result =
+        \\{"complete":true,"summary":"Still actionable.","findings":[],"existing_open_findings":["thread-1"],"non_blocking_threads":[]}
+    ;
+    job = .{ .number = 42, .head = head, .followup = true, .receipt = 31 };
+    const unchanged = (try core.run(a, &fake, configured, &job, .scheduled)).?;
+    try t.expectEqual(.local, unchanged.explanation.?.publication);
+    try t.expectEqual(@as(usize, 0), fake.posts);
+}
+
+test "a clean rereview can approve again after the latest approval was dismissed" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var configured = repo;
+    configured.approvals = true;
+    const approval: core.Prior = .{ .id = 30, .commit_id = head, .state = "APPROVED", .user = .{ .login = repo.login }, .body = null };
+    var dismissed = approval;
+    dismissed.id = 31;
+    dismissed.state = "DISMISSED";
+    var fake: Fake = .{ .a = a, .result = clean, .previous_reviews = &.{ approval, dismissed } };
+    var job: core.Job = .{ .number = 42, .head = head, .followup = true };
+    const result = (try core.run(a, &fake, configured, &job, .scheduled)).?;
+    try t.expectEqual(.APPROVE, result.event);
+    try t.expectEqual(.verified, result.explanation.?.publication);
+    try t.expectEqual(@as(usize, 1), fake.posts);
+}
+
+test "truncated replies only block approval on an open thread" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var configured = repo;
+    configured.approvals = true;
+    for ([_]bool{ false, true }) |resolved| {
+        var thread = open_nit;
+        thread.isResolved = resolved;
+        thread.truncated = true;
+        var fake: Fake = .{ .a = a, .result = assessed, .discussion = &.{thread} };
+        var job: core.Job = .{ .number = 42, .head = head, .followup = true };
+        const result = (try core.run(a, &fake, configured, &job, .scheduled)).?;
+        try t.expectEqual(if (resolved) core.Event.APPROVE else .COMMENT, result.event);
+        try t.expectEqual(@as(usize, 1), result.explanation.?.coverage.truncated_threads);
+        try t.expectEqual(@as(usize, if (resolved) 0 else 1), result.explanation.?.coverage.truncated_open_threads);
+        try t.expectEqual(@as(usize, if (resolved) 1 else 0), fake.posts);
+    }
+}
+
+test "a repeated unanchored finding on the same head stays local" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const unanchored =
+        \\{"complete":true,"summary":"Static review.","findings":[{"severity":"P2","path":"src/watch.rs","line":21,"body":"The cursor skips a height."}],"existing_open_findings":[],"non_blocking_threads":[]}
+    ;
+    var fake: Fake = .{ .a = a, .result = unanchored };
+    var job: core.Job = .{ .number = 42, .head = head };
+    _ = (try core.run(a, &fake, repo, &job, .scheduled)).?;
+    try t.expect(std.mem.startsWith(u8, fake.posted_result.?.body, "src/watch.rs:21."));
+    job = .{ .number = 42, .head = head, .followup = true, .followup_id = @splat(1) };
+    const result = (try core.run(a, &fake, repo, &job, .scheduled)).?;
+    try t.expectEqual(.local, result.explanation.?.publication);
+    try t.expectEqual(@as(usize, 1), fake.posts);
 }
 
 test "effective diff changes and human conversation comments trigger review" {
@@ -572,6 +689,7 @@ test "publishes one commit-bound comment, verifies it, and deduplicates a second
     try t.expectEqual(@as(usize, 1), fake.readbacks);
     const payload = fake.posted_result.?;
     try t.expectEqualStrings(head, payload.commit_id);
+    try t.expect(std.mem.startsWith(u8, payload.body, "<!-- talos:review:"));
     try t.expectEqual(@as(usize, 1), payload.comments.len);
     try t.expectEqual(@as(u32, 20), payload.comments[0].line);
 
@@ -613,6 +731,8 @@ test "multiple reviewers produce one verified review with one comment per anchor
     try t.expect(std.mem.indexOf(u8, review.comments[0].body, "The cursor is saved before processing succeeds.") != null);
     try t.expect(std.mem.indexOf(u8, review.body, "src/watch.rs:40") != null);
     try t.expectEqual(@as(usize, 1), std.mem.count(u8, review.body, "1 existing finding still open. unresolved"));
+    try t.expect(std.mem.startsWith(u8, fake.posted_result.?.body, "src/watch.rs:40."));
+    try t.expect(std.mem.indexOf(u8, fake.posted_result.?.body, "existing finding") == null);
     try t.expect(std.mem.indexOf(u8, review.body, "Second pass.") == null);
     try t.expect(std.mem.indexOf(u8, review.body, "Third pass.") == null);
     try t.expectEqual(@as(usize, 1), fake.posts);
@@ -960,13 +1080,17 @@ test "approval with open threads requires every reviewer to give a reason and no
         var job: core.Job = .{ .number = fixture_pull.number, .head = head };
         const result = (try core.run(a, &fake, configured, &job, .scheduled)).?;
         try t.expectEqual(case.expected, result.event);
-        try t.expectEqual(case.expected, fake.posted_result.?.event);
         try t.expectEqual(case.expected, fake.saved_result.?.event);
         try t.expectEqual(@as(usize, 0), result.comments.len);
         try t.expect(std.mem.indexOf(u8, fake.prompt_text, author_reply) != null);
         if (case.expected == .APPROVE) {
+            try t.expectEqual(.APPROVE, fake.posted_result.?.event);
+            try t.expect(std.mem.startsWith(u8, fake.posted_result.?.body, "<!-- talos:review:"));
             try t.expect(std.mem.indexOf(u8, result.body, "1 open thread can stay open.") != null);
             try t.expectEqual(@as(usize, 1), std.mem.count(u8, result.body, "Duplicate wakeups already coalesce"));
+        } else {
+            try t.expect(fake.posted_result == null);
+            try t.expectEqual(.local, result.explanation.?.publication);
         }
     }
 }
@@ -1044,7 +1168,7 @@ test "a queued focused review survives restart and publishes only with explicit 
         try t.expectEqual(core.Event.COMMENT, result.event);
         try t.expectEqual(publish, fake.posted_result != null);
         try t.expect(std.mem.indexOf(u8, fake.prompt_text, request) != null);
-        try t.expect(std.mem.indexOf(u8, result.body, "performance review") != null);
+        try t.expect(std.mem.indexOf(u8, result.body, "Performance review") != null);
         try t.expect(std.mem.indexOf(u8, result.body, request) == null);
     }
 }
@@ -1064,7 +1188,7 @@ test "non-blocking thread assessments need a reason and unique IDs" {
     ));
 }
 
-test "a clean lightweight result publishes a comment under an approval policy" {
+test "a clean lightweight result stays local under an approval policy" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1075,6 +1199,8 @@ test "a clean lightweight result publishes a comment under an approval policy" {
     var prepared = (try core.prepare(a, &fake, configured, &job, .scheduled)).?;
     prepared.route_depth = .light;
     const candidate = core.ReviewerResult{ .engine = .codex, .review = try core.parseReview(a, clean) };
-    _ = (try core.finish(a, &fake, configured, &job, prepared, &.{candidate})).?;
-    try t.expectEqual(core.Event.COMMENT, fake.posted_result.?.event);
+    const result = (try core.finish(a, &fake, configured, &job, prepared, &.{candidate})).?;
+    try t.expectEqual(core.Event.COMMENT, result.event);
+    try t.expectEqual(.local, result.explanation.?.publication);
+    try t.expect(fake.posted_result == null);
 }
