@@ -204,7 +204,14 @@ fn completeReviews(a: io.A, reviewer: anytype, plan: Plan, progress: *core.Route
             },
         };
         progress.completion_attempted |= bit;
-        const review = core.parseReview(a, raw) catch continue;
+        var review = core.parseReview(a, raw) catch continue;
+        for (result.review.evidence_requests) |request| {
+            if (core.hasEvidenceRequest(provided, request) or core.hasEvidenceRequest(progress.evidence_requests, request)) continue;
+            review.complete = false;
+            // Keep the first pass's gap when the retry drops an unfulfilled request.
+            if (review.coverage_gaps.len == 0) review.coverage_gaps = result.review.coverage_gaps;
+            break;
+        }
         result.review = try core.preserveFindings(a, result.review, review);
     }
     return true;
@@ -428,6 +435,31 @@ test "completion never repeats a request and retains incomplete findings through
     try t.expectEqual(@as(u8, 1), repeated.report.?.evidence_passes);
     try t.expect(!repeated.progress.results[0].review.complete);
     try t.expectEqual(@as(usize, 1), repeated.progress.results[0].review.findings.len);
+}
+
+test "a clean completion cannot clear a material source request left out of the batch" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const requests: []const core.EvidenceRequest = &.{
+        .{ .path = "caller.zig", .start_line = 10, .end_line = 12 },
+        .{ .path = "retry.zig", .start_line = 6, .end_line = 12 },
+    };
+    var first = try core.parseReview(a, requesting_result);
+    first.evidence_requests = requests;
+    var plan = sample_plan;
+    plan.progress.screen_waiting = false;
+    plan.progress.decision = .{};
+    plan.progress.results = &.{.{ .engine = .codex, .review = first }};
+    plan.progress.completion_requests = requests[0..1];
+    plan.completion_evidence = .{ .source = "caller evidence", .provided = requests[0..1] };
+
+    var reviewer: MockReviewer = .{};
+    const finished = try run(a, &reviewer, plan);
+    try t.expectEqual(@as(u8, 1), finished.report.?.evidence_passes);
+    try t.expect(!finished.progress.results[0].review.complete);
+    try t.expectEqualStrings(first.coverage_gaps[0], finished.progress.results[0].review.coverage_gaps[0]);
 }
 
 const sample_plan: Plan = .{
