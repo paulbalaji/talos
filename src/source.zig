@@ -27,6 +27,7 @@ pub const Supplement = struct {
     evidence: []const u8 = "",
     limited: bool = false,
     coverage_reasons: []const []const u8 = &.{},
+    excerpts: []const struct { request: core.EvidenceRequest, end_offset: usize } = &.{},
 };
 
 const diff_flags = [_][]const u8{
@@ -505,9 +506,11 @@ pub const Git = struct {
         }
         var remaining: usize = supplement_limit;
         var requests_incomplete = requests.len > max_requests;
+        var excerpts: std.ArrayList(std.meta.Child(@FieldType(Supplement, "excerpts"))) = .empty;
         for (requests[0..@min(requests.len, max_requests)], 1..) |request, index| {
             if (self.appendExcerpt(cache_path, head, request, null, &evidence, &remaining)) |complete| {
                 requests_incomplete = requests_incomplete or !complete;
+                try excerpts.append(a, .{ .request = request, .end_offset = evidence.items.len });
             } else |err| {
                 if (err == error.OutOfMemory) return err;
                 try writer.print("Evidence request {d} omitted ({s}).\n", .{ index, excerptOmission(err) });
@@ -518,7 +521,7 @@ pub const Git = struct {
             try writer.writeAll("Remaining evidence requests omitted (request budget).\n");
         }
         if (requests_incomplete) try coverage.append(a, "Some requested pinned source excerpts were omitted or clipped.");
-        return .{ .evidence = evidence.items, .limited = coverage.items.len != 0, .coverage_reasons = coverage.items };
+        return .{ .evidence = evidence.items, .limited = coverage.items.len != 0, .coverage_reasons = coverage.items, .excerpts = excerpts.items };
     }
 
     fn appendExcerpt(self: Git, cache_path: []const u8, head: []const u8, request: core.EvidenceRequest, anchor_line: ?u32, evidence: *std.ArrayList(u8), remaining: *usize) !bool {

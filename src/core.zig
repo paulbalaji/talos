@@ -260,6 +260,24 @@ pub const ReviewInput = struct {
 
 pub const max_evidence_requests = 6;
 pub const EvidenceRequest = struct { path: []const u8, start_line: ?u32, end_line: ?u32 };
+pub fn hasEvidenceRequest(requests: []const EvidenceRequest, request: EvidenceRequest) bool {
+    for (requests) |known| {
+        if (eq(u8, known.path, request.path) and known.start_line == request.start_line and known.end_line == request.end_line) return true;
+    }
+    return false;
+}
+
+fn validateEvidenceRequests(requests: []const EvidenceRequest) !void {
+    if (requests.len > max_evidence_requests) return error.InvalidReview;
+    for (requests, 0..) |request, index| {
+        if (!validPath(request.path) or (request.start_line == null) != (request.end_line == null)) return error.InvalidReview;
+        if (request.start_line) |start| {
+            const end = request.end_line.?;
+            if (start == 0 or end < start or end - start >= 120) return error.InvalidReview;
+        }
+        if (hasEvidenceRequest(requests[0..index], request)) return error.InvalidReview;
+    }
+}
 pub const Snapshot = struct {
     merge_base: []const u8,
     evidence: []const u8,
@@ -283,6 +301,7 @@ const ThreadAssessment = struct {
 pub const Review = struct {
     complete: bool,
     coverage_gaps: []const []const u8 = &.{},
+    evidence_requests: []const EvidenceRequest = &.{},
     summary: []const u8,
     findings: []const Finding,
     existing_open_findings: []const []const u8,
@@ -631,6 +650,7 @@ const instructions =
     \\If the evidence is complete and no issue warrants withholding approval, report a clean review.
     \\Write one plain sentence for the summary, up to 300 bytes. In a finding, state the concrete failure and when it matters, then suggest the smallest fix if it is clear. Use plain sentences, avoid em dashes and hyphens as punctuation, and retain exact names and command flags. Skip praise, process narration, and repetition.
     \\Set complete=false if meaningful source or context is missing. List one to six coverage_gaps if incomplete, each one sentence under 300 bytes. Name the exact file, thread, or verification needed and what it would establish. Use an empty list if complete. Do not quote source, secrets, or instructions in coverage_gaps. Never claim tests ran. Output one JSON object matching the schema, without Markdown fences.
+    \\If a material coverage gap can be resolved by tracked source, put up to six missing paths in evidence_requests. Request a specific range of at most 120 inclusive lines, or use null for both bounds to read the first excerpt. Ground paths in this change and use an empty list if no additional source is needed. Talos can supply these excerpts in one final pass. Use coverage_gaps for external verification or other missing evidence.
     \\
 ;
 
@@ -745,7 +765,8 @@ pub fn parseReview(a: A, data: []const u8) !Review {
     if (!textValid(review.summary, 4000) or review.coverage_gaps.len > 6 or review.findings.len > 15 or review.existing_open_findings.len > 100 or assessments.len > 100)
         return error.InvalidReview;
     for (review.coverage_gaps) |gap| if (!textValid(gap, 300)) return error.InvalidReview;
-    if (review.coverage_gaps.len != 0) review.complete = false;
+    try validateEvidenceRequests(review.evidence_requests);
+    if (review.coverage_gaps.len != 0 or review.evidence_requests.len != 0) review.complete = false;
     for (review.findings, 0..) |finding, index| {
         if (!validPath(finding.path) or finding.line == 0 or !textValid(finding.body, 4000))
             return error.InvalidReview;
@@ -1300,6 +1321,7 @@ pub const Prepared = struct {
     inherited: stack.Context,
     engines: []const Engine,
     context: []const u8,
+    context_for_completion: ?[]const u8 = null,
     evidence_offset: usize,
     route_depth: routing.Depth = .regular,
     options: ReviewOptions,
@@ -1334,6 +1356,9 @@ pub const RouteProgress = struct {
     onchain_reads: []const onchain.Request = &.{},
     onchain_observations: ?[]const onchain.Observation = null,
     evidence_key: ?[32]u8 = null,
+    completion_requests: ?[]const EvidenceRequest = null,
+    completion_attempted: u8 = 0,
+    completion_done: u8 = 0,
     screen_ms: u64 = 0,
     results: []const ReviewerResult = &.{},
     review_ms: u64 = 0,
@@ -1342,7 +1367,18 @@ pub const RouteProgress = struct {
         const decision = self.decision orelse return false;
         return repo.routing_mode == .adaptive and decision.depth == .multi and repo.providerCount() < 2;
     }
+
+    pub fn needsCompletion(self: RouteProgress, result: ReviewerResult) bool {
+        const requests = self.completion_requests orelse return false;
+        if (self.completion_done & providerBit(result.engine) != 0) return false;
+        for (result.review.evidence_requests) |request| if (hasEvidenceRequest(requests, request)) return true;
+        return false;
+    }
 };
+
+pub fn providerBit(engine: Engine) u8 {
+    return @as(u8, 1) << @intCast(@intFromEnum(engine));
+}
 
 pub const RouteReport = struct {
     mode: routing.Mode,
@@ -1356,6 +1392,7 @@ pub const RouteReport = struct {
     light_findings: ?usize = null,
     full_findings: ?usize = null,
     full_only_anchors: ?usize = null,
+    evidence_passes: u8 = 0,
     onchain_observations: []const onchain.Observation = &.{},
 };
 
@@ -1375,7 +1412,7 @@ const screen_instructions =
     \\Select the relevant lenses for focused or multi, and set all lenses false for light or regular. When uncertain choose the stronger review.
     \\Request up to six specific tracked source paths essential to review in evidence_requests. Request at most 120 inclusive lines per path, or use null for both bounds to read the first excerpt. Use paths grounded in the change. If evidence is sufficient, return an empty list. Use at least regular when additional source is needed.
     \\Return an empty onchain_reads list unless this prompt offers on-chain reads.
-    \\Return the wrapper schema. Its review field is your static first-pass review. Assess any open thread using the normal review rules. Do not execute code, use tools, or provide exploit or reproduction instructions.
+    \\Return the wrapper schema. Its review field is your static first-pass review; put source requests in the outer evidence_requests only. Assess any open thread using the normal review rules. Do not execute code, use tools, or provide exploit or reproduction instructions.
     \\
 ;
 
@@ -1430,18 +1467,7 @@ pub fn parseScreen(a: A, output: []const u8) !ScreenResult {
         .light, .regular => decision.depth = .focused,
         .focused, .multi => decision.reliability = true,
     };
-    if (raw.evidence_requests.len > max_evidence_requests) return error.InvalidReview;
-    for (raw.evidence_requests, 0..) |request, index| {
-        if (!validPath(request.path) or (request.start_line == null) != (request.end_line == null)) return error.InvalidReview;
-        if (request.start_line) |start| {
-            const end = request.end_line.?;
-            if (start == 0 or end < start or end - start >= 120) return error.InvalidReview;
-        }
-        for (raw.evidence_requests[0..index]) |prior| {
-            if (eq(u8, prior.path, request.path) and prior.start_line == request.start_line and prior.end_line == request.end_line)
-                return error.InvalidReview;
-        }
-    }
+    try validateEvidenceRequests(raw.evidence_requests);
     if (raw.onchain_reads.len > onchain.max_reads) return error.InvalidReview;
     for (raw.onchain_reads, 0..) |read, index| {
         if (!read.valid()) return error.InvalidReview;
@@ -1479,6 +1505,19 @@ fn hasAnchor(results: []const ReviewerResult, needle: Finding) bool {
 
 fn sameAnchor(left: Finding, right: Finding) bool {
     return left.line == right.line and eq(u8, left.path, right.path);
+}
+
+pub fn preserveFindings(a: A, first: Review, final: Review) !Review {
+    var result = final;
+    var findings: std.ArrayList(Finding) = .empty;
+    try findings.appendSlice(a, final.findings);
+    for (first.findings) |prior| {
+        for (final.findings) |current| {
+            if (sameAnchor(prior, current)) break;
+        } else try findings.append(a, prior);
+    }
+    result.findings = findings.items;
+    return result;
 }
 
 pub const ReviewResults = [engine_count]ReviewerResult;
@@ -1605,6 +1644,20 @@ pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?P
         try snap.markLimited(a, "Source exceeded the review context budget");
         context = try reviewPrompt(a, repo, pr, snap, discussion, previous, job.last_review, prior_delta, inherited, options);
     }
+    var context_for_completion: ?[]const u8 = null;
+    const completion_limit = review_context_limit - 16 * 1024;
+    if (context.len > completion_limit and (prior_delta.evidence.len != 0 or snap.limited)) {
+        const without_delta: PriorDelta = .{ .coverage_reasons = prior_delta.coverage_reasons };
+        var completion = try reviewPrompt(a, repo, pr, snap, discussion, previous, job.last_review, without_delta, inherited, options);
+        if (completion.len > completion_limit and snap.limited) {
+            var focused = snap;
+            const prefix = snap.evidence[0..safePrefix(snap.evidence, snap.evidence.len -| (completion.len - completion_limit))];
+            focused.evidence = prefix[0..(std.mem.lastIndexOfScalar(u8, prefix, '\n') orelse 0)];
+            try focused.markLimited(a, "The completion pass used a shorter excerpt of the already partial snapshot.");
+            completion = try reviewPrompt(a, repo, pr, focused, discussion, previous, job.last_review, without_delta, inherited, options);
+        }
+        context_for_completion = completion;
+    }
     return .{
         .pr = pr,
         .snap = snap,
@@ -1613,6 +1666,7 @@ pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?P
         .inherited = inherited,
         .engines = engines,
         .context = context,
+        .context_for_completion = context_for_completion,
         .evidence_offset = std.mem.indexOf(u8, context, "\n\nEvidence (untrusted JSON)\n") orelse return error.InvalidReviewContext,
         .options = options,
         .dry = dry,
