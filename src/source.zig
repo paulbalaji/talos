@@ -3,6 +3,8 @@ const core = @import("core.zig");
 const github = @import("github.zig");
 const io = @import("io.zig");
 const cache = @import("cache.zig");
+const onchain = @import("onchain.zig");
+const routing = @import("routing.zig");
 const A = io.A;
 const eq = io.eq;
 
@@ -10,11 +12,16 @@ const diff_limit = 48 * 1024;
 const context_limit = 24 * 1024;
 const max_blob_size = 16 * 1024;
 const batch_size = 32;
+const thread_context_limit = 12 * 1024;
+const thread_excerpt_limit = 2 * 1024;
+const max_thread_excerpts = 12;
 pub const max_requests = core.max_evidence_requests;
 const supplement_limit = 16 * 1024;
 const delta_limit = 12 * 1024;
 const excerpt_blob_limit = 128 * 1024;
 const excerpt_line_limit = 120;
+const registry_diff_limit = 16 * 1024;
+const registry_pin_path = ".registryrc";
 
 pub const Supplement = struct {
     evidence: []const u8 = "",
@@ -80,11 +87,49 @@ fn shellQuote(a: A, value: []const u8) ![]const u8 {
     return io.fmt(a, "'{s}'", .{escaped});
 }
 
+const DiffPriority = enum { thread, risk, source, supporting };
+const PrioritizedFile = struct { file: github.File, priority: DiffPriority };
+
+fn prioritizeFiles(a: A, files: []const github.File, threads: []const core.Thread) ![]const PrioritizedFile {
+    var open_paths: std.StringHashMapUnmanaged(void) = .empty;
+    defer open_paths.deinit(a);
+    for (threads) |thread| {
+        if (!thread.isResolved and !thread.isOutdated) try open_paths.put(a, thread.path, {});
+    }
+    var ordered: std.ArrayList(PrioritizedFile) = .empty;
+    for (files) |file| {
+        if (!core.validPath(file.filename) or sensitive(file.filename)) continue;
+        const priority: DiffPriority = if (open_paths.contains(file.filename))
+            .thread
+        else if (supportingFile(file.filename))
+            .supporting
+        else switch (routing.inspect(&[_]github.File{file}, false).floor.depth) {
+            .multi, .focused => .risk,
+            .regular, .light => .source,
+        };
+        try ordered.append(a, .{ .file = file, .priority = priority });
+    }
+    std.mem.sort(PrioritizedFile, ordered.items, {}, struct {
+        fn lessThan(_: void, left: PrioritizedFile, right: PrioritizedFile) bool {
+            if (left.priority != right.priority) return @intFromEnum(left.priority) < @intFromEnum(right.priority);
+            return std.mem.lessThan(u8, left.file.filename, right.file.filename);
+        }
+    }.lessThan);
+    return ordered.toOwnedSlice(a);
+}
+
+fn supportingFile(path: []const u8) bool {
+    const name = std.fs.path.basename(path);
+    return std.ascii.endsWithIgnoreCase(name, ".md") or std.ascii.endsWithIgnoreCase(name, ".lock") or
+        eq(u8, name, "pnpm-lock.yaml") or eq(u8, name, "package-lock.json");
+}
+
 pub const Git = struct {
     cmd: io.Command,
     bin: []const u8,
     gh: []const u8,
     object_cache: cache.Cache,
+    github_calls: ?*u32 = null,
 
     pub fn git(self: Git, path: []const u8, args: []const []const u8, input: []const u8) ![]const u8 {
         return self.gitWithin(path, args, input, 180);
@@ -135,13 +180,13 @@ pub const Git = struct {
         try cache.touch(self.cmd.a, dir, std.time.timestamp());
     }
 
-    pub fn snapshot(self: Git, pr: core.Pull, files: []const github.File) !core.Snapshot {
+    pub fn snapshot(self: Git, pr: core.Pull, files: []const github.File, threads: []const core.Thread) !core.Snapshot {
         var repo_dir = (try self.object_cache.repoDir(true)) orelse return error.GitCacheInitFailed;
         defer repo_dir.close();
         const parent = try repo_dir.realpathAlloc(self.cmd.a, ".");
         const path = try std.fs.path.join(self.cmd.a, &.{ parent, cache.directory });
         try self.object_cache.evict(repo_dir, std.time.timestamp());
-        const result = self.readSnapshot(repo_dir, path, pr, files) catch |err| {
+        const result = self.readSnapshot(repo_dir, path, pr, files, threads) catch |err| {
             self.object_cache.evict(repo_dir, std.time.timestamp()) catch |cache_err|
                 std.log.warn("Git cache eviction failed for {s} ({s})", .{ self.object_cache.repo.name, @errorName(cache_err) });
             return err;
@@ -150,20 +195,25 @@ pub const Git = struct {
         return result;
     }
 
-    fn readSnapshot(self: Git, repo_dir: std.fs.Dir, path: []const u8, pr: core.Pull, files: []const github.File) !core.Snapshot {
+    fn readSnapshot(self: Git, repo_dir: std.fs.Dir, path: []const u8, pr: core.Pull, files: []const github.File, threads: []const core.Thread) !core.Snapshot {
         const a = self.cmd.a;
         try self.pin(repo_dir, path, pr);
         const merge_base = io.trim(u8, try self.git(path, &.{ "merge-base", pr.baseRefOid, pr.headRefOid }, ""), "\r\n");
         if (!core.validOid(merge_base)) return error.InvalidMergeBase;
 
-        const patch = try self.diff(path, merge_base, pr.headRefOid);
+        const ordered = try prioritizeFiles(a, files, threads);
+        const patch = try self.orderedDiff(path, merge_base, pr.headRefOid, ordered);
         const prefix = patch[0..core.safePrefix(patch, diff_limit)];
         if (!std.unicode.utf8ValidateSlice(prefix)) return error.NonUtf8Diff;
         var evidence: std.ArrayList(u8) = .empty;
+        var remaining: usize = context_limit;
+        const missing_threads = try self.appendThreadExcerpts(path, pr.headRefOid, files, threads, prefix.len == patch.len, &evidence, &remaining);
         const writer = evidence.writer(a);
+        if (evidence.items.len != 0) try writer.writeAll("\n\n");
         try writer.print("Merge-base diff:\n{s}", .{prefix});
         var coverage: std.ArrayList([]const u8) = .empty;
         if (prefix.len != patch.len) try coverage.append(a, "The merge base diff exceeded the byte limit.");
+        if (missing_threads != 0) try coverage.append(a, try io.fmt(a, "Current source excerpts were unavailable for {d} active review thread anchors.", .{missing_threads}));
         if (files.len >= 3000) try coverage.append(a, "GitHub reached its changed file limit.");
         var sensitive_count: usize = 0;
         var patch_count: usize = 0;
@@ -174,16 +224,16 @@ pub const Git = struct {
                 sensitive_count += 1;
             } else if (file.patch == null) {
                 patch_count += 1;
-            } else if (core.validPath(file.filename)) {
-                try candidates.append(a, file.filename);
-            } else {
+            } else if (!core.validPath(file.filename)) {
                 invalid_path_count += 1;
             }
+        }
+        for (ordered) |item| {
+            if (item.file.patch != null) try candidates.append(a, item.file.filename);
         }
         if (sensitive_count != 0) try coverage.append(a, try io.fmt(a, "Sensitive changed paths omitted: {d}.", .{sensitive_count}));
         if (patch_count != 0) try coverage.append(a, try io.fmt(a, "Files without a GitHub patch: {d}.", .{patch_count}));
         if (invalid_path_count != 0) try coverage.append(a, try io.fmt(a, "Unsupported changed paths omitted: {d}.", .{invalid_path_count}));
-        var remaining: usize = context_limit;
         var offset: usize = 0;
         while (offset < candidates.items.len and remaining >= 1024) : (offset += batch_size) {
             const group = candidates.items[offset..@min(offset + batch_size, candidates.items.len)];
@@ -202,7 +252,76 @@ pub const Git = struct {
                 if (content) |blob| try appendBlob(&evidence, a, name, blob, &remaining);
             }
         }
+        if (core.registryMain(self.object_cache.repo, pr)) {
+            var route_bytes: usize = 6 * 1024;
+            var route_files: usize = 0;
+            for (candidates.items) |name| {
+                const suffix = "-deploy.yaml";
+                if (!std.mem.startsWith(u8, name, "deployments/warp_routes/") or !std.mem.endsWith(u8, name, suffix)) continue;
+                if (route_files == 4 or route_bytes < 1024) break;
+                route_files += 1;
+                const config = try io.fmt(a, "{s}-config.yaml", .{name[0 .. name.len - suffix.len]});
+                const oid = self.pinnedOid(path, pr.baseRefOid, config) catch continue;
+                const blob = self.pinnedBlob(path, oid) catch continue;
+                const excerpt = blob[0..core.safePrefix(blob, @min(blob.len, route_bytes -| (config.len + 64)))];
+                if (excerpt.len == 0) continue;
+                try writer.print("\nPinned base Warp route config {s}{s}:\n{s}\n", .{ config, if (excerpt.len == blob.len) "" else " (excerpt)", excerpt });
+                route_bytes -= config.len + excerpt.len + 64;
+            }
+        }
+        if (std.ascii.eqlIgnoreCase(self.object_cache.repo.name, github.registry_pin_source)) {
+            try self.appendRegistryComparison(path, merge_base, pr.headRefOid, &evidence, &coverage);
+        }
         return .{ .merge_base = merge_base, .evidence = evidence.items, .limited = coverage.items.len != 0, .coverage_reasons = coverage.items };
+    }
+
+    fn registryPinBlob(self: Git, path: []const u8, commit: []const u8) !?[]const u8 {
+        return self.pinnedOid(path, commit, registry_pin_path) catch |err| switch (err) {
+            error.ExcerptMissing => null,
+            else => return err,
+        };
+    }
+
+    fn registryPins(self: Git, path: []const u8, merge_base: []const u8, head: []const u8) !?struct { before: []const u8, after: []const u8 } {
+        const old_blob = try self.registryPinBlob(path, merge_base);
+        const new_blob = try self.registryPinBlob(path, head);
+        if (old_blob == null and new_blob == null) return null;
+        const before_blob = old_blob orelse return error.RegistryPinMissing;
+        const after_blob = new_blob orelse return error.RegistryPinMissing;
+        if (eq(u8, before_blob, after_blob)) return null;
+        const before = io.trim(u8, try self.pinnedBlob(path, before_blob), " \t\r\n");
+        const after = io.trim(u8, try self.pinnedBlob(path, after_blob), " \t\r\n");
+        if (!core.validOid(before) or !core.validOid(after)) return error.InvalidRegistryPins;
+        return if (eq(u8, before, after)) null else .{ .before = before, .after = after };
+    }
+
+    fn appendRegistryComparison(self: Git, path: []const u8, merge_base: []const u8, head: []const u8, evidence: *std.ArrayList(u8), coverage: *std.ArrayList([]const u8)) !void {
+        const a = self.cmd.a;
+        const pins = (self.registryPins(path, merge_base, head) catch |err| {
+            const reason = switch (err) {
+                error.OutOfMemory => return err,
+                error.RegistryPinMissing => ".registryrc is missing on one side of the pin change.",
+                error.InvalidRegistryPins => "Registry pin comparison requires one full commit SHA in .registryrc on both sides of the change.",
+                error.DisallowedTreeEntry => ".registryrc must be a regular tracked file.",
+                else => "Could not read .registryrc at the pinned pull request commits.",
+            };
+            try coverage.append(a, reason);
+            return;
+        }) orelse return;
+        const client: github.Client = .{ .cmd = self.cmd, .gh = self.gh, .repo = self.object_cache.repo.name, .calls = self.github_calls };
+        const files = client.registryFiles(pins.before, pins.after) catch |err| {
+            const reason = switch (err) {
+                error.OutOfMemory, error.GitHubRateLimited => return err,
+                error.RegistryPinNotFastForward => "The new registry revision does not descend from the previous pin.",
+                error.RegistryCompareIncomplete => "GitHub omitted commits from the registry pin comparison.",
+                error.RegistryCompareMismatch => "GitHub did not confirm the exact registry pins.",
+                else => "The exact registry pin comparison was unavailable.",
+            };
+            try coverage.append(a, reason);
+            return;
+        };
+        try evidence.writer(a).print("\n\nPinned {s} dependency diff, {s} to {s} ({d} paths returned):\n", .{ onchain.registry_repo, pins.before, pins.after, files.len });
+        try appendRegistryFiles(a, evidence, coverage, files);
     }
 
     fn pin(self: Git, repo_dir: std.fs.Dir, path: []const u8, pr: core.Pull) !void {
@@ -234,6 +353,59 @@ pub const Git = struct {
         return self.git(cache_path, &args, "") catch return error.GitDiffFailed;
     }
 
+    fn orderedDiff(self: Git, cache_path: []const u8, base: []const u8, head: []const u8, files: []const PrioritizedFile) ![]const u8 {
+        if (files.len == 0) return self.diff(cache_path, base, head);
+        const a = self.cmd.a;
+        const order_file = "diff-order";
+        var patterns: std.ArrayList(u8) = .empty;
+        for (files) |item| {
+            for (item.file.filename, 0..) |byte, i| {
+                // Git treats order-file lines as glob patterns and leading # as a comment.
+                if (byte == '*' or byte == '?' or byte == '[' or (byte == '#' and i == 0)) try patterns.append(a, '\\');
+                try patterns.append(a, byte);
+            }
+            try patterns.append(a, '\n');
+        }
+        try io.write(self.cmd.dir, order_file, patterns.items);
+        defer self.cmd.dir.deleteFile(order_file) catch {};
+        const option = try io.fmt(a, "-O{s}/{s}", .{ self.cmd.cwd, order_file });
+        const args = diff_flags ++ [_][]const u8{ option, base, head, "--" } ++ excluded_paths;
+        return self.git(cache_path, &args, "") catch return error.GitDiffFailed;
+    }
+
+    fn appendThreadExcerpts(self: Git, cache_path: []const u8, head: []const u8, files: []const github.File, threads: []const core.Thread, diff_complete: bool, evidence: *std.ArrayList(u8), remaining: *usize) !usize {
+        var seen: [max_thread_excerpts]struct { path: []const u8, line: u32 } = undefined;
+        var attempted: usize = 0;
+        var missing: usize = 0;
+        var thread_remaining: usize = @min(thread_context_limit, remaining.*);
+        for (threads) |thread| {
+            if (thread.isResolved or thread.isOutdated or thread.diffSide != .RIGHT) continue;
+            const line = thread.line orelse continue;
+            const duplicate = for (seen[0..attempted]) |target| {
+                if (target.line == line and eq(u8, target.path, thread.path)) break true;
+            } else false;
+            if (duplicate) continue;
+            if (line != 0 and attempted < seen.len and thread_remaining > thread.path.len + 160 and
+                core.validPath(thread.path) and !sensitive(thread.path))
+            {
+                seen[attempted] = .{ .path = thread.path, .line = line };
+                attempted += 1;
+                const budget: usize = @min(thread_remaining, thread_excerpt_limit);
+                var left = budget;
+                const request: core.EvidenceRequest = .{ .path = thread.path, .start_line = @max(1, line -| 8), .end_line = line +| 8 };
+                const complete = self.appendExcerpt(cache_path, head, request, line, evidence, &left) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => false,
+                };
+                thread_remaining -= budget - left;
+                remaining.* -= budget - left;
+                if (complete) continue;
+            }
+            if (!diff_complete or !anchor(files, thread.path, line)) missing += 1;
+        }
+        return missing;
+    }
+
     pub fn supplement(self: Git, pr: core.Pull, previous_head: ?[]const u8, requests: []const core.EvidenceRequest) !Supplement {
         const a = self.cmd.a;
         const previous = if (previous_head) |oid| if (eq(u8, oid, pr.headRefOid)) null else oid else null;
@@ -250,6 +422,47 @@ pub const Git = struct {
         const result = try self.readSupplement(cache_path, pr.headRefOid, previous, requests);
         try self.object_cache.evict(repo_dir, std.time.timestamp());
         return result;
+    }
+
+    pub fn onchainReads(self: Git, pr: core.Pull, requests: []const onchain.Request, search_path: []const u8) ![]const onchain.Observation {
+        if (!std.ascii.eqlIgnoreCase(self.object_cache.repo.name, onchain.registry_repo) or !eq(u8, pr.baseRefName, "main") or
+            requests.len > onchain.max_reads) return error.InvalidOnchainRequest;
+        const a = self.cmd.a;
+        const results = try a.alloc(onchain.Observation, requests.len);
+        for (results, requests) |*result, request| {
+            if (!request.valid()) return error.InvalidOnchainRequest;
+            result.* = .{ .request = request };
+        }
+        const curl = io.executable(a, search_path, "curl") catch return results;
+        var repo_dir = (try self.object_cache.repoDir(true)) orelse return error.GitCacheInitFailed;
+        defer repo_dir.close();
+        const cache_path = try std.fs.path.join(a, &.{ try repo_dir.realpathAlloc(a, "."), cache.directory });
+        defer self.object_cache.evict(repo_dir, std.time.timestamp()) catch |err|
+            std.log.warn("Git cache eviction failed for {s} ({s})", .{ self.object_cache.repo.name, @errorName(err) });
+        if (!try self.cachedPinsMatch(cache_path, pr)) try self.pin(repo_dir, cache_path, pr);
+
+        var env = std.process.EnvMap.init(a);
+        defer env.deinit();
+        var command = self.cmd;
+        command.env = &env;
+        var timer = try std.time.Timer.start();
+        const client: onchain.Client = .{ .cmd = command, .curl = curl, .timer = &timer };
+        var pins = std.StringHashMap(?onchain.Pin).init(a);
+        defer pins.deinit();
+        for (results) |*result| {
+            const chain = result.request.chain;
+            const entry = try pins.getOrPut(chain);
+            if (!entry.found_existing) entry.value_ptr.* = pinned: {
+                const file = try io.fmt(a, "chains/{s}/metadata.yaml", .{chain});
+                const oid = self.pinnedOid(cache_path, pr.baseRefOid, file) catch break :pinned null;
+                const metadata = self.pinnedBlob(cache_path, oid) catch break :pinned null;
+                break :pinned client.pin(metadata) catch null;
+            };
+            const read_pin = entry.value_ptr.* orelse continue;
+            result.block = read_pin.height;
+            result.value = client.read(result.request, read_pin) catch null;
+        }
+        return results;
     }
 
     fn previousDiff(self: Git, cache_path: []const u8, previous: []const u8, head: []const u8) ![]const u8 {
@@ -293,7 +506,7 @@ pub const Git = struct {
         var remaining: usize = supplement_limit;
         var requests_incomplete = requests.len > max_requests;
         for (requests[0..@min(requests.len, max_requests)], 1..) |request, index| {
-            if (self.appendExcerpt(cache_path, head, request, &evidence, &remaining)) |complete| {
+            if (self.appendExcerpt(cache_path, head, request, null, &evidence, &remaining)) |complete| {
                 requests_incomplete = requests_incomplete or !complete;
             } else |err| {
                 if (err == error.OutOfMemory) return err;
@@ -308,21 +521,16 @@ pub const Git = struct {
         return .{ .evidence = evidence.items, .limited = coverage.items.len != 0, .coverage_reasons = coverage.items };
     }
 
-    fn appendExcerpt(self: Git, cache_path: []const u8, head: []const u8, request: core.EvidenceRequest, evidence: *std.ArrayList(u8), remaining: *usize) !bool {
+    fn appendExcerpt(self: Git, cache_path: []const u8, head: []const u8, request: core.EvidenceRequest, anchor_line: ?u32, evidence: *std.ArrayList(u8), remaining: *usize) !bool {
         const a = self.cmd.a;
         if (!core.validPath(request.path) or sensitive(request.path)) return error.DisallowedExcerptPath;
         const lines = try excerptRange(request.start_line, request.end_line);
         if (remaining.* <= request.path.len + 160) return error.ExcerptBudget;
-        const pathspec = try io.fmt(a, ":(literal){s}", .{request.path});
-        const entry = try self.gitWithin(cache_path, &.{ "ls-tree", "-z", "--full-tree", head, "--", pathspec }, "", 20);
-        const oid = try excerptOid(entry, request.path);
-        const text = io.trim(u8, try self.gitWithin(cache_path, &.{ "cat-file", "-s", oid }, "", 30), "\r\n");
-        const size = try std.fmt.parseUnsigned(usize, text, 10);
-        if (size > excerpt_blob_limit) return error.ExcerptTooLarge;
-        const blob = try self.gitWithin(cache_path, &.{ "cat-file", "blob", oid }, "", 20);
-        if (blob.len != size or !std.unicode.utf8ValidateSlice(blob) or std.mem.indexOfScalar(u8, blob, 0) != null)
-            return error.ExcerptNotText;
+        const blob = try self.pinnedBlob(cache_path, try self.pinnedOid(cache_path, head, request.path));
         const excerpt = try excerptLines(blob, lines);
+        if (anchor_line) |line| {
+            if (excerpt.end < line) return error.ExcerptPastEnd;
+        }
         const prefix = excerpt.text[0..core.safePrefix(excerpt.text, remaining.* - request.path.len - 160)];
         const complete = !(excerpt.more and (lines.clipped or request.end_line == null)) and prefix.len == excerpt.text.len;
         const start = evidence.items.len;
@@ -331,6 +539,22 @@ pub const Git = struct {
         });
         remaining.* -= evidence.items.len - start;
         return complete;
+    }
+
+    fn pinnedOid(self: Git, cache_path: []const u8, head: []const u8, file: []const u8) ![]const u8 {
+        const pathspec = try io.fmt(self.cmd.a, ":(literal){s}", .{file});
+        const entry = try self.gitWithin(cache_path, &.{ "ls-tree", "-z", "--full-tree", head, "--", pathspec }, "", 20);
+        return excerptOid(entry, file);
+    }
+
+    fn pinnedBlob(self: Git, cache_path: []const u8, oid: []const u8) ![]const u8 {
+        const text = io.trim(u8, try self.gitWithin(cache_path, &.{ "cat-file", "-s", oid }, "", 30), "\r\n");
+        const size = try std.fmt.parseUnsigned(usize, text, 10);
+        if (size > excerpt_blob_limit) return error.ExcerptTooLarge;
+        const blob = try self.gitWithin(cache_path, &.{ "cat-file", "blob", oid }, "", 20);
+        if (blob.len != size or !std.unicode.utf8ValidateSlice(blob) or std.mem.indexOfScalar(u8, blob, 0) != null)
+            return error.ExcerptNotText;
+        return blob;
     }
 
     fn readBlob(self: Git, path: []const u8, head: []const u8, name: []const u8, remaining: usize) ![]const u8 {
@@ -367,6 +591,82 @@ pub const Git = struct {
         return blobs;
     }
 };
+
+fn registryPatchComplete(file: github.File) bool {
+    const additions = file.additions orelse return false;
+    const deletions = file.deletions orelse return false;
+    const patch = file.patch orelse return false;
+    if (!std.mem.startsWith(u8, patch, "@@ -") or !std.unicode.utf8ValidateSlice(patch) or std.mem.indexOfScalar(u8, patch, 0) != null)
+        return false;
+    var lines = std.mem.splitScalar(u8, patch, '\n');
+    var added: u32 = 0;
+    var deleted: u32 = 0;
+    var left: u32 = 0;
+    var right: u32 = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        switch (line[0]) {
+            '@' => {
+                if (left != 0 or right != 0) return false;
+                const hunk = hunkRanges(line) orelse return false;
+                left = hunk.left.count;
+                right = hunk.right.count;
+            },
+            '+' => {
+                if (right == 0) return false;
+                right -= 1;
+                added +|= 1;
+            },
+            '-' => {
+                if (left == 0) return false;
+                left -= 1;
+                deleted +|= 1;
+            },
+            ' ' => {
+                if (left == 0 or right == 0) return false;
+                left -= 1;
+                right -= 1;
+            },
+            '\\' => if (!eq(u8, line, "\\ No newline at end of file")) return false,
+            else => return false,
+        }
+    }
+    return left == 0 and right == 0 and added == additions and deleted == deletions;
+}
+
+fn appendRegistryFiles(a: A, evidence: *std.ArrayList(u8), coverage: *std.ArrayList([]const u8), files: []const github.File) !void {
+    if (files.len >= github.registry_compare_file_limit) try coverage.append(a, "The registry pin comparison reached GitHub's changed file limit.");
+    const start = evidence.items.len;
+    var unavailable: usize = 0;
+    var omitted: usize = 0;
+    for (files) |file| {
+        const original = file.previous_filename orelse file.filename;
+        if (!core.validPath(file.filename) or !core.validPath(original) or sensitive(file.filename) or sensitive(original)) {
+            unavailable += 1;
+            continue;
+        }
+        const heading = "diff --git a/{s} b/{s}\n";
+        if (evidence.items.len - start + file.filename.len + original.len + heading.len - 6 > registry_diff_limit) {
+            omitted += 1;
+            continue;
+        }
+        const writer = evidence.writer(a);
+        try writer.print(heading, .{ original, file.filename });
+        if (!registryPatchComplete(file)) {
+            unavailable += 1;
+            continue;
+        }
+        if (file.patch) |patch| {
+            if (evidence.items.len - start + patch.len + 1 > registry_diff_limit) {
+                omitted += 1;
+                continue;
+            }
+            try writer.print("{s}\n", .{patch});
+        }
+    }
+    if (unavailable != 0) try coverage.append(a, try io.fmt(a, "Registry changes unavailable, partial, or excluded for {d} path{s}.", .{ unavailable, if (unavailable == 1) "" else "s" }));
+    if (omitted != 0) try coverage.append(a, try io.fmt(a, "Registry changes exceeded the review byte limit for {d} path{s}.", .{ omitted, if (omitted == 1) "" else "s" }));
+}
 
 fn excerptOid(entry: []const u8, path: []const u8) ![]const u8 {
     if (entry.len == 0) return error.ExcerptMissing;
@@ -458,10 +758,11 @@ fn takeBlob(input: *[]const u8, expected: BlobHeader) ![]const u8 {
 }
 
 fn appendBlob(evidence: *std.ArrayList(u8), a: A, name: []const u8, blob: []const u8, remaining: *usize) !void {
-    if (blob.len > @min(remaining.*, max_blob_size) or !std.unicode.utf8ValidateSlice(blob) or
+    const overhead = name.len + 40;
+    if (blob.len > max_blob_size or blob.len + overhead > remaining.* or !std.unicode.utf8ValidateSlice(blob) or
         std.mem.indexOfScalar(u8, blob, 0) != null) return;
     try evidence.writer(a).print("\n\nHead file {s}:\n{s}", .{ name, blob });
-    remaining.* -|= blob.len + name.len + 40;
+    remaining.* -= blob.len + overhead;
 }
 
 // GitHub's files API provides the hunks GitHub can attach to. Count right-side
@@ -484,13 +785,10 @@ fn patchHasLine(patch: []const u8, line: u32) bool {
         if (std.mem.startsWith(u8, text, "@@ -")) {
             if (right != right_end or left_remaining != 0) return false;
             if (matched) return true;
-            const plus = std.mem.indexOf(u8, text, " +") orelse return false;
-            const suffix = std.mem.indexOf(u8, text[plus + 2 ..], " @@") orelse return false;
-            const left = range(text[4..plus]) orelse return false;
-            const target = range(text[plus + 2 ..][0..suffix]) orelse return false;
-            left_remaining = left.count;
-            right = target.start;
-            right_end = std.math.add(u32, right, target.count) catch return false;
+            const hunk = hunkRanges(text) orelse return false;
+            left_remaining = hunk.left.count;
+            right = hunk.right.start;
+            right_end = std.math.add(u32, right, hunk.right.count) catch return false;
         } else if (text.len > 0) switch (text[0]) {
             ' ', '+' => {
                 if (right >= right_end) return false;
@@ -512,7 +810,17 @@ fn patchHasLine(patch: []const u8, line: u32) bool {
     return matched and right == right_end and left_remaining == 0;
 }
 
-fn range(text: []const u8) ?struct { start: u32, count: u32 } {
+const LineRange = struct { start: u32, count: u32 };
+
+fn hunkRanges(text: []const u8) ?struct { left: LineRange, right: LineRange } {
+    if (!std.mem.startsWith(u8, text, "@@ -")) return null;
+    const plus = std.mem.indexOf(u8, text[4..], " +") orelse return null;
+    const right = text[4 + plus + 2 ..];
+    const suffix = std.mem.indexOf(u8, right, " @@") orelse return null;
+    return .{ .left = range(text[4..][0..plus]) orelse return null, .right = range(right[0..suffix]) orelse return null };
+}
+
+fn range(text: []const u8) ?LineRange {
     var parts = std.mem.splitScalar(u8, text, ',');
     const start = std.fmt.parseUnsigned(u32, parts.next() orelse return null, 10) catch return null;
     const count = if (parts.next()) |value| std.fmt.parseUnsigned(u32, value, 10) catch return null else 1;
@@ -556,6 +864,41 @@ test "right-side anchors honor deletions, context, and truncated hunks" {
     try testing.expect(!anchor(&.{.{ .filename = ".env.local", .patch = "@@ -0,0 +1 @@\n+secret" }}, ".env.local", 1));
 }
 
+test "registry evidence retains exact text patches and withholds approval on omitted content" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const example = "@@ -1 +1 @@\n-old\n+new";
+    const input = [_]github.File{
+        .{ .filename = "chains/apechain/metadata.yaml", .patch = example, .additions = 1, .deletions = 1 },
+        .{ .filename = "chains/renamed.yaml", .status = "renamed", .previous_filename = "chains/old.yaml", .additions = 0, .deletions = 0 },
+        .{ .filename = "chains/partial.yaml", .patch = "@@ -1,3 +1,3 @@\n-old\n+new\n context", .additions = 1, .deletions = 1 },
+        .{ .filename = "chains/credentials.yaml", .status = "renamed", .previous_filename = ".env.local", .patch = "hidden" },
+        .{ .filename = "chains/missing.yaml", .additions = 1, .deletions = 1 },
+    };
+    var evidence: std.ArrayList(u8) = .empty;
+    var coverage: std.ArrayList([]const u8) = .empty;
+    try appendRegistryFiles(a, &evidence, &coverage, input[0..1]);
+    try t.expectEqualStrings("diff --git a/chains/apechain/metadata.yaml b/chains/apechain/metadata.yaml\n" ++ example ++ "\n", evidence.items);
+    try t.expectEqual(@as(usize, 0), coverage.items.len);
+    evidence.clearRetainingCapacity();
+    try appendRegistryFiles(a, &evidence, &coverage, input[1..]);
+    try t.expectEqualStrings("diff --git a/chains/old.yaml b/chains/renamed.yaml\n" ++
+        "diff --git a/chains/partial.yaml b/chains/partial.yaml\n" ++
+        "diff --git a/chains/missing.yaml b/chains/missing.yaml\n", evidence.items);
+    try t.expectEqualStrings("Registry changes unavailable, partial, or excluded for 4 paths.", coverage.items[0]);
+    const oversized = [_]github.File{.{
+        .filename = "big.yaml",
+        .patch = "@@ -0,0 +1 @@\n+" ++ "x" ** registry_diff_limit,
+        .additions = 1,
+        .deletions = 0,
+    }};
+    try appendRegistryFiles(a, &evidence, &coverage, &oversized);
+    try t.expect(evidence.items.len < registry_diff_limit);
+    try t.expectEqualStrings("Registry changes exceeded the review byte limit for 1 path.", coverage.items[1]);
+}
+
 test "batch blobs use size framing and reject mismatched responses" {
     const testing = std.testing;
     const oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -574,7 +917,7 @@ test "batch blobs use size framing and reject mismatched responses" {
     try testing.expectError(error.InvalidGitBatch, blobHeader(oid ++ " blob 1 extra"));
 }
 
-test "supplement reads a pinned caller and a previous-head delta and rejects invalid requests" {
+test "pinned source reads exact trees and prioritizes active review anchors in a large diff" {
     const t = std.testing;
     const bin = "/usr/bin/git";
     std.fs.accessAbsolute(bin, .{}) catch return error.SkipZigTest;
@@ -602,10 +945,13 @@ test "supplement reads a pinned caller and a previous-head delta and rejects inv
     _ = try git.cmd.run(&.{ bin, "init", "--bare", "--template=", path }, "", 10);
     const unchanged = io.trim(u8, try git.git(path, &.{ "hash-object", "-w", "--stdin" }, "skip\ncaller evidence\nskip too\n"), "\n");
     const secret = io.trim(u8, try git.git(path, &.{ "hash-object", "-w", "--stdin" }, "DO NOT PRESENT THIS VALUE"), "\n");
+    const old_pin = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const new_pin = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     var commits: [2][]const u8 = undefined;
-    for (&commits, [_][]const u8{ "old behavior\n", "new behavior\n" }) |*commit, content| {
+    for (&commits, [_][]const u8{ "old behavior\n", "new behavior\n" }, [_][]const u8{ old_pin ++ "\n", new_pin ++ "\n" }) |*commit, content, pin| {
         const blob = io.trim(u8, try git.git(path, &.{ "hash-object", "-w", "--stdin" }, content), "\n");
-        const input = try io.fmt(a, "100644 blob {s}\tcaller.zig\n100644 blob {s}\tchange.zig\n100644 blob {s}\t.env.local\n120000 blob {s}\tlinked.zig\n", .{ unchanged, blob, secret, secret });
+        const pin_blob = io.trim(u8, try git.git(path, &.{ "hash-object", "-w", "--stdin" }, pin), "\n");
+        const input = try io.fmt(a, "100644 blob {s}\tcaller.zig\n100644 blob {s}\tchange.zig\n100644 blob {s}\t.env.local\n120000 blob {s}\tlinked.zig\n100644 blob {s}\t.registryrc\n", .{ unchanged, blob, secret, secret, pin_blob });
         const tree = io.trim(u8, try git.git(path, &.{"mktree"}, input), "\n");
         commit.* = io.trim(u8, try git.git(path, &.{ "commit-tree", tree, "-m", "fixture" }, ""), "\n");
     }
@@ -625,6 +971,56 @@ test "supplement reads a pinned caller and a previous-head delta and rejects inv
     for ([_][]const u8{ "skip too", "DO NOT PRESENT", "over-budget.zig" }) |part| {
         try t.expect(std.mem.indexOf(u8, result.evidence, part) == null);
     }
+    const pins = (try git.registryPins(path, commits[0], commits[1])).?;
+    try t.expectEqualStrings(old_pin, pins.before);
+    try t.expectEqualStrings(new_pin, pins.after);
+    try t.expect((try git.registryPins(path, commits[1], commits[1])) == null);
+
+    const active_path = "z-active[?]*.zig";
+    const risky_path = "zz-owner.yaml";
+    const docs = "#doc.md";
+    const files = [_]github.File{
+        .{ .filename = docs },
+        .{ .filename = risky_path, .patch = "@@ -0,0 +1 @@\n+owner: new\n" },
+        .{ .filename = active_path, .patch = "@@ -0,0 +1,3 @@\n+start\n+active anchor\n+end\n" },
+    };
+    const current = core.Thread{ .id = "current", .isResolved = false, .isOutdated = false, .path = active_path, .line = 2, .diffSide = .RIGHT, .replies = &.{} };
+    var duplicate = current;
+    duplicate.id = "duplicate";
+    var stale = current;
+    stale.isOutdated = true;
+    stale.path = ".env.local";
+    var left = current;
+    left.path = "linked.zig";
+    left.diffSide = .LEFT;
+    var missing = current;
+    missing.line = 9;
+    const threads: []const core.Thread = &.{ current, duplicate, stale, left, missing };
+
+    const docs_blob = io.trim(u8, try git.git(path, &.{ "hash-object", "-w", "--stdin" }, "large docs\n" ** 5000), "\n");
+    const risk_blob = io.trim(u8, try git.git(path, &.{ "hash-object", "-w", "--stdin" }, "owner: new\n"), "\n");
+    const active_blob = io.trim(u8, try git.git(path, &.{ "hash-object", "-w", "--stdin" }, "start\nactive anchor\nend\n"), "\n");
+    const new_tree = try io.fmt(a, "100644 blob {s}\t{s}\n100644 blob {s}\t{s}\n100644 blob {s}\t{s}\n", .{
+        docs_blob, docs, risk_blob, risky_path, active_blob, active_path,
+    });
+    const tree_oid = io.trim(u8, try git.git(path, &.{"mktree"}, new_tree), "\n");
+    const new_head = io.trim(u8, try git.git(path, &.{ "commit-tree", tree_oid, "-p", commits[0], "-m", "review" }, ""), "\n");
+    const full = try git.diff(path, commits[0], new_head);
+    try t.expect(std.mem.indexOf(u8, full[0..diff_limit], "+active anchor") == null);
+    const ordered = try prioritizeFiles(a, &files, threads);
+    try t.expectEqualStrings(active_path, ordered[0].file.filename);
+    try t.expectEqualStrings(risky_path, ordered[1].file.filename);
+    try t.expectEqualStrings(docs, ordered[2].file.filename);
+    const diff = try git.orderedDiff(path, commits[0], new_head, ordered);
+    const active_offset = std.mem.indexOf(u8, diff[0..diff_limit], "+active anchor") orelse return error.TestExpectedEqual;
+    const risk_offset = std.mem.indexOf(u8, diff[0..diff_limit], "+owner: new") orelse return error.TestExpectedEqual;
+    const docs_offset = std.mem.indexOf(u8, diff[0..diff_limit], "+large docs") orelse return error.TestExpectedEqual;
+    try t.expect(active_offset < risk_offset and risk_offset < docs_offset);
+    var evidence: std.ArrayList(u8) = .empty;
+    var remaining: usize = context_limit;
+    try t.expectEqual(@as(usize, 1), try git.appendThreadExcerpts(path, new_head, &files, threads, false, &evidence, &remaining));
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, evidence.items, "active anchor"));
+    try t.expect(std.mem.indexOf(u8, evidence.items, "DO NOT PRESENT") == null);
 }
 
 test "source excerpts cap requested lines and preserve the last line without a newline" {

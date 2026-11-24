@@ -33,6 +33,10 @@ const Fake = struct {
     discussion: []const core.Thread = &.{},
     late_discussion: ?[]const core.Thread = null,
     comments: []const core.Reply = &.{},
+    snapshot_threads: []const core.Thread = &.{},
+    source_limited: bool = false,
+    previous_delta: []const u8 = "",
+    historical_coverage_reasons: []const []const u8 = &.{},
     thread_reads: usize = 0,
     result: []const u8 = finding,
     other_results: []const []const u8 = &.{},
@@ -51,7 +55,7 @@ const Fake = struct {
     inline_readbacks: usize = 0,
     prompt_text: []const u8 = "",
     posted_result: ?core.Payload = null,
-    saved_result: ?core.Payload = null,
+    saved_result: ?core.Result = null,
 
     pub fn checkIdentity(_: *Fake) !void {}
 
@@ -71,8 +75,16 @@ const Fake = struct {
         };
     }
 
-    pub fn snapshot(_: *Fake, _: core.Pull) !core.Snapshot {
-        return .{ .merge_base = base, .evidence = "Diff in src/watch.rs" };
+    pub fn snapshot(self: *Fake, _: core.Pull, threads: []const core.Thread) !core.Snapshot {
+        self.snapshot_threads = threads;
+        return .{ .merge_base = base, .evidence = "Diff in src/watch.rs", .limited = self.source_limited };
+    }
+
+    pub fn supplement(self: *Fake, _: core.Pull, _: ?[]const u8, _: []const core.EvidenceRequest) !struct {
+        evidence: []const u8,
+        coverage_reasons: []const []const u8,
+    } {
+        return .{ .evidence = self.previous_delta, .coverage_reasons = self.historical_coverage_reasons };
     }
 
     pub fn stackContext(self: *Fake, _: core.Pull, _: bool) !stack.Context {
@@ -149,8 +161,18 @@ const Fake = struct {
         if (self.db) |db| try db.save(self.state.?);
     }
 
-    pub fn saveResult(self: *Fake, _: u32, result: core.Payload) !void {
+    pub fn saveResult(self: *Fake, _: u32, result: core.Result) !void {
         self.saved_result = result;
+    }
+
+    pub fn confirmResult(self: *Fake, _: u32, commit: []const u8, followup_id: []const u8, event: core.Event, id: u64) !void {
+        if (self.saved_result) |*result| {
+            try t.expectEqualStrings(commit, result.commit_id);
+            try t.expectEqualStrings(followup_id, result.followupId());
+            try t.expectEqual(event, result.event);
+            result.explanation.?.publication = .verified;
+            result.explanation.?.github_review_id = id;
+        }
     }
 };
 
@@ -233,6 +255,8 @@ test "inline readback resumes from a persisted intent without posting again" {
     var job: core.Job = .{ .number = fixture_pull.number, .head = head };
     try t.expectError(error.ReviewInlineReadbackMismatch, core.run(a, &fake, repo, &job, .scheduled));
     try t.expectEqual(core.Phase.uncertain, job.phase);
+    try t.expectEqual(.pending, fake.saved_result.?.explanation.?.publication);
+    try t.expect(fake.saved_result.?.explanation.?.github_review_id == null);
     try t.expectEqual(@as(usize, 1), job.expected_inline.?.len);
     var recovered = try io.parse(a, core.Job, try io.json(a, job));
     fake.lose_inline_readback = false;
@@ -241,6 +265,31 @@ test "inline readback resumes from a persisted intent without posting again" {
     try t.expectEqual(@as(usize, 2), fake.inline_readbacks);
     try t.expectEqual(core.Phase.complete, recovered.phase);
     try t.expect(recovered.expected_inline == null);
+    try t.expectEqual(.verified, fake.saved_result.?.explanation.?.publication);
+    try t.expectEqual(@as(?u64, 55), fake.saved_result.?.explanation.?.github_review_id);
+}
+
+test "a multi-review result identifies the reviewer and exact missing evidence" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const incomplete =
+        \\{"complete":true,"coverage_gaps":["The pinned RPC read does not include the ProxyAdmin owner."],"summary":"Static review.","findings":[],"existing_open_findings":[],"non_blocking_threads":[]}
+    ;
+    var fake: Fake = .{ .a = a, .result = clean, .other_results = &.{incomplete} };
+    const configured: core.Repo = .{ .name = repo.name, .login = repo.login, .additional_engines = &.{.claude}, .approvals = true };
+    var job: core.Job = .{ .number = fixture_pull.number, .head = head };
+    const preview = (try core.run(a, &fake, configured, &job, .{ .preview = .{} })).?;
+    const detail = preview.explanation.?;
+    try t.expectEqual(.COMMENT, preview.event);
+    try t.expect(!detail.coverage.complete);
+    try t.expectEqualSlices(std.meta.Child(@FieldType(core.Explanation, "blockers")), &.{.limited_coverage}, detail.blockers);
+    try t.expect(detail.coverage.reviewers[0].complete);
+    try t.expectEqual(core.Engine.claude, detail.coverage.reviewers[1].engine);
+    try t.expectEqualStrings("The pinned RPC read does not include the ProxyAdmin owner.", detail.coverage.reviewers[1].gaps[0]);
+    try t.expect(std.mem.indexOf(u8, preview.body, "claude reported incomplete coverage") != null);
+    try t.expect(fake.saved_result == null);
+    try t.expectEqual(@as(usize, 0), fake.posts);
 }
 
 test "persisted findings and pending receipt anchors outlive a review worker" {
@@ -527,7 +576,7 @@ test "publishes one commit-bound comment, verifies it, and deduplicates a second
     try t.expectEqual(@as(u32, 20), payload.comments[0].line);
 
     work = .{ .number = fixture_pull.number, .head = head };
-    try t.expectEqual(@as(?core.Payload, null), try core.run(a, &fake, repo, &work, .scheduled));
+    try t.expectEqual(@as(?core.Result, null), try core.run(a, &fake, repo, &work, .scheduled));
     try t.expectEqual(@as(usize, 1), fake.posts);
     try t.expectEqual(@as(usize, 1), fake.reviews_run);
 }
@@ -934,6 +983,39 @@ test "an approval is discarded when a thread opens before posting" {
     try t.expectEqual(@as(usize, 0), fake.posts);
     try t.expectEqual(core.Phase.pending, job.phase);
     try t.expect(fake.saved_result == null);
+}
+
+test "a clipped historical delta permits approval only with complete current evidence and assessed threads" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var configured = repo;
+    configured.approvals = true;
+    const cases = [_]struct { source_limited: bool, result: []const u8, event: core.Event }{
+        .{ .source_limited = false, .result = assessed, .event = .APPROVE },
+        .{ .source_limited = false, .result = clean, .event = .COMMENT },
+        .{ .source_limited = true, .result = assessed, .event = .COMMENT },
+    };
+    for (cases) |case| {
+        var fake: Fake = .{
+            .a = a,
+            .discussion = &.{open_nit},
+            .source_limited = case.source_limited,
+            .result = case.result,
+            .previous_delta = "Previous-head diff was truncated.",
+            .historical_coverage_reasons = &.{"The previous diff exceeded the byte limit."},
+        };
+        var job: core.Job = .{
+            .number = fixture_pull.number,
+            .head = head,
+            .last_review = .{ .head = changed, .base = .fromPull(fixture_pull), .merge_base = base, .notes = &.{} },
+        };
+        const result = (try core.run(a, &fake, configured, &job, .scheduled)).?;
+        try t.expectEqual(case.event, result.event);
+        try t.expectEqualStrings(open_nit.id, fake.snapshot_threads[0].id);
+        try t.expect(std.mem.indexOf(u8, fake.prompt_text, "\"historical_coverage_reasons\":[\"The previous diff exceeded the byte limit.\"]") != null);
+        if (case.event == .APPROVE) try t.expect(std.mem.indexOf(u8, result.body, "Review coverage was limited.") == null);
+    }
 }
 
 test "a queued focused review survives restart and publishes only with explicit authorization" {

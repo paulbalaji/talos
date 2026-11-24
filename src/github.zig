@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("core.zig");
 const io = @import("io.zig");
+const onchain = @import("onchain.zig");
 const stack = @import("stack.zig");
 const A = io.A;
 const eq = io.eq;
@@ -19,10 +20,13 @@ const RawThread = struct {
     isOutdated: bool,
     path: []const u8,
     line: ?u32,
+    diffSide: ?core.DiffSide = null,
     comments: Connection(core.Reply),
 };
 
 pub const File = struct { filename: []const u8, patch: ?[]const u8 = null, status: []const u8 = "", previous_filename: ?[]const u8 = null, additions: ?u32 = null, deletions: ?u32 = null };
+pub const registry_pin_source = "hyperlane-xyz/hyperlane-monorepo";
+pub const registry_compare_file_limit = 300;
 
 pub const FollowupRef = struct {
     number: u32,
@@ -346,6 +350,38 @@ pub const Client = struct {
         return oid;
     }
 
+    pub fn registryFiles(self: Client, before: []const u8, after: []const u8) ![]const File {
+        if (!std.ascii.eqlIgnoreCase(self.repo, registry_pin_source) or
+            !core.validOid(before) or !core.validOid(after) or eq(u8, before, after)) return error.InvalidRegistryPins;
+        const a = self.cmd.a;
+        const path = try io.fmt(a, "repos/{s}/compare/{s}...{s}", .{ onchain.registry_repo, before, after });
+        // GitHub places file patches on the first page, caps the commit list
+        // at 250 by default, and includes the most recent commit at the end.
+        const raw = self.api(path, &.{}, "") catch |err| return transportFailure(err, error.GitHubCompareFailed);
+        return decodeRegistryFiles(a, raw, before, after);
+    }
+
+    fn decodeRegistryFiles(a: A, raw: []const u8, before: []const u8, after: []const u8) ![]const File {
+        const Commit = struct { sha: []const u8 };
+        const result = try io.parse(a, struct {
+            base_commit: Commit,
+            merge_base_commit: Commit,
+            status: []const u8,
+            ahead_by: usize,
+            behind_by: usize,
+            total_commits: usize,
+            commits: []const Commit,
+            files: []const File,
+        }, raw);
+        if (!eq(u8, result.base_commit.sha, before)) return error.RegistryCompareMismatch;
+        if (!eq(u8, result.status, "ahead") or result.behind_by != 0 or !eq(u8, result.merge_base_commit.sha, before))
+            return error.RegistryPinNotFastForward;
+        if (result.commits.len == 0 or result.commits.len != result.total_commits or result.ahead_by != result.total_commits)
+            return error.RegistryCompareIncomplete;
+        if (!eq(u8, result.commits[result.commits.len - 1].sha, after)) return error.RegistryCompareMismatch;
+        return result.files;
+    }
+
     pub fn post(self: Client, number: u32, payload: core.Payload) !u64 {
         const a = self.cmd.a;
         const target = try self.endpoint(try io.fmt(a, "pulls/{d}/reviews", .{number}));
@@ -413,7 +449,7 @@ pub const Client = struct {
         \\      nodes { author { login kind: __typename } body url updatedAt association: authorAssociation }
         \\    }
         \\    reviewThreads(first: 50, after: $cursor) { pageInfo { hasNextPage endCursor }
-        \\      nodes { id isResolved isOutdated path line
+        \\      nodes { id isResolved isOutdated path line diffSide
         \\        comments(first: 50) { pageInfo { hasNextPage endCursor }
         \\          nodes { author { login kind: __typename } body url updatedAt association: authorAssociation originalCommit { oid } }
         \\        }
@@ -474,6 +510,7 @@ pub const Client = struct {
             .isOutdated = raw.isOutdated,
             .path = raw.path,
             .line = raw.line,
+            .diffSide = raw.diffSide,
             .replies = replies.items,
             .truncated = truncated,
         };
@@ -553,6 +590,24 @@ fn checkGraphErrors(errors: ?[]const std.json.Value, fallback: anyerror) !void {
         if (kind == .string and eq(u8, kind.string, "RATE_LIMITED")) return error.GitHubRateLimited;
     }
     return fallback;
+}
+
+test "registry compare requires a complete forward comparison at the exact pins" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const after = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const base = "{\"base_commit\":{\"sha\":\"" ++ before ++ "\"},\"merge_base_commit\":{\"sha\":\"" ++ before ++ "\"},";
+    const sample = "\"commits\":[{\"sha\":\"" ++ after ++ "\"}],\"files\":[{\"filename\":\"chains/apechain/metadata.yaml\"}]}";
+    const match = base ++ "\"status\":\"ahead\",\"ahead_by\":1,\"behind_by\":0,\"total_commits\":1," ++ sample;
+    const truncated = base ++ "\"status\":\"ahead\",\"ahead_by\":251,\"behind_by\":0,\"total_commits\":251," ++ sample;
+    const diverged = base ++ "\"status\":\"diverged\",\"ahead_by\":1,\"behind_by\":1,\"total_commits\":1," ++ sample;
+    try t.expectEqualStrings("chains/apechain/metadata.yaml", (try Client.decodeRegistryFiles(a, match, before, after))[0].filename);
+    try t.expectError(error.RegistryCompareMismatch, Client.decodeRegistryFiles(a, match, before, before));
+    try t.expectError(error.RegistryCompareIncomplete, Client.decodeRegistryFiles(a, truncated, before, after));
+    try t.expectError(error.RegistryPinNotFastForward, Client.decodeRegistryFiles(a, diverged, before, after));
 }
 
 test "a paginated scan rejects partial responses and preserves discovery order" {

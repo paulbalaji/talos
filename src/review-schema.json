@@ -3,6 +3,7 @@
   "additionalProperties": false,
   "required": [
     "complete",
+    "coverage_gaps",
     "summary",
     "findings",
     "existing_open_findings",
@@ -11,6 +12,10 @@
   "properties": {
     "complete": {
       "type": "boolean"
+    },
+    "coverage_gaps": {
+      "type": "array",
+      "items": { "type": "string" }
     },
     "summary": {
       "type": "string"

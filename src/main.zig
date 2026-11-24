@@ -16,6 +16,7 @@ const adaptive = @import("adaptive.zig");
 const usage_meter = @import("usage.zig");
 const followup = @import("followup.zig");
 const followup_git = @import("followup_git.zig");
+const onchain = @import("onchain.zig");
 
 const eq = io.eq;
 const A = io.A;
@@ -118,6 +119,7 @@ const Local = struct {
             .bin = try self.bin(.git),
             .gh = try self.bin(.gh),
             .object_cache = .{ .a = self.a, .root = db.dir, .repo = repo },
+            .github_calls = if (self.counts) |counts| &counts.github_commands else null,
         };
     }
 
@@ -158,9 +160,9 @@ const Adapter = struct {
         return self.github_client.discussion(number);
     }
 
-    pub fn snapshot(self: *Adapter, pr: core.Pull) !core.Snapshot {
+    pub fn snapshot(self: *Adapter, pr: core.Pull, threads: []const core.Thread) !core.Snapshot {
         self.files = try self.github_client.files(pr.number);
-        return self.git_source.snapshot(pr, self.files);
+        return self.git_source.snapshot(pr, self.files, threads);
     }
 
     pub fn supplement(self: *Adapter, pr: core.Pull, previous: ?[]const u8, requests: []const core.EvidenceRequest) !source.Supplement {
@@ -201,7 +203,7 @@ const Adapter = struct {
                 if (merged_pin or stack.samePin(member.pin, pin)) {
                     if (member.digest) |stored| break :digest stored;
                 }
-                const snapshot_value = try self.git_source.snapshot(ancestor_pr, &.{});
+                const snapshot_value = try self.git_source.snapshot(ancestor_pr, &.{}, &.{});
                 break :digest try stack.Digest.make(self.db.a, snapshot_value.evidence, try self.ancestorReview(pin));
             };
             ancestor.* = .{
@@ -267,6 +269,26 @@ const Adapter = struct {
         return runReviewer(self.tools, self.repo, engine, prompt);
     }
 
+    fn onchainReads(self: *Adapter, pr: core.Pull, reads: []const onchain.Request) ![]const onchain.Observation {
+        if (reads.len == 0) return &.{};
+        return self.git_source.onchainReads(pr, reads, self.tools.env.get("PATH") orelse "/usr/bin:/bin");
+    }
+
+    fn previewReads(self: *Adapter, prepared: core.Prepared) ![]const onchain.Observation {
+        if (!prepared.onchain_available or self.repo.light_models.len == 0) return &.{};
+        const screen = routing.inspect(self.files, prepared.snap.limited);
+        if (!screen.ask_model and screen.floor.depth != .multi) return &.{};
+        const a = self.db.a;
+        const prompt = try core.screenPrompt(a, prepared);
+        if (prompt.len > core.review_context_limit) return &.{};
+        for (self.repo.light_models) |reviewer| {
+            const response = invokeReviewer(self.tools, reviewer.engine, .{ .model = reviewer.model, .effort = .default }, core.screen_schema, prompt) catch continue;
+            const result = core.parseScreen(a, response) catch continue;
+            return self.onchainReads(prepared.pr, result.onchain_reads);
+        }
+        return &.{};
+    }
+
     pub fn post(self: *Adapter, number: u32, payload: core.Payload) !u64 {
         return self.github_client.post(number, payload);
     }
@@ -283,8 +305,12 @@ const Adapter = struct {
         try self.db.save(self.state);
     }
 
-    pub fn saveResult(self: *Adapter, number: u32, payload: core.Payload) !void {
-        try self.db.result(self.repo.name, number, payload);
+    pub fn saveResult(self: *Adapter, number: u32, result: core.Result) !void {
+        try self.db.result(self.repo.name, number, result);
+    }
+
+    pub fn confirmResult(self: *Adapter, number: u32, head: []const u8, followup_id: []const u8, event: core.Event, id: u64) !void {
+        try self.db.confirmResult(self.repo.name, number, head, followup_id, event, id);
     }
 };
 
@@ -1027,6 +1053,8 @@ const Main = struct {
                 work.prepared.synthesis_provider = saved.synthesis_provider;
                 work.prepared.synthesis_summary = saved.synthesis_summary;
                 work.prepared.additional_evidence_limited = saved.additional_evidence_limited;
+                work.prepared.evidence_requests = saved.evidence_requests;
+                work.prepared.onchain_observations = saved.onchain_observations;
                 _ = try core.finish(self.a, &work.adapter, entry.repo, job, work.prepared, saved.results);
                 return;
             }
@@ -1056,6 +1084,10 @@ const Main = struct {
             if (automatically_routed and work.prepared.inherited.pins.len > 1) {
                 screen.floor = screen.floor.merge(.{ .depth = .focused, .reliability = true });
                 screen.ask_model = false;
+            }
+            if (work.prepared.onchain_available and screen.floor.depth == .multi) screen.ask_model = true;
+            if (progress.onchain_reads.len != 0 and progress.onchain_observations == null) {
+                progress.onchain_observations = try work.adapter.onchainReads(work.prepared.pr, progress.onchain_reads);
             }
             var evidence: ?[]const u8 = null;
             var evidence_limited = false;
@@ -1119,6 +1151,8 @@ const Main = struct {
                 work.prepared.synthesis_provider = report.synthesis_provider;
                 work.prepared.synthesis_summary = outcome.synthesis_summary;
                 work.prepared.additional_evidence_limited = outcome.evidence_limited;
+                work.prepared.evidence_requests = outcome.progress.evidence_requests;
+                work.prepared.onchain_observations = report.onchain_observations;
                 work.job.route_report = report;
                 work.job.route_report.?.providers = try self.a.dupe(core.Engine, report.providers);
                 work.job.route_progress = null;
@@ -1259,8 +1293,17 @@ const Main = struct {
             }
             var gh_env: std.process.EnvMap = undefined;
             var live = try self.adapter(entry, state, &gh_env);
-            const payload = (try core.run(self.a, &live, entry.repo, &job, .{ .preview = preview })).?;
-            try self.out("{s}\n", .{try io.json(self.a, .{ .repo = entry.repo.name, .pr = job.number, .review = payload })});
+            var prepared = (try core.prepare(self.a, &live, entry.repo, &job, .{ .preview = preview })).?;
+            const observations = try live.previewReads(prepared);
+            prepared.additional_evidence_limited = try core.appendOnchain(self.a, &prepared.context, observations);
+            prepared.onchain_observations = observations;
+            const results = try core.analyze(self.a, &live, prepared.engines, prepared.context);
+            const payload = (try core.finish(self.a, &live, entry.repo, &job, prepared, results[0..prepared.engines.len])).?;
+            if (observations.len == 0) {
+                try self.out("{s}\n", .{try io.json(self.a, .{ .repo = entry.repo.name, .pr = job.number, .review = payload })});
+            } else {
+                try self.out("{s}\n", .{try io.json(self.a, .{ .repo = entry.repo.name, .pr = job.number, .review = payload, .onchain_observations = observations })});
+            }
         }
     }
 
