@@ -14,6 +14,8 @@ const queue = @import("queue.zig");
 const routing = @import("routing.zig");
 const adaptive = @import("adaptive.zig");
 const usage_meter = @import("usage.zig");
+const followup = @import("followup.zig");
+const followup_git = @import("followup_git.zig");
 
 const eq = io.eq;
 const A = io.A;
@@ -27,6 +29,9 @@ const usage =
     \\talos [--home DIR] queue-budget [STARTS]
     \\talos [--home DIR] usage [ENGINE DAILY_STARTS]
     \\talos [--home DIR] queue OWNER/REPO PR [--mode MODE] [--prompt TEXT [--publish]]
+    \\talos [--home DIR] followup THREAD_URL [--dry-run | --merge-when-ready]
+    \\talos [--home DIR] followup status [--json]
+    \\talos [--home DIR] followup pause|resume THREAD_URL
     \\talos [--home DIR] stack OWNER/REPO STACK_NUMBER
     \\talos [--home DIR] stack OWNER/REPO NAME PR PR [PR ...]
     \\talos [--home DIR] unstack OWNER/REPO NAME
@@ -426,6 +431,148 @@ const ReviewWorker = struct {
     }
 };
 
+const FollowupService = struct {
+    app: Main,
+    state: *store.State,
+    repo: core.Repo,
+    client: github.Client,
+    work: followup_git.Work,
+
+    pub fn origin(self: *FollowupService, job: followup.Job) !core.Pull {
+        return self.client.pull(job.source.pr);
+    }
+
+    pub fn remote(self: *FollowupService, job: followup.Job) !?[]const u8 {
+        return self.work.remote(try job.source.branch(self.app.a));
+    }
+
+    pub fn baseHead(self: *FollowupService, job: followup.Job) ![]const u8 {
+        return (try self.work.remote(job.base)) orelse error.FollowupBaseMissing;
+    }
+
+    pub fn draft(self: *FollowupService, job: followup.Job) !?followup.Draft {
+        const ref = (try self.client.followupRef(try job.source.branch(self.app.a), job.pr)) orelse return null;
+        return .{
+            .pull = try self.client.pull(ref.number),
+            .branch = ref.head.ref,
+            .repo = if (ref.head.repo) |item| item.full_name else "",
+        };
+    }
+
+    fn verifiedDraft(self: *FollowupService, job: followup.Job) !core.Pull {
+        const managed = (try self.draft(job)) orelse return error.FollowupDraftUnconfirmed;
+        if (!try followup.matchesDraft(self.app.a, job, managed) or !eq(u8, managed.pull.state, "OPEN") or
+            job.head == null or !eq(u8, managed.pull.headRefOid, job.head.?))
+            return error.FollowupTargetChanged;
+        return managed.pull;
+    }
+
+    pub fn feedback(self: *FollowupService, job: followup.Job, pull: core.Pull) !followup.Feedback {
+        const reviews = try self.client.reviews(pull.number);
+        const discussion = try self.client.discussion(pull.number);
+        return followup.collectFeedback(self.app.a, job, pull, reviews, discussion);
+    }
+
+    fn checkIdentity(self: *FollowupService, job: followup.Job) !void {
+        if (job.paused or try self.app.db.paused(job.source.repo)) return error.RepoPaused;
+        if (!std.ascii.eqlIgnoreCase(job.login, self.repo.login) or !std.ascii.eqlIgnoreCase(try self.client.identity(), job.login))
+            return error.GitHubIdentityChanged;
+    }
+
+    pub fn prepare(self: *FollowupService, job: followup.Job, source_pr: core.Pull, parent: []const u8, input: []const u8) !followup.Prepared {
+        const a = self.app.a;
+        const now = std.time.timestamp();
+        const provider_usage: usage_meter.Snapshot = if (self.app.meter) |meter| meter.snapshot() else .{};
+        var selected: ?core.Engine = null;
+        for (try self.repo.providers(a)) |engine| {
+            const at = self.state.queue_budget.engineAt(engine, now, 0, provider_usage) orelse continue;
+            if (at > now) continue;
+            selected = engine;
+            break;
+        }
+        const engine = selected orelse return error.ReviewerCoolingDown;
+        const discussion = try self.client.discussion(job.source.pr);
+        const thread = for (discussion.threads) |thread| {
+            if (eq(u8, thread.id, job.thread)) break thread;
+        } else return error.FollowupThreadNotFound;
+        const author = source_pr.author orelse return error.InvalidFollowupSource;
+        const feedback_run = input.len != 0;
+        const branch = if (feedback_run) try job.source.branch(a) else job.base;
+        try self.work.fetch(branch, parent);
+        const file = try self.work.read(parent, job.path);
+        var evidence: std.ArrayList(followup.Evidence) = .empty;
+        for (job.evidence_paths[0..@min(job.evidence_paths.len, 3)]) |path| {
+            var item: followup.Evidence = .{ .path = path, .text = null };
+            if (self.work.read(parent, path)) |extra| {
+                const length = core.safePrefix(extra.text, 8 * 1024);
+                item.text = extra.text[0..length];
+                item.clipped = length < extra.text.len;
+            } else |err| {
+                if (err == error.OutOfMemory) return err;
+            }
+            try evidence.append(a, item);
+        }
+        const prompt = try followup.prompt(a, job, author.login, thread, file.text, input, evidence.items);
+        const answer = try invokeReviewer(self.app.local(self.repo), engine, reviewerProfile(self.repo, engine), followup.schema, prompt);
+        const change = try followup.proposal(a, answer);
+        if (change.action != .fix) return .{ .head = parent, .change = change };
+        const revised = try followup.edit(a, file.text, change);
+        const title = if (feedback_run) "fix: address followup review feedback" else try io.fmt(a, "fix: {s}", .{change.title});
+        const head = try self.work.commit(job, parent, file.mode, revised, title);
+        return .{ .head = head, .change = change };
+    }
+
+    pub fn persist(self: *FollowupService) !void {
+        try self.app.db.save(self.state);
+    }
+
+    pub fn push(self: *FollowupService, job: followup.Job, parent: []const u8, head: []const u8) !void {
+        try self.checkIdentity(job);
+        if (job.pr != null) {
+            const pull = try self.verifiedDraft(job);
+            const input = try self.feedback(job, pull);
+            if (input.needs_human or !eq(u8, &input.key, &job.pending.?.feedback.?)) return error.FollowupFeedbackChanged;
+            _ = try self.verifiedDraft(job);
+        } else if (!eq(u8, try self.baseHead(job), parent)) return error.FollowupTargetChanged;
+        try self.work.push(try job.source.branch(self.app.a), job.head, head);
+    }
+
+    pub fn create(self: *FollowupService, job: followup.Job) !void {
+        try self.checkIdentity(job);
+        const a = self.app.a;
+        const head = (try self.remote(job)) orelse return error.FollowupPushUnconfirmed;
+        if (!eq(u8, head, job.head.?)) return error.FollowupTargetChanged;
+        var body: std.ArrayList(u8) = .empty;
+        try core.reviewProse(a, &body, job.summary);
+        try body.writer(a).print("\n\nFollowup to <{s}>.\n\n{s}", .{ try job.source.url(a), try followup.marker(a, job.source) });
+        try self.client.createFollowup(try job.source.branch(a), job.base, job.title, body.items);
+    }
+
+    pub fn ready(self: *FollowupService, job: followup.Job) !void {
+        try self.checkIdentity(job);
+        const pull = try self.verifiedDraft(job);
+        const input = try self.feedback(job, pull);
+        if (input.needs_human or (input.text.len != 0 and (job.feedback == null or !eq(u8, &job.feedback.?, &input.key))))
+            return error.FollowupFeedbackChanged;
+        const latest = try self.verifiedDraft(job);
+        if (!latest.isDraft or !core.checksPassed(latest) or !eq(u8, pull.baseRefOid, latest.baseRefOid)) return error.FollowupChecksChanged;
+        try self.client.readyFollowup(latest.number);
+        if ((try self.verifiedDraft(job)).isDraft) return error.FollowupReadyUnconfirmed;
+    }
+
+    pub fn merge(self: *FollowupService, job: followup.Job) !void {
+        if (!job.merge) return error.FollowupMergeDisabled;
+        try self.checkIdentity(job);
+        const pull = try self.verifiedDraft(job);
+        const input = try self.feedback(job, pull);
+        if (!input.approved or input.needs_human or (input.text.len != 0 and (job.feedback == null or !eq(u8, &job.feedback.?, &input.key))))
+            return error.FollowupFeedbackChanged;
+        const latest = try self.verifiedDraft(job);
+        if (latest.isDraft or !core.checksPassed(latest) or !eq(u8, latest.baseRefOid, pull.baseRefOid)) return error.FollowupChecksChanged;
+        try self.client.mergeFollowup(latest.number, latest.headRefOid);
+    }
+};
+
 const Main = struct {
     a: A,
     env: *const std.process.EnvMap,
@@ -529,12 +676,23 @@ const Main = struct {
         };
     }
 
-    fn scan(self: Main, entry: *core.Entry) !void {
+    fn scan(self: Main, entry: *core.Entry, managed: []const followup.Job) !void {
         const local_tools = self.local(entry.repo);
         const env = try local_tools.githubEnv();
         const client = try local_tools.gh(&env, entry.repo.name);
         if (!std.ascii.eqlIgnoreCase(entry.repo.login, try client.identity())) return error.GitHubIdentityChanged;
-        const pulls = try client.ready();
+        const available = try client.ready();
+        const pulls = if (managed.len == 0) available else tracked: {
+            var unmatched: std.ArrayList(core.Pull) = .empty;
+            pull_loop: for (available) |pull| {
+                for (managed) |job| {
+                    if (!std.ascii.eqlIgnoreCase(job.source.repo, entry.repo.name)) continue;
+                    if (job.pr == pull.number) continue :pull_loop;
+                }
+                try unmatched.append(self.a, pull);
+            }
+            break :tracked unmatched.items;
+        };
         const natives = try client.nativeGroups(pulls);
         const pins = try client.stackPulls(try stack.numbers(self.a, entry.stacks));
         try entry.discover(self.a, pulls, false);
@@ -597,7 +755,7 @@ const Main = struct {
                 changed = true;
             }
             if (entry.next_scan <= now and state.queue_budget.canScan(now) and !try self.db.paused(entry.repo.name)) {
-                if (worker.scan(entry)) |_| {
+                if (worker.scan(entry, state.followups)) |_| {
                     entry.last_scan = std.time.timestamp();
                     entry.next_scan = entry.last_scan + entry.repo.interval;
                     entry.scan_attempts = 0;
@@ -615,11 +773,133 @@ const Main = struct {
             }
         }
         if (state.entries.len == 0) return;
+        try worker.tickFollowup(state, &counts);
         try worker.reviewBatch(state, &counts);
         if (counts.jobs != 0) {
             state.queue_budget.last_tick = counts;
             try self.db.save(state);
         }
+    }
+
+    fn followupService(self: Main, state: *store.State, repo: core.Repo, env: *std.process.EnvMap) !FollowupService {
+        const tools = self.local(repo);
+        env.* = try tools.githubEnv();
+        return .{
+            .app = self,
+            .state = state,
+            .repo = repo,
+            .client = try tools.gh(env, repo.name),
+            .work = try followup_git.Work.make(try tools.git(env, self.db, repo), self.scratch, repo.name),
+        };
+    }
+
+    fn followupStatus(self: Main, state: store.State, args: []const []const u8) !void {
+        if (args.len != 0) {
+            if (args.len != 1 or !eq(u8, args[0], "--json")) return error.Usage;
+            return self.out("{s}\n", .{try io.json(self.a, state.followups)});
+        }
+        if (state.followups.len == 0) return self.out("No followups queued.\n", .{});
+        for (state.followups) |job| {
+            const source_url = try job.source.url(self.a);
+            const draft_url = if (job.pr) |pr| try io.fmt(self.a, "  https://github.com/{s}/pull/{d}", .{ job.source.repo, pr }) else "";
+            try self.out("{s}  {s}{s}\n", .{ source_url, if (job.paused) "paused" else @tagName(job.stage), draft_url });
+            if (job.note.len != 0) try self.out("  {s}\n", .{job.note});
+        }
+    }
+
+    fn findFollowup(state: *store.State, target: followup.Target) ?*followup.Job {
+        for (state.followups) |*job| if (job.source.same(target)) return job;
+        return null;
+    }
+
+    fn followupCommand(self: Main, state: *store.State, args: []const []const u8) !void {
+        if (args.len == 0 or args.len > 2) return error.Usage;
+        if (eq(u8, args[0], "pause") or eq(u8, args[0], "resume")) {
+            if (args.len != 2) return error.Usage;
+            const job = findFollowup(state, try followup.Target.parse(args[1])) orelse return error.FollowupNotQueued;
+            job.paused = eq(u8, args[0], "pause");
+            if (!job.paused) {
+                job.attempts = 0;
+                job.next = 0;
+                if (job.stage == .needs_input and job.pr == null) {
+                    job.stage = .waiting;
+                    job.evidence_paths = &.{};
+                }
+            }
+            try self.db.save(state);
+            return self.out("{s} followup\n", .{if (job.paused) "Paused" else "Resumed"});
+        }
+        const preview = args.len == 2 and eq(u8, args[1], "--dry-run");
+        const merge = args.len == 2 and eq(u8, args[1], "--merge-when-ready");
+        if (args.len == 2 and !preview and !merge) return error.Usage;
+        var target = try followup.Target.parse(args[0]);
+        const entry = state.find(target.repo) orelse return error.UnknownRepository;
+        target.repo = entry.repo.name;
+
+        var env: std.process.EnvMap = undefined;
+        var service = try self.followupService(state, entry.repo, &env);
+        const source_pr = try service.client.pull(target.pr);
+        const discussion = try service.client.discussion(target.pr);
+        var job = try followup.select(self.a, target, entry.repo.login, source_pr, discussion);
+        if (!followup_git.allowed(job.path)) return error.FollowupPathDisallowed;
+        if (preview) {
+            if (!eq(u8, source_pr.state, "MERGED")) return self.out("Waiting for the source PR to merge.\n", .{});
+            var ledger: usage_meter.Ledger = .{ .dir = self.db.dir, .data = try usage_meter.load(self.a, self.db.dir, std.time.timestamp()) };
+            service.app.meter = &ledger;
+            const parent = try service.baseHead(job);
+            var prepared = try service.prepare(job, source_pr, parent, "");
+            if (prepared.change.action == .request_source) {
+                job.evidence_paths = prepared.change.evidence_paths;
+                prepared = try service.prepare(job, source_pr, parent, "");
+            }
+            return self.out("{s}\n", .{try io.json(self.a, .{ .path = job.path, .base = parent, .proposal = prepared.change })});
+        }
+        if (eq(u8, source_pr.state, "CLOSED")) return error.FollowupSourceClosed;
+        if (findFollowup(state, job.source)) |existing| {
+            if (merge and !existing.merge) {
+                if (!std.ascii.eqlIgnoreCase(try service.client.identity(), existing.login)) return error.GitHubIdentityChanged;
+                existing.merge = true;
+                try self.db.save(state);
+            }
+            const url = if (existing.pr) |pr| try io.fmt(self.a, "https://github.com/{s}/pull/{d}", .{ existing.source.repo, pr }) else try existing.source.url(self.a);
+            return self.out("Followup already tracked. {s}\n", .{url});
+        }
+        if (!std.ascii.eqlIgnoreCase(try service.client.identity(), job.login)) return error.GitHubIdentityChanged;
+        job.merge = merge;
+        state.followups = try std.mem.concat(self.a, followup.Job, &.{ state.followups, &.{job} });
+        try self.db.save(state);
+        return self.out("Queued followup for {s}\n", .{try job.source.url(self.a)});
+    }
+
+    fn tickFollowup(self: Main, state: *store.State, counts: *queue.TickCounts) !void {
+        const now = std.time.timestamp();
+        if (!state.queue_budget.canScan(now)) return;
+        var candidate: ?*followup.Job = null;
+        for (state.followups) |*job| {
+            if (!job.active() or job.paused or job.next > now or try self.db.paused(job.source.repo)) continue;
+            if (candidate == null or job.next < candidate.?.next) candidate = job;
+        }
+        const job = candidate orelse return;
+        const entry = state.find(job.source.repo) orelse return error.UnknownRepository;
+        var env: std.process.EnvMap = undefined;
+        var service = try self.followupService(state, entry.repo, &env);
+        counts.jobs += 1;
+        if (followup.advance(self.a, &service, job)) |_| {
+            job.attempts = 0;
+            job.next = std.time.timestamp() + entry.repo.interval;
+        } else |err| {
+            state.queue_budget.noteFailure(std.time.timestamp(), err);
+            if (err == error.ReviewerCoolingDown or err == error.RepoPaused) {
+                job.note = if (err == error.ReviewerCoolingDown) "Waiting for a reviewer." else "The repo is paused.";
+                job.next = std.time.timestamp() + entry.repo.interval;
+            } else {
+                job.attempts +|= 1;
+                job.next = std.time.timestamp() + core.delay(job.attempts);
+                job.note = @errorName(err);
+                if (job.attempts >= 6) job.paused = true;
+            }
+        }
+        try self.db.save(state);
     }
 
     fn showQueueBudget(self: Main, budget: queue.Budget) !void {
@@ -645,7 +925,7 @@ const Main = struct {
 
     fn reviewBatch(self: Main, state: *store.State, counts: *queue.TickCounts) !void {
         const limit = state.queue_budget.limit;
-        var batch: ReviewBatch = .{ .starts_left = limit, .receipts_left = limit, .meter = self.meter };
+        var batch: ReviewBatch = .{ .starts_left = limit -| counts.reviewer_starts, .receipts_left = limit, .meter = self.meter };
         defer batch.deinit();
 
         var repos: [queue.active_repos]queue.RepoJobs = undefined;
@@ -957,7 +1237,7 @@ const Main = struct {
                 job = .{ .number = pull.number, .head = pull.headRefOid, .last_review = entry.lastReview(pull.number) };
             } else {
                 if (try self.db.paused(entry.repo.name)) continue;
-                try self.scan(entry); // This copy is never written back.
+                try self.scan(entry, state.followups); // This copy is never written back.
                 const queued = entry.due(std.time.timestamp()) orelse continue;
                 if (queued.phase != .pending) continue;
                 job = queued.*;
@@ -1146,6 +1426,8 @@ const Main = struct {
     fn dispatch(self: Main, args: []const []const u8) !void {
         const cmd = args[0];
         const params = args[1..];
+        if (eq(u8, cmd, "followup") and params.len > 0 and eq(u8, params[0], "status"))
+            return self.followupStatus(try self.db.load(), params[1..]);
         if (eq(u8, cmd, "status")) {
             var state = try self.db.load();
             return self.status(&state, params);
@@ -1190,6 +1472,7 @@ const Main = struct {
         if (eq(u8, cmd, "tick") and params.len == 0) return self.scheduledTick();
         var state = try self.db.load();
         if (eq(u8, cmd, "add")) return self.add(&state, params);
+        if (eq(u8, cmd, "followup")) return self.followupCommand(&state, params);
         if (eq(u8, cmd, "defaults")) return self.defaults(&state, params);
         if (eq(u8, cmd, "queue-budget")) return self.setQueueBudget(&state, params);
         if (eq(u8, cmd, "usage") and params.len == 2) {

@@ -277,7 +277,7 @@ test "rereview carries forward the previous head and evidence based thread dispo
     try t.expectEqual(@as(usize, 1), entry.jobs.len);
     try t.expectEqualStrings(head, entry.jobs[0].last_review.?.head);
     const prepared = (try core.prepare(a, &fake, local, &entry.jobs[0], .scheduled)).?;
-    try t.expect(std.mem.indexOf(u8, prepared.context, "\"disposition\":\"non_blocking\"") != null);
+    try t.expect(std.mem.indexOf(u8, prepared.context, "\"disposition\":\"deferred\"") != null);
     try t.expect(std.mem.indexOf(u8, prepared.context, "Duplicate wakeups already coalesce") != null);
     try t.expectEqualStrings(changed, prepared.pr.headRefOid);
 }
@@ -847,7 +847,7 @@ const open_nit = core.Thread{
 };
 
 const assessed =
-    \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":[],"non_blocking_threads":[{"id":"thread-1","reason":"Duplicate wakeups already coalesce within a poll, so the residual work is bounded to one retry per interval."}]}
+    \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":[],"non_blocking_threads":[{"id":"thread-1","reason":"Duplicate wakeups already coalesce within a poll, so the residual work is bounded to one retry per interval.","disposition":"deferred"}]}
 ;
 
 test "approval with open threads requires every reviewer to give a reason and no reviewer to report an active finding" {

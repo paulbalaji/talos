@@ -2,6 +2,7 @@ const std = @import("std");
 const io = @import("io.zig");
 const core = @import("core.zig");
 const queue = @import("queue.zig");
+const followup = @import("followup.zig");
 const A = io.A;
 
 pub const State = struct {
@@ -9,6 +10,7 @@ pub const State = struct {
     default_engines: []const core.Engine = &.{.codex},
     queue_budget: queue.Budget = .{},
     entries: []core.Entry = &.{},
+    followups: []followup.Job = &.{},
 
     pub fn find(self: *State, repo: []const u8) ?*core.Entry {
         for (self.entries) |*entry| {

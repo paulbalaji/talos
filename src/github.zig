@@ -24,6 +24,11 @@ const RawThread = struct {
 
 pub const File = struct { filename: []const u8, patch: ?[]const u8 = null, status: []const u8 = "", previous_filename: ?[]const u8 = null, additions: ?u32 = null, deletions: ?u32 = null };
 
+pub const FollowupRef = struct {
+    number: u32,
+    head: struct { ref: []const u8, repo: ?struct { full_name: []const u8 } },
+};
+
 const review_comment_page_size = 100;
 const ReviewComment = struct {
     id: u64,
@@ -122,6 +127,44 @@ pub const Client = struct {
         const result = try io.parse(a, core.Pull, input);
         if (result.number != number) return error.GitHubTargetMismatch;
         return result;
+    }
+
+    pub fn followupRef(self: Client, branch: []const u8, known: ?u32) !?FollowupRef {
+        const a = self.cmd.a;
+        if (known) |pr| {
+            const endpoint_path = try self.endpoint(try io.fmt(a, "pulls/{d}", .{pr}));
+            const data = self.api(endpoint_path, &.{}, "") catch |err| return transportFailure(err, error.GitHubFollowupLookupFailed);
+            const result = try io.parse(a, FollowupRef, data);
+            if (result.number != pr) return error.GitHubTargetMismatch;
+            return result;
+        }
+        const head = try io.fmt(a, "head={s}:{s}", .{ std.mem.sliceTo(self.repo, '/'), branch });
+        const raw = self.api(try self.endpoint("pulls"), &.{ "--method", "GET", "-f", head, "-f", "state=all", "-F", "per_page=2" }, "") catch |err|
+            return transportFailure(err, error.GitHubFollowupLookupFailed);
+        const matches = try io.parse(a, []const FollowupRef, raw);
+        if (matches.len > 1) return error.AmbiguousFollowupDraft;
+        return if (matches.len == 1) matches[0] else null;
+    }
+
+    pub fn createFollowup(self: Client, branch: []const u8, base: []const u8, title: []const u8, body: []const u8) !void {
+        const payload = try io.json(self.cmd.a, .{ .head = branch, .base = base, .title = title, .body = body, .draft = true });
+        _ = self.api(try self.endpoint("pulls"), &.{ "--method", "POST", "--input", "-" }, payload) catch |err|
+            return transportFailure(err, error.FollowupDraftUnconfirmed);
+    }
+
+    pub fn readyFollowup(self: Client, number: u32) !void {
+        const a = self.cmd.a;
+        const repo = try io.fmt(a, "github.com/{s}", .{self.repo});
+        _ = self.invoke(&.{ self.gh, "pr", "ready", try io.fmt(a, "{d}", .{number}), "-R", repo }, "") catch |err|
+            return transportFailure(err, error.FollowupReadyUnconfirmed);
+    }
+
+    pub fn mergeFollowup(self: Client, number: u32, head: []const u8) !void {
+        if (!core.validOid(head)) return error.InvalidFollowupRef;
+        const a = self.cmd.a;
+        const repo = try io.fmt(a, "github.com/{s}", .{self.repo});
+        _ = self.invoke(&.{ self.gh, "pr", "merge", try io.fmt(a, "{d}", .{number}), "-R", repo, "--auto", "--squash", "--match-head-commit", head }, "") catch |err|
+            return transportFailure(err, error.FollowupMergeUnconfirmed);
     }
 
     pub fn stackPulls(self: Client, numbers: []const u32) ![]stack.Pin {
@@ -351,7 +394,7 @@ pub const Client = struct {
         \\    reviewThreads(first: 50, after: $cursor) { pageInfo { hasNextPage endCursor }
         \\      nodes { id isResolved isOutdated path line
         \\        comments(first: 50) { pageInfo { hasNextPage endCursor }
-        \\          nodes { author { login kind: __typename } body url updatedAt association: authorAssociation }
+        \\          nodes { author { login kind: __typename } body url updatedAt association: authorAssociation originalCommit { oid } }
         \\        }
         \\      }
         \\    }
@@ -371,7 +414,7 @@ pub const Client = struct {
         \\query($id: ID!, $cursor: String) {
         \\  node(id: $id) { ... on PullRequestReviewThread {
         \\    comments(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor }
-        \\      nodes { author { login kind: __typename } body url updatedAt association: authorAssociation }
+        \\      nodes { author { login kind: __typename } body url updatedAt association: authorAssociation originalCommit { oid } }
         \\    }
         \\  } }
         \\}
