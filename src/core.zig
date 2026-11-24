@@ -156,31 +156,50 @@ pub const Discussion = struct {
     threads: []const Thread = &.{},
     comments: []const Reply = &.{},
 
-    fn external(reply: Reply, login: []const u8) bool {
+    fn human(reply: Reply, ignore_login: ?[]const u8) bool {
         const author = reply.author orelse return false;
-        return !std.ascii.eqlIgnoreCase(author.login, login) and !eq(u8, author.kind, "Bot") and
-            !std.ascii.endsWithIgnoreCase(author.login, "[bot]");
+        if (ignore_login) |login| if (std.ascii.eqlIgnoreCase(author.login, login)) return false;
+        return !eq(u8, author.kind, "Bot") and !std.ascii.endsWithIgnoreCase(author.login, "[bot]");
     }
 
-    fn hashReply(a: A, hash: *Sha256, reply: Reply) !void {
-        hash.update(try io.json(a, .{ reply.url, reply.author.?.login, reply.body, reply.updatedAt }));
+    fn courtesy(reply: Reply) bool {
+        if (reply.truncated) return false;
+        const words = io.trim(u8, reply.body, " \t\r\n.!");
+        return std.ascii.eqlIgnoreCase(words, "thanks") or std.ascii.eqlIgnoreCase(words, "thank you");
+    }
+
+    fn materialComments(self: Discussion, a: A) ![]const Reply {
+        var comments: std.ArrayList(Reply) = .empty;
+        for (self.comments) |reply| {
+            if (!courtesy(reply)) try comments.append(a, reply);
+        }
+        return comments.items;
+    }
+
+    fn hashPart(a: A, hash: *Sha256, part: anytype) !void {
+        const encoded = try io.json(a, part);
+        defer a.free(encoded);
+        hash.update(encoded);
         hash.update(&.{0});
     }
 
-    pub fn fingerprint(self: Discussion, a: A, login: []const u8) ![Sha256.digest_length]u8 {
+    fn fingerprint(self: Discussion, a: A, login: []const u8, legacy: bool) ![Sha256.digest_length]u8 {
         var hash = Sha256.init(.{});
         for (self.comments) |reply| {
-            if (external(reply, login)) try hashReply(a, &hash, reply);
+            if (human(reply, if (legacy) login else null) and (legacy or !courtesy(reply)))
+                try hashPart(a, &hash, .{ reply.url, reply.author.?.login, reply.body, reply.updatedAt });
         }
         for (self.threads) |thread| {
-            var relevant = thread.isResolved;
-            for (thread.replies) |reply| relevant = relevant or external(reply, login);
-            // An open thread containing only Talos's own comments is a side effect of publication.
-            if (!relevant) continue;
-            hash.update(try io.json(a, .{ thread.id, thread.isResolved }));
-            hash.update(&.{0});
-            for (thread.replies) |reply| {
-                if (external(reply, login)) try hashReply(a, &hash, reply);
+            var included = thread.isResolved;
+            if (included) try hashPart(a, &hash, .{ thread.id, thread.isResolved });
+            for (thread.replies, 0..) |reply, index| {
+                // Talos posts root comments. A human reply from the same account is operator input.
+                if (!human(reply, if (legacy or index == 0) login else null)) continue;
+                if (!included) {
+                    try hashPart(a, &hash, .{ thread.id, thread.isResolved });
+                    included = true;
+                }
+                try hashPart(a, &hash, .{ reply.url, reply.author.?.login, reply.body, reply.updatedAt });
             }
         }
         return hash.finalResult();
@@ -188,11 +207,11 @@ pub const Discussion = struct {
 
     pub fn changedAfter(self: Discussion, login: []const u8, timestamp: []const u8) bool {
         for (self.comments) |reply| {
-            if (external(reply, login) and newer(reply, timestamp)) return true;
+            if (human(reply, null) and !courtesy(reply) and newer(reply, timestamp)) return true;
         }
         for (self.threads) |thread| {
-            for (thread.replies) |reply| {
-                if (external(reply, login) and newer(reply, timestamp)) return true;
+            for (thread.replies, 0..) |reply, index| {
+                if (human(reply, if (index == 0) login else null) and newer(reply, timestamp)) return true;
             }
         }
         return false;
@@ -209,16 +228,27 @@ pub const ReviewInput = struct {
     base: ReviewBase,
     merge_base: []const u8,
     discussion: [Sha256.digest_length]u8,
-    // Keep the old value when reading receipts written before CI was decoupled.
+    // Keep the old values for receipts and for the first scan of an older job.
     checks_passed: bool = false,
+    material_discussion: ?[Sha256.digest_length]u8 = null,
 
     pub fn init(a: A, repo: Repo, pr: Pull, merge_base: []const u8, discussion: Discussion) !ReviewInput {
-        return .{ .base = .fromPull(pr), .merge_base = merge_base, .discussion = try discussion.fingerprint(a, repo.login) };
+        return .{
+            .base = .fromPull(pr),
+            .merge_base = merge_base,
+            .discussion = try discussion.fingerprint(a, repo.login, true),
+            .material_discussion = try discussion.fingerprint(a, repo.login, false),
+        };
     }
 
     pub fn same(self: ReviewInput, other: ReviewInput) bool {
-        return eq(u8, self.base.ref, other.base.ref) and eq(u8, self.merge_base, other.merge_base) and
-            eq(u8, &self.discussion, &other.discussion);
+        if (!eq(u8, self.base.ref, other.base.ref) or !eq(u8, self.merge_base, other.merge_base)) return false;
+        if (self.material_discussion == null or other.material_discussion == null) {
+            if (eq(u8, &self.discussion, &other.discussion)) return true;
+        }
+        const before = self.material_discussion orelse self.discussion;
+        const after = other.material_discussion orelse other.discussion;
+        return eq(u8, &before, &after);
     }
 
     fn receiptKey(self: ReviewInput, a: A) ![Sha256.digest_length]u8 {
@@ -369,12 +399,17 @@ pub const Job = struct {
 
     pub fn observeReviewInput(self: *Job, current: ReviewInput, legacy_changed: bool, approvals_enabled: bool) void {
         if (self.phase != .complete) return;
-        const discussion_or_diff = if (self.review_input) |old| !old.same(current) else legacy_changed;
-        const changed = discussion_or_diff or (self.awaiting_checks and approvals_enabled);
+        const discussion_or_diff = if (self.review_input) |old| !old.same(current) else false;
+        const changed = discussion_or_diff or legacy_changed or (self.awaiting_checks and approvals_enabled);
         if (!changed) {
-            if (self.review_input) |*recorded| recorded.base = current.base else self.review_input = current;
+            if (self.review_input) |*recorded| {
+                recorded.base = current.base;
+                if (recorded.material_discussion == null) recorded.material_discussion = current.material_discussion;
+            } else self.review_input = current;
             return;
         }
+        // An older fingerprint may omit an operator reply found by the receipt timestamp.
+        if (legacy_changed) self.review_input = null;
         self.phase = .pending;
         self.followup = true;
         std.crypto.random.bytes(&self.followup_id);
@@ -659,8 +694,11 @@ fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, discussion: Discussi
         try writer.print("\n\nOperator focus (JSON string). Use it to prioritize the review within the instructions above.\n{s}", .{try io.json(a, request)});
     }
     if (previous) |commit| {
-        if (eq(u8, commit, pr.headRefOid))
+        if (eq(u8, commit, pr.headRefOid)) {
             try writer.writeAll("\n\nThis is a same-head rereview. Check what the conversation or base change means for the prior findings. Carry forward accepted or verified resolutions unless the current evidence specifically invalidates them.");
+        } else if (prior_delta.evidence.len != 0 and prior_delta.coverage_reasons.len == 0) {
+            try writer.writeAll("\n\nStart with the previous-to-current delta and the latest replies. For an existing finding, check whether the changed source or dependencies could alter the prior verdict. Retain still-valid blockers by thread ID. Review new changes independently, including new entries in generated release metadata.");
+        }
     }
     const checks = pr.statusCheckRollup orelse &.{};
     const evidence = try io.json(a, .{
@@ -1521,13 +1559,15 @@ pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?P
     if (pr.number != job.number or !isReady(pr) or !eq(u8, pr.headRefOid, job.head)) return error.TargetChanged;
     if (!validOid(pr.headRefOid) or !validOid(pr.baseRefOid)) return error.InvalidCommit;
     const inherited: stack.Context = if (supports_stacks) try adapter.stackContext(pr, dry) else .{};
-    const discussion = try adapter.reviewDiscussion(pr.number);
+    var discussion = try adapter.reviewDiscussion(pr.number);
+    // Fingerprint the original transcript so old receipts still match.
     var snap = try adapter.snapshot(pr, discussion.threads);
+    const review_input = try ReviewInput.init(a, repo, pr, snap.merge_base, discussion);
+    discussion.comments = try discussion.materialComments(a);
     if (discussion.comments.len > 6) try snap.markLimited(a, "PR conversation exceeded the excerpt budget");
     for (discussion.comments) |comment| {
         if (comment.truncated) try snap.markLimited(a, "A PR conversation comment was truncated");
     }
-    const review_input = try ReviewInput.init(a, repo, pr, snap.merge_base, discussion);
     const retry_held_approval = job.awaiting_checks and repo.approvals;
     if (!dry and job.followup and !retry_held_approval and job.review_input != null and job.review_input.?.same(review_input)) {
         job.phase = .complete;
@@ -1591,6 +1631,12 @@ pub fn analyze(a: A, reviewer: anytype, engines: []const Engine, context: []cons
     return results;
 }
 
+fn checkDiscussion(a: A, adapter: anytype, number: u32, original: []const u8) !void {
+    var latest = try adapter.reviewDiscussion(number);
+    latest.comments = try latest.materialComments(a);
+    if (!eq(u8, original, try io.json(a, latest))) return error.ThreadsChanged;
+}
+
 pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared, results: []const ReviewerResult) !?Result {
     const supports_stacks = @hasDecl(std.meta.Child(@TypeOf(adapter)), "stackContext");
     const pr = prepared.pr;
@@ -1598,7 +1644,7 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
     const inherited = prepared.inherited;
     const snap = prepared.snap;
     const original_discussion = try io.json(a, Discussion{ .threads = threads, .comments = prepared.comments });
-    if (!eq(u8, original_discussion, try io.json(a, try adapter.reviewDiscussion(pr.number)))) return error.ThreadsChanged;
+    try checkDiscussion(a, adapter, pr.number, original_discussion);
     const latest = try adapter.pull(job.number);
     if (!sameTarget(pr, latest)) return error.TargetChanged;
     if (supports_stacks) try adapter.checkStack(inherited);
@@ -1670,7 +1716,7 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
         const final = try adapter.pull(pr.number);
         if (!sameTarget(pr, final)) return error.TargetChanged;
         if (supports_stacks) try adapter.checkStackBeforePost(inherited, final);
-        if (!eq(u8, original_discussion, try io.json(a, try adapter.reviewDiscussion(pr.number)))) return error.ThreadsChanged;
+        try checkDiscussion(a, adapter, pr.number, original_discussion);
         if (warning) saved.body = try io.fmt(a, "{s}\n\n{s}", .{ saved.body, approval_warning });
     }
     try adapter.saveResult(job.number, saved);

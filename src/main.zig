@@ -775,7 +775,7 @@ const Main = struct {
         else
             try client.mergeBase(pull.baseRefOid, pull.headRefOid);
         const current = try core.ReviewInput.init(self.a, repo, pull, merge_base, discussion);
-        const legacy_changed = saved == null and job.receipt != null and
+        const legacy_changed = (saved == null or saved.?.material_discussion == null) and job.receipt != null and
             job.legacyDiscussionChanged(repo.login, discussion, try client.reviews(pull.number));
         job.observeReviewInput(current, legacy_changed, repo.approvals);
     }

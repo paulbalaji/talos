@@ -34,6 +34,7 @@ const Fake = struct {
     discussion: []const core.Thread = &.{},
     late_discussion: ?[]const core.Thread = null,
     comments: []const core.Reply = &.{},
+    late_comments: ?[]const core.Reply = null,
     snapshot_threads: []const core.Thread = &.{},
     source_limited: bool = false,
     previous_delta: []const u8 = "",
@@ -73,7 +74,7 @@ const Fake = struct {
         self.thread_reads += 1;
         return .{
             .threads = if (self.thread_reads >= 3) self.late_discussion orelse self.discussion else self.discussion,
-            .comments = self.comments,
+            .comments = if (self.thread_reads >= 3) self.late_comments orelse self.comments else self.comments,
         };
     }
 
@@ -324,10 +325,13 @@ test "rereview carries forward the previous head and evidence based thread dispo
     const loaded = try io.parse(a, core.Job, try io.json(a, job));
     var entry: core.Entry = .{ .repo = local, .jobs = try a.dupe(core.Job, &.{loaded}) };
     fake.target.headRefOid = changed;
+    fake.previous_delta = "New changeset entry: fee config.";
     try entry.discover(a, &.{fake.target}, false);
     try t.expectEqual(@as(usize, 1), entry.jobs.len);
     try t.expectEqualStrings(head, entry.jobs[0].last_review.?.head);
     const prepared = (try core.prepare(a, &fake, local, &entry.jobs[0], .scheduled)).?;
+    try t.expect(std.mem.indexOf(u8, prepared.context, "Start with the previous-to-current delta") != null);
+    try t.expect(std.mem.indexOf(u8, prepared.context, fake.previous_delta) != null);
     try t.expect(std.mem.indexOf(u8, prepared.context, "\"disposition\":\"deferred\"") != null);
     try t.expect(std.mem.indexOf(u8, prepared.context, "Duplicate wakeups already coalesce") != null);
     try t.expectEqualStrings(changed, prepared.pr.headRefOid);
@@ -520,7 +524,7 @@ test "effective diff changes and human conversation comments trigger review" {
     try t.expect(!first.same(try core.ReviewInput.init(a, repo, fixture_pull, base, discussion)));
     try t.expect(discussion.changedAfter(repo.login, "2026-11-23T14:30:00Z"));
     try t.expect(!discussion.changedAfter(repo.login, "2026-11-23T15:30:00Z"));
-    try t.expect(!(core.Discussion{ .comments = &.{own} }).changedAfter(repo.login, "2026-11-23T14:30:00Z"));
+    try t.expect((core.Discussion{ .comments = &.{own} }).changedAfter(repo.login, "2026-11-23T14:30:00Z"));
 
     const job: core.Job = .{ .number = fixture_pull.number, .head = head, .receipt = 55, .phase = .complete };
     const earlier = core.Prior{ .id = 55, .commit_id = head, .state = "COMMENTED", .user = .{ .login = repo.login }, .body = "", .submitted_at = "2026-11-23T14:30:00Z" };
@@ -529,6 +533,91 @@ test "effective diff changes and human conversation comments trigger review" {
     try t.expect(!job.legacyDiscussionChanged(repo.login, discussion, &.{ earlier, manual }));
     manual.commit_id = changed;
     try t.expect(job.legacyDiscussionChanged(repo.login, discussion, &.{ earlier, manual }));
+}
+
+test "standalone thanks neither invalidates an approval nor wakes a finished review" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var configured = repo;
+    configured.approvals = true;
+    const ack: core.Reply = .{ .author = .{ .login = "author" }, .body = "  Thank you!\n", .url = "ack" };
+    const conversation = [_]core.Reply{ack} ** 7;
+    var fake: Fake = .{ .a = a, .result = clean, .comments = conversation[0..6], .late_comments = &conversation };
+    var job: core.Job = .{ .number = fixture_pull.number, .head = head };
+    const result = (try core.run(a, &fake, configured, &job, .scheduled)).?;
+    try t.expectEqual(core.Event.APPROVE, result.event);
+    try t.expectEqual(@as(usize, 1), fake.reviews_run);
+    try t.expectEqual(@as(usize, 1), fake.posts);
+    try t.expect(std.mem.indexOf(u8, fake.prompt_text, "Thank you!") == null);
+
+    const after = try core.ReviewInput.init(a, configured, fixture_pull, base, .{ .comments = &conversation });
+    job.observeReviewInput(after, false, configured.approvals);
+    try t.expectEqual(core.Phase.complete, job.phase);
+
+    var meaningful = ack;
+    meaningful.body = "Thanks! This deploys to production after all.";
+    const edited = try core.ReviewInput.init(a, configured, fixture_pull, base, .{ .comments = &.{meaningful} });
+    job.observeReviewInput(edited, false, configured.approvals);
+    try t.expectEqual(core.Phase.pending, job.phase);
+
+    var seven: Fake = .{ .a = a, .result = clean, .comments = &conversation };
+    var seven_job: core.Job = .{ .number = fixture_pull.number, .head = head };
+    try t.expectEqual(core.Event.APPROVE, (try core.run(a, &seven, configured, &seven_job, .scheduled)).?.event);
+}
+
+test "an operator reply is material while its own inline root and legacy receipt stay stable" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const own: core.Reply = .{ .author = .{ .login = repo.login }, .body = "Finding", .url = "root" };
+    const operator: core.Reply = .{
+        .author = .{ .login = repo.login },
+        .body = "We tested the rollback. The issue is still valid but we can defer it.",
+        .url = "operator",
+        .updatedAt = "2026-11-23T15:30:00Z",
+    };
+    var thread: core.Thread = .{ .id = "thread", .isResolved = false, .isOutdated = false, .path = "src/watch.rs", .line = 20, .replies = &.{own} };
+    const first = try core.ReviewInput.init(a, repo, fixture_pull, base, .{});
+    const after_post = try core.ReviewInput.init(a, repo, fixture_pull, base, .{ .threads = &.{thread} });
+    try t.expect(first.same(after_post));
+
+    var legacy = first;
+    legacy.material_discussion = null;
+    var job = try io.parse(a, core.Job, try io.json(a, core.Job{
+        .number = fixture_pull.number,
+        .head = head,
+        .phase = .complete,
+        .review_input = legacy,
+    }));
+    job.observeReviewInput(after_post, false, repo.approvals);
+    try t.expectEqual(core.Phase.complete, job.phase);
+    try t.expectEqual(legacy.discussion, job.review_input.?.discussion);
+    try t.expectEqual(after_post.material_discussion, job.review_input.?.material_discussion);
+
+    thread.replies = &.{ own, operator };
+    const discussion = core.Discussion{ .threads = &.{thread} };
+    const after_reply = try core.ReviewInput.init(a, repo, fixture_pull, base, discussion);
+    try t.expectEqual(legacy.discussion, after_reply.discussion);
+    job.observeReviewInput(after_reply, false, repo.approvals);
+    try t.expectEqual(core.Phase.pending, job.phase);
+
+    job.phase = .complete;
+    job.review_input = legacy;
+    job.receipt = 55;
+    const previous: core.Prior = .{
+        .id = 55,
+        .commit_id = head,
+        .state = "COMMENTED",
+        .user = .{ .login = repo.login },
+        .body = "",
+        .submitted_at = "2026-11-23T14:30:00Z",
+    };
+    const changed_after_receipt = job.legacyDiscussionChanged(repo.login, discussion, &.{previous});
+    try t.expect(changed_after_receipt);
+    job.observeReviewInput(after_reply, changed_after_receipt, repo.approvals);
+    try t.expectEqual(core.Phase.pending, job.phase);
+    try t.expect(job.review_input == null);
 }
 
 test "complete clean reviews approve independently of GitHub checks and mergeability" {
