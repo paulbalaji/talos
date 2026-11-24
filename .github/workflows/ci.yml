@@ -32,7 +32,11 @@ jobs:
         run: |
           distribution="zig-$ZIG_TARGET-0.15.2"
           cd "$RUNNER_TEMP"
-          curl --fail --silent --show-error --location "https://ziglang.org/download/0.15.2/$distribution.tar.xz" --output zig.tar.xz
+          if ! curl --fail --silent --show-error --location --connect-timeout 10 --max-time 40 \
+            "https://ziglang.org/download/0.15.2/$distribution.tar.xz" --output zig.tar.xz; then
+            curl --fail --silent --show-error --location --connect-timeout 10 --max-time 60 \
+              "https://zigmirror.com/$distribution.tar.xz" --output zig.tar.xz
+          fi
           printf '%s  zig.tar.xz\n' "$ZIG_SHA256" | shasum -a 256 -c
           tar -xf zig.tar.xz
           echo "$RUNNER_TEMP/$distribution" >> "$GITHUB_PATH"
