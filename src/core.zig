@@ -110,8 +110,6 @@ pub const Pull = struct {
 };
 
 const Check = struct {
-    name: ?[]const u8 = null,
-    context: ?[]const u8 = null,
     status: ?[]const u8 = null,
     state: ?[]const u8 = null,
     conclusion: ?[]const u8 = null,
@@ -205,10 +203,11 @@ pub const ReviewInput = struct {
     base: ReviewBase,
     merge_base: []const u8,
     discussion: [Sha256.digest_length]u8,
+    // Keep the old value when reading receipts written before CI was decoupled.
     checks_passed: bool = false,
 
     pub fn init(a: A, repo: Repo, pr: Pull, merge_base: []const u8, discussion: Discussion) !ReviewInput {
-        return .{ .base = .fromPull(pr), .merge_base = merge_base, .discussion = try discussion.fingerprint(a, repo.login), .checks_passed = checksPassed(pr) };
+        return .{ .base = .fromPull(pr), .merge_base = merge_base, .discussion = try discussion.fingerprint(a, repo.login) };
     }
 
     pub fn same(self: ReviewInput, other: ReviewInput) bool {
@@ -292,6 +291,7 @@ pub const Job = struct {
     last_review: ?ReviewRecord = null,
     expected_inline: ?[]const Inline = null,
     followup: bool = false,
+    // Completed clean reviews that the old policy held for CI get one rereview.
     awaiting_checks: bool = false,
     followup_id: [16]u8 = @splat(0),
 
@@ -313,10 +313,10 @@ pub const Job = struct {
         return baseline.len > 0 and discussion.changedAfter(login, baseline);
     }
 
-    pub fn observeReviewInput(self: *Job, current: ReviewInput, legacy_changed: bool) void {
+    pub fn observeReviewInput(self: *Job, current: ReviewInput, legacy_changed: bool, approvals_enabled: bool) void {
         if (self.phase != .complete) return;
         const discussion_or_diff = if (self.review_input) |old| !old.same(current) else legacy_changed;
-        const changed = discussion_or_diff or (self.awaiting_checks and current.checks_passed);
+        const changed = discussion_or_diff or (self.awaiting_checks and approvals_enabled);
         if (!changed) {
             if (self.review_input) |*recorded| recorded.base = current.base else self.review_input = current;
             return;
@@ -824,46 +824,19 @@ fn usefulSummary(summary: []const u8) bool {
 }
 
 pub fn checksPassed(pr: Pull) bool {
-    if (mergeBlocked(pr)) return false;
+    if (eq(u8, pr.mergeStateStatus, "DIRTY") or eq(u8, pr.mergeStateStatus, "UNKNOWN")) return false;
     const checks = pr.statusCheckRollup orelse return false;
     for (checks) |check| {
-        if (checkBlocker(check) != null) return false;
+        if (!checkPassed(check)) return false;
     }
     return true;
 }
 
-fn mergeBlocked(pr: Pull) bool {
-    return eq(u8, pr.mergeStateStatus, "DIRTY") or eq(u8, pr.mergeStateStatus, "UNKNOWN");
-}
-
-fn checkBlocker(check: Check) ?[]const u8 {
-    if (check.state) |state| return if (eq(u8, state, "SUCCESS")) null else state;
-    const status = check.status orelse return "status unavailable";
-    if (!eq(u8, status, "COMPLETED")) return status;
-    const conclusion = check.conclusion orelse return "conclusion unavailable";
-    return if (eq(u8, conclusion, "SUCCESS") or eq(u8, conclusion, "NEUTRAL") or eq(u8, conclusion, "SKIPPED")) null else conclusion;
-}
-
-fn appendApprovalBlockers(a: A, body: *std.ArrayList(u8), pr: Pull) !void {
-    const writer = body.writer(a);
-    try writer.writeAll("\n\nApproval checks are incomplete.");
-    if (mergeBlocked(pr)) try writer.print("\n- Merge state {s}", .{pr.mergeStateStatus});
-    const checks = pr.statusCheckRollup orelse {
-        try writer.writeAll("\n- GitHub check rollup unavailable");
-        return;
-    };
-    var count: usize = 0;
-    for (checks) |check| {
-        const reason = checkBlocker(check) orelse continue;
-        count += 1;
-        if (count > 5) continue;
-        const name = check.name orelse check.context orelse "GitHub check";
-        try writer.writeAll("\n- ");
-        try escape(a, body, name[0..safePrefix(name, 150)]);
-        try writer.writeAll(" · ");
-        try escape(a, body, reason[0..safePrefix(reason, 100)]);
-    }
-    if (count > 5) try writer.print("\n- {d} more checks", .{count - 5});
+fn checkPassed(check: Check) bool {
+    if (check.state) |state| return eq(u8, state, "SUCCESS");
+    if (!eq(u8, check.status orelse "", "COMPLETED")) return false;
+    const conclusion = check.conclusion orelse return false;
+    return eq(u8, conclusion, "SUCCESS") or eq(u8, conclusion, "NEUTRAL") or eq(u8, conclusion, "SKIPPED");
 }
 
 fn marker(a: A, repo: Repo, job: Job) ![]const u8 {
@@ -917,7 +890,7 @@ fn groupFindings(a: A, results: []const ReviewerResult) ![]const FindingGroup {
     return groups.items;
 }
 
-const EvaluatedReview = struct { review: Payload, awaiting_checks: bool, has_findings: bool };
+const EvaluatedReview = struct { review: Payload, has_findings: bool };
 
 fn payload(a: A, adapter: anytype, pr: Pull, prepared: Prepared, results: []const ReviewerResult) !EvaluatedReview {
     const snap = prepared.snap;
@@ -1002,8 +975,6 @@ fn payload(a: A, adapter: anytype, pr: Pull, prepared: Prepared, results: []cons
             }
         }
     }
-    const checks_passed = checksPassed(pr);
-    if (!checks_passed) try appendApprovalBlockers(a, &body, pr);
     var clean = options.general() and complete and groups.len == 0 and open_findings.len == 0;
     if (clean) {
         var remaining: usize = 0;
@@ -1035,11 +1006,10 @@ fn payload(a: A, adapter: anytype, pr: Pull, prepared: Prepared, results: []cons
     return .{
         .review = .{
             .commit_id = pr.headRefOid,
-            .event = if (clean and checks_passed) .APPROVE else .COMMENT,
+            .event = if (clean) .APPROVE else .COMMENT,
             .body = body.items,
             .comments = comments.items,
         },
-        .awaiting_checks = clean and !checks_passed,
         .has_findings = groups.len != 0 or open_findings.len != 0,
     };
 }
@@ -1332,9 +1302,8 @@ pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?P
         if (comment.truncated) try snap.markLimited(a, "A PR conversation comment was truncated");
     }
     const review_input = try ReviewInput.init(a, repo, pr, snap.merge_base, discussion);
-    if (!dry and job.followup and job.review_input != null and job.review_input.?.same(review_input) and
-        !(job.awaiting_checks and review_input.checks_passed))
-    {
+    const retry_held_approval = job.awaiting_checks and repo.approvals;
+    if (!dry and job.followup and !retry_held_approval and job.review_input != null and job.review_input.?.same(review_input)) {
         job.phase = .complete;
         job.analysis = null;
         job.route_progress = null;
@@ -1406,13 +1375,12 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
     if (supports_stacks) try adapter.checkStack(inherited);
     var reviewed = job.*;
     reviewed.review_input = prepared.review_input;
-    if (reviewed.review_input) |*input| input.checks_passed = checksPassed(latest);
     if (job.followup) reviewed.receipt = null;
     const evaluated = try payload(a, adapter, latest, prepared, results);
     var result = evaluated.review;
     if (prepared.route_depth == .light) result.event = .COMMENT;
     const own_pr = if (latest.author) |author| eq(u8, author.login, repo.login) else true;
-    reviewed.awaiting_checks = evaluated.awaiting_checks and repo.approvals and !own_pr and prepared.route_depth != .light;
+    reviewed.awaiting_checks = job.awaiting_checks and !repo.approvals and !own_pr and result.event == .APPROVE;
     if (!prepared.dry and result.event == .APPROVE and (!repo.approvals or own_pr)) result.event = .COMMENT;
     reviewed.event = result.event;
     result.body = try io.fmt(a, "{s}\n\n{s}", .{ result.body, try marker(a, repo, reviewed) });
@@ -1440,7 +1408,6 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
         const final = try adapter.pull(pr.number);
         if (!sameTarget(pr, final)) return error.TargetChanged;
         if (supports_stacks) try adapter.checkStackBeforePost(inherited, final);
-        if (result.event == .APPROVE and !checksPassed(final)) return error.ChecksChanged;
         if (!eq(u8, original_discussion, try io.json(a, try adapter.reviewDiscussion(pr.number)))) return error.ThreadsChanged;
     }
     try adapter.saveResult(job.number, result);

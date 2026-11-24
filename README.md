@@ -66,8 +66,6 @@ Performance covers hot paths and scaling. Reliability covers partial failure, re
 
 After a review, Talos checks for new human replies, closed or reopened threads, and changes to the base branch or merge base. It checks up to four completed PRs per repo per scan. A rereview includes the previous verdict on individual findings and a bounded diff from the last reviewed commit when available. Talos keeps up to 16 notes for each tracked PR. The review receipt prevents a duplicate post after a restart.
 
-When approvals are enabled and CI is the only reason Talos withheld approval, passing checks trigger a rereview on the same head. The new review rechecks the current source and discussion before approving.
-
 If a rereview finds an issue after an approval, its comment flags the earlier approval for a person to reassess. On upgrade, Talos uses newer human replies to catch up completed reviews. It tracks resolution changes from the first successful scan.
 
 `talos status OWNER/REPO` shows up to five completed jobs still tracked and links to verified GitHub reviews. `talos result OWNER/REPO 123` prints the last saved local candidate, including its reviewed commit. A review reconciled from GitHub can have a receipt without a local candidate.
@@ -188,7 +186,7 @@ Fable receives the review context when Claude consults it. It requires Fable acc
 
 Each reviewer in a list gets the same pinned source and discussion. Talos runs them in order, groups findings at the same diff line, and sends one review with reviewer attribution. A failed reviewer retries the job. Choose providers that can receive the repo's source and discussion.
 
-`--comments` allows publishing a comment review. `--approvals` requires complete coverage and no findings from every configured reviewer, passing checks, and no merge conflicts. Each reviewer must give an evidence-based reason why each open thread is non-blocking. Any active finding or unassessed thread blocks approval. GitHub applies the target branch’s conversation-resolution rule at merge time. The author must differ from the configured GitHub identity. A clean candidate can become a comment when only comments are enabled.
+`--comments` allows publishing a comment review. `--approvals` requires complete coverage and no findings from every configured reviewer. Talos can approve while CI is running. GitHub enforces required checks, merge conflicts, and conversation resolution when merging. Each reviewer must give an evidence-based reason why each open thread is non-blocking. Any active finding or unassessed thread blocks approval. The author must differ from the configured GitHub identity. A clean candidate can become a comment when only comments are enabled.
 
 ### macOS build fallback
 
