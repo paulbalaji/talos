@@ -23,11 +23,12 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["path", "start_line", "end_line"],
+        "required": ["path", "start_line", "end_line", "line_contains"],
         "properties": {
           "path": { "type": "string" },
           "start_line": { "type": ["integer", "null"] },
-          "end_line": { "type": ["integer", "null"] }
+          "end_line": { "type": ["integer", "null"] },
+          "line_contains": { "type": ["string", "null"] }
         }
       }
     },

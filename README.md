@@ -156,7 +156,9 @@ Every model start also counts against the per-tick budget. Adaptive routing rese
 
 ### Verify on-chain claims
 
-For adaptive reviews of PRs targeting `hyperlane-xyz/hyperlane-registry` main, the screening reviewer can request up to six public EVM reads. Talos uses `curl` and the HTTPS RPC URLs at the pinned base commit. It checks the chain ID, reads at a specific block, and gives the full reviewers the observed values alongside GitHub check statuses. Reviewers can request `owner()`, Safe `getOwners()` and `getThreshold()`, `paused()`, and whether an address has contract code. The RPC requests share a 30-second budget per review.
+For adaptive reviews of PRs targeting `hyperlane-xyz/hyperlane-registry` main, the screening reviewer can request up to six public EVM reads. Talos uses `curl` and the HTTPS RPC URLs at the pinned base commit. It checks the chain ID, reads at a specific block, and gives the full reviewers the observed values alongside GitHub check statuses. Reviewers can request `owner()`, Safe `getOwners()` and `getThreshold()`, `paused()`, `maxCapacity()`, and whether an address has contract code. The RPC requests share a 30-second budget per review.
+
+A change limited to `maxCapacity` on a supported Warp route gets a regular review with automatic reads. Talos resolves the ISM from the pinned router and looks for a unique rate-limited module bound to that router. It compares the observed capacity with the proposed value. A missing or mismatched read holds approval.
 
 Configure a [lightweight model](#route-reviews-by-risk) to enable these requests. A numbered `run-once` preview includes the observations in its JSON output. Scheduled reviews retain the observations and block heights in `status --json`. Unavailable requested evidence limits coverage and blocks automatic approval. The review checks specific claims about live state. A green CI status by itself does not prove those claims.
 
@@ -208,7 +210,7 @@ Fable receives the review context when Claude consults it. It requires Fable acc
 
 Each reviewer in a list starts with the same pinned source and discussion. Talos runs them in order, groups findings at the same diff line, and sends one review. Choose providers that can receive the repo's source and discussion.
 
-Full reviewers can request specific missing source. Talos fetches one shared batch of up to six tracked paths at the pinned head and retries only the affected reviewers. Missing source or exhausted provider budget preserves the existing findings and coverage limits.
+Full reviewers can request specific missing source. Talos fetches one shared batch of up to six excerpts at the pinned head and retries only the affected reviewers. Requests can name a line range or use unique text to locate a declaration. Missing source or exhausted provider budget preserves the existing findings and coverage limits. When a reviewer returns invalid output, Talos tries another configured provider when the required review count can still be met.
 
 `--comments` allows publishing new findings and warnings about earlier approvals. `--approvals` requires complete coverage and no findings from every configured reviewer. Talos can approve while CI is running. GitHub enforces required checks, merge conflicts, and conversation resolution when merging. Each reviewer must give an evidence-based reason why each open thread is non-blocking. Any active finding or unassessed thread blocks approval. The author must differ from the configured GitHub identity.
 

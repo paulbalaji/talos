@@ -292,6 +292,7 @@ const Adapter = struct {
     }
 
     fn previewReads(self: *Adapter, prepared: core.Prepared) ![]const onchain.Observation {
+        if (prepared.onchain_available and prepared.snap.onchain_reads.len != 0) return self.onchainReads(prepared.pr, prepared.snap.onchain_reads);
         if (!prepared.onchain_available or self.repo.light_models.len == 0) return &.{};
         const screen = routing.inspect(self.files, prepared.snap.limited);
         if (!screen.ask_model and screen.floor.depth != .multi) return &.{};
@@ -1105,8 +1106,10 @@ const Main = struct {
                     progress.base = .fromPull(work.prepared.pr);
                 } else job.route_progress = null;
             }
+            if (work.prepared.onchain_available and work.prepared.snap.onchain_reads.len != 0) progress.onchain_reads = work.prepared.snap.onchain_reads;
             const automatically_routed = entry.repo.routing_mode != .fixed and work.prepared.options.allowRouting();
-            const scoped_review = (work.prepared.snap.registry_logo_only or work.prepared.snap.relayer_promotion) and !work.prepared.snap.limited;
+            const scoped_review = (work.prepared.snap.registry_logo_only or work.prepared.snap.relayer_promotion or
+                (work.prepared.onchain_available and work.prepared.snap.onchain_reads.len != 0)) and !work.prepared.snap.limited;
             var screen: routing.Screen = if (automatically_routed and !scoped_review)
                 routing.inspect(work.adapter.files, work.prepared.snap.limited)
             else
@@ -1136,6 +1139,7 @@ const Main = struct {
                 if (progress.evidence_key) |prior| {
                     if (!eq(u8, &prior, &evidence_key)) {
                         progress.results = &.{};
+                        progress.malformed_reviewers = 0;
                         progress.review_ms = 0;
                         progress.initial_evidence_limited = false;
                         progress.completion_requests = null;

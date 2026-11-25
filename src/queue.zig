@@ -110,6 +110,7 @@ pub const Budget = struct {
         providers: for (std.meta.tags(core.Engine)) |engine| {
             const primary = engine == repo.engine or std.mem.indexOfScalar(core.Engine, repo.additional_engines, engine) != null;
             if (!primary and std.mem.indexOfScalar(core.Engine, repo.fallback_engines, engine) == null) continue;
+            if (progress) |partial| if (partial.malformed_reviewers & engineBit(engine) != 0) continue;
             for (completed) |pass| {
                 if (pass.engine == engine) continue :providers;
             }

@@ -11,6 +11,8 @@ pub const Operation = enum {
     safe_threshold,
     paused,
     has_code,
+    max_capacity,
+    warp_rate_limit,
 
     fn selector(self: Operation) []const u8 {
         return switch (self) {
@@ -18,7 +20,8 @@ pub const Operation = enum {
             .safe_owners => "0xa0e67e2b",
             .safe_threshold => "0xe75235b8",
             .paused => "0x5c975abb",
-            .has_code => unreachable,
+            .max_capacity => "0x59b6a0c9",
+            .has_code, .warp_rate_limit => unreachable,
         };
     }
 };
@@ -27,6 +30,7 @@ pub const Request = struct {
     chain: []const u8,
     address: []const u8,
     operation: Operation,
+    expected_value: ?[]const u8 = null,
 
     pub fn valid(self: Request) bool {
         if (self.chain.len == 0 or self.chain.len > 48) return false;
@@ -39,7 +43,10 @@ pub const Observation = struct {
     request: Request,
     block: ?u64 = null,
     value: ?[]const u8 = null,
+    resolved_address: ?[]const u8 = null,
 };
+
+const Reading = struct { value: []const u8, resolved_address: ?[]const u8 = null };
 
 const Metadata = struct {
     chain_id: u64,
@@ -89,9 +96,17 @@ pub const Client = struct {
         const timeout = try std.fmt.bufPrint(&timeout_buffer, "{d}", .{seconds});
         const request = try io.json(self.cmd.a, .{ .jsonrpc = "2.0", .id = @as(u32, 1), .method = method, .params = params });
         const output = try self.cmd.run(&.{ self.curl, "--disable", "--silent", "--fail", "--globoff", "--proto", "=https", "--connect-timeout", "3", "--max-time", timeout, "--max-filesize", "65536", "--header", "Content-Type: application/json", "--data-binary", "@-", "--url", url }, request, @intCast(seconds + 1));
-        const response = try io.parse(self.cmd.a, struct { id: u32, result: []const u8 }, output);
+        const response = try io.parse(self.cmd.a, struct {
+            id: u32,
+            result: ?[]const u8 = null,
+            @"error": ?struct { code: i32, message: []const u8 } = null,
+        }, output);
         if (response.id != 1) return error.InvalidRpcReply;
-        return response.result;
+        if (response.@"error") |failure| {
+            if (failure.code == 3 or std.ascii.indexOfIgnoreCase(failure.message, "execution reverted") != null) return error.RpcCallReverted;
+            return error.InvalidRpcReply;
+        }
+        return response.result orelse error.InvalidRpcReply;
     }
 
     pub fn pin(self: Client, text: []const u8) !Pin {
@@ -107,7 +122,7 @@ pub const Client = struct {
         return error.RpcUnavailable;
     }
 
-    pub fn read(self: Client, request: Request, pinned: Pin) ![]const u8 {
+    pub fn read(self: Client, request: Request, pinned: Pin) !Reading {
         if (!request.valid()) return error.InvalidOnchainRequest;
         if (self.readAt(request, pinned.url, pinned.block)) |value| return value else |_| {}
         for (pinned.metadata.urls) |candidate| {
@@ -120,12 +135,40 @@ pub const Client = struct {
         return error.RpcUnavailable;
     }
 
-    fn readAt(self: Client, request: Request, url: []const u8, block: []const u8) ![]const u8 {
+    fn call(self: Client, url: []const u8, block: []const u8, address: []const u8, data: []const u8) ![]const u8 {
+        return self.rpc(url, "eth_call", .{ .{ .to = address, .data = data }, block });
+    }
+
+    fn readAt(self: Client, request: Request, url: []const u8, block: []const u8) !Reading {
+        if (request.operation == .warp_rate_limit) return self.warpRateLimit(request.address, url, block);
         const result = if (request.operation == .has_code)
             try self.rpc(url, "eth_getCode", .{ request.address, block })
         else
-            try self.rpc(url, "eth_call", .{ .{ .to = request.address, .data = request.operation.selector() }, block });
-        return decode(self.cmd.a, request.operation, result);
+            try self.call(url, block, request.address, request.operation.selector());
+        return .{ .value = try decode(self.cmd.a, request.operation, result) };
+    }
+
+    fn warpRateLimit(self: Client, router: []const u8, url: []const u8, block: []const u8) !Reading {
+        const a = self.cmd.a;
+        // Resolve the router's configured ISM and the static aggregation members
+        // at the same block. A RateLimitedIsm is bound to this recipient.
+        const ism = try decode(a, .owner, try self.call(url, block, router, "0xde523cf3"));
+        const members = try aggregationMembers(try self.call(url, block, ism, "0x6f72df75" ++ "0" ** 62 ++ "20" ++ "0" ** 64));
+        var match: ?Reading = null;
+        for (0..members.len / 64) |index| {
+            const module = try addressWord(a, members[index * 64 ..][0..64]);
+            const raw_recipient = self.call(url, block, module, "0x66d003ac") catch |err| switch (err) {
+                error.RpcCallReverted => continue,
+                else => return err,
+            };
+            if (io.eq(u8, raw_recipient, "0x")) continue;
+            const recipient = try decode(a, .owner, raw_recipient);
+            if (!std.ascii.eqlIgnoreCase(recipient, router)) continue;
+            if (match != null) return error.AmbiguousRateLimit;
+            const capacity = try self.call(url, block, module, Operation.max_capacity.selector());
+            match = .{ .value = try decode(a, .max_capacity, capacity), .resolved_address = module };
+        }
+        return match orelse error.MissingRateLimit;
     }
 };
 
@@ -146,10 +189,25 @@ fn addressWord(a: io.A, word: []const u8) ![]const u8 {
     return io.fmt(a, "0x{s}", .{word[24..]});
 }
 
+fn aggregationMembers(raw: []const u8) ![]const u8 {
+    const data = hex(raw) orelse return error.InvalidRpcReply;
+    if (data.len < 192) return error.InvalidRpcReply;
+    const offset = std.fmt.parseInt(u8, data[0..64], 16) catch return error.InvalidRpcReply;
+    const threshold = std.fmt.parseInt(u8, data[64..128], 16) catch return error.InvalidRpcReply;
+    const count = std.fmt.parseInt(usize, data[128..192], 16) catch return error.InvalidRpcReply;
+    if (offset != 64 or count > 8 or threshold == 0 or threshold > count or data.len != 192 + 64 * count) return error.InvalidRpcReply;
+    return data[192..];
+}
+
 fn decode(a: io.A, operation: Operation, raw: []const u8) ![]const u8 {
     const data = hex(raw) orelse return error.InvalidRpcReply;
     switch (operation) {
         .owner => return addressWord(a, data),
+        .max_capacity => {
+            if (data.len != 64) return error.InvalidRpcReply;
+            const number = std.fmt.parseInt(u256, data, 16) catch return error.InvalidRpcReply;
+            return io.fmt(a, "{d}", .{number});
+        },
         .safe_threshold, .paused => {
             if (data.len != 64) return error.InvalidRpcReply;
             const number = std.fmt.parseInt(u64, data, 16) catch return error.InvalidRpcReply;
@@ -173,6 +231,7 @@ fn decode(a: io.A, operation: Operation, raw: []const u8) ![]const u8 {
             for (owners[0..count], 0..) |*owner, i| owner.* = try addressWord(a, data[128 + 64 * i ..][0..64]);
             return std.mem.join(a, ", ", owners[0..count]);
         },
+        .warp_rate_limit => unreachable,
     }
 }
 
@@ -186,6 +245,7 @@ test "on-chain reads validate requests and decode standard ABI return values" {
     try t.expect(!(Request{ .chain = "../bsc", .address = request.address, .operation = .owner }).valid());
     try t.expectEqualStrings(request.address, try decode(arena.allocator(), .owner, "0x" ++ "0" ** 24 ++ address));
     try t.expectEqualStrings("3", try decode(arena.allocator(), .safe_threshold, "0x" ++ "0" ** 63 ++ "3"));
+    try t.expectEqualStrings("18446744073709551616", try decode(arena.allocator(), .max_capacity, "0x" ++ "0" ** 47 ++ "10000000000000000"));
     try t.expectEqualStrings(request.address, try decode(arena.allocator(), .safe_owners, "0x" ++ "0" ** 62 ++ "20" ++ "0" ** 63 ++ "1" ++ "0" ** 24 ++ address));
     try t.expectError(error.InvalidRpcReply, decode(arena.allocator(), .paused, "0x" ++ "0" ** 63 ++ "2"));
     const metadata = parseMetadata("chainId: 56\nprotocol: ethereum\nrpcUrls:\n  - http: http://example.com\n  - http: https://example.com\n").?;
