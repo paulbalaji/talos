@@ -131,7 +131,7 @@ pub fn run(a: io.A, reviewer: anytype, plan: Plan) !Outcome {
     if (!completing) progress.initial_evidence_limited = outcome.evidence_limited;
     for (plan.providers) |engine| {
         if (progress.results.len == required or reviewer.starts() >= plan.start_limit) break;
-        if (hasProvider(progress.results, engine) or !reviewer.available(engine)) continue;
+        if (hasProvider(progress.results, engine) or progress.malformed_reviewers & core.providerBit(engine) != 0 or !reviewer.available(engine)) continue;
 
         const prompt = try workflow.workerPrompt(a, context, applied, progress.results.len, required);
         if (prompt.len > core.review_context_limit) return error.ReviewContextLimit;
@@ -143,13 +143,23 @@ pub fn run(a: io.A, reviewer: anytype, plan: Plan) !Outcome {
             return outcome;
         };
         progress.review_ms +|= timer.read() / std.time.ns_per_ms;
-        const result = core.parseReview(a, raw) catch |err| {
-            outcome.failure = err;
-            return outcome;
+        const result = core.parseReview(a, raw) catch |err| switch (err) {
+            error.InvalidReview, error.DuplicateAnchor => {
+                progress.malformed_reviewers |= core.providerBit(engine);
+                continue;
+            },
+            else => return err,
         };
         progress.results = try std.mem.concat(a, core.ReviewerResult, &.{ progress.results, &.{.{ .engine = engine, .review = result }} });
     }
-    if (progress.results.len != required) return outcome;
+    if (progress.results.len != required) {
+        if (plan.providers.len -| @popCount(progress.malformed_reviewers) < required) {
+            progress.malformed_reviewers = 0;
+            outcome.failure = error.InvalidReview;
+        }
+        return outcome;
+    }
+    progress.malformed_reviewers = 0;
     if (progress.completion_requests == null) {
         progress.completion_requests = try completionRequests(a, progress.results, progress.evidence_requests);
         if (progress.completion_requests.?.len != 0) return outcome;
@@ -286,7 +296,7 @@ fn screen(a: io.A, reviewer: anytype, plan: Plan, progress: *core.RouteProgress)
             const result = core.parseScreen(a, raw) catch break;
             progress.screen_result = .{ .engine = engine, .review = result.review };
             if (plan.repo.routing_mode == .adaptive) progress.evidence_requests = result.evidence_requests;
-            if (plan.prepared.onchain_available) progress.onchain_reads = result.onchain_reads;
+            if (plan.prepared.onchain_available and progress.onchain_reads.len == 0) progress.onchain_reads = result.onchain_reads;
             var decision = plan.screen.floor.merge(result.decision);
             if (decision.depth == .light and (plan.repo.reviewSize() > 1 or result.evidence_requests.len != 0 or progress.onchain_reads.len != 0 or !core.lightComplete(result.review, plan.prepared)))
                 decision.depth = .regular;
@@ -351,6 +361,7 @@ const MockReviewer = struct {
     singleton: bool = false,
     request_source: bool = false,
     repeat_request: bool = false,
+    malformed_engine: ?core.Engine = null,
 
     pub fn available(self: *MockReviewer, engine: core.Engine) bool {
         return self.unavailable_engine != engine;
@@ -371,6 +382,7 @@ const MockReviewer = struct {
         }
         try std.testing.expect(!std.mem.containsAtLeast(u8, prompt, 1, "Choose review fidelity"));
         if (std.mem.eql(u8, schema, workflow.synthesis_schema)) return verified_singleton;
+        if (self.malformed_engine == engine) return "{}";
         if (self.request_source and engine == .codex and
             (self.repeat_request or std.mem.indexOf(u8, prompt, completion_instructions) == null))
         {
@@ -384,6 +396,26 @@ const MockReviewer = struct {
 const requesting_result =
     \\{"complete":false,"coverage_gaps":["Need the retry caller to check the pending item."],"summary":"Initial fixture review.","findings":[],"existing_open_findings":[],"non_blocking_threads":[],"evidence_requests":[{"path":"caller.zig","start_line":10,"end_line":12}]}
 ;
+
+test "an invalid full reviewer falls through to authorized providers across ticks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var plan = sample_plan;
+    plan.providers = &.{ .codex, .claude, .kimi };
+    plan.repo.fallback_engines = &.{ .claude, .kimi };
+    plan.screen = .{ .floor = .{ .depth = .multi, .reliability = true }, .ask_model = false };
+    plan.start_limit = 2;
+    var first: MockReviewer = .{ .malformed_engine = .codex };
+    const held = try run(a, &first, plan);
+    try std.testing.expectEqualSlices(core.Engine, &.{ .codex, .claude }, first.calls[0..first.count]);
+    try std.testing.expect(held.failure == null and held.report == null);
+    plan.progress = try io.parse(a, core.RouteProgress, try io.json(a, held.progress));
+    var second: MockReviewer = .{};
+    const completed = try run(a, &second, plan);
+    try std.testing.expectEqualSlices(core.Engine, &.{.kimi}, second.calls[0..second.count]);
+    try std.testing.expectEqualSlices(core.Engine, &.{ .claude, .kimi }, completed.report.?.providers);
+}
 
 const requesting_with_finding =
     \\{"complete":false,"coverage_gaps":["Need the retry caller to check the pending item."],"summary":"Initial fixture review.","findings":[{"severity":"P2","path":"retry.zig","line":8,"body":"Retry removes the pending item prematurely."}],"existing_open_findings":[],"non_blocking_threads":[],"evidence_requests":[{"path":"caller.zig","start_line":10,"end_line":12}]}

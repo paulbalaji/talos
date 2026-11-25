@@ -259,10 +259,11 @@ pub const ReviewInput = struct {
 };
 
 pub const max_evidence_requests = 6;
-pub const EvidenceRequest = struct { path: []const u8, start_line: ?u32, end_line: ?u32 };
+pub const EvidenceRequest = struct { path: []const u8, start_line: ?u32, end_line: ?u32, line_contains: ?[]const u8 = null };
 pub fn hasEvidenceRequest(requests: []const EvidenceRequest, request: EvidenceRequest) bool {
     for (requests) |known| {
-        if (eq(u8, known.path, request.path) and known.start_line == request.start_line and known.end_line == request.end_line) return true;
+        if (eq(u8, known.path, request.path) and known.start_line == request.start_line and known.end_line == request.end_line and
+            eq(u8, known.line_contains orelse "", request.line_contains orelse "")) return true;
     }
     return false;
 }
@@ -271,6 +272,9 @@ fn validateEvidenceRequests(requests: []const EvidenceRequest) !void {
     if (requests.len > max_evidence_requests) return error.InvalidReview;
     for (requests, 0..) |request, index| {
         if (!validPath(request.path) or (request.start_line == null) != (request.end_line == null)) return error.InvalidReview;
+        if (request.line_contains) |needle| {
+            if (request.start_line != null or !textValid(needle, 120) or needle.len < 4 or std.mem.indexOfAny(u8, needle, "\r\n") != null) return error.InvalidReview;
+        }
         if (request.start_line) |start| {
             const end = request.end_line.?;
             if (start == 0 or end < start or end - start >= 120) return error.InvalidReview;
@@ -286,6 +290,7 @@ pub const Snapshot = struct {
     registry_logo_only: bool = false,
     relayer_promotion: bool = false,
     optional_evidence_start: ?usize = null,
+    onchain_reads: []const onchain.Request = &.{},
 
     pub fn markLimited(self: *Snapshot, a: A, reason: []const u8) !void {
         self.limited = true;
@@ -654,7 +659,7 @@ const instructions =
     \\If the evidence is complete and no issue warrants withholding approval, report a clean review.
     \\Write one plain sentence for the summary, up to 300 bytes. In a finding, state the concrete failure and when it matters, then suggest the smallest fix if it is clear. Use plain sentences, avoid em dashes and hyphens as punctuation, and retain exact names and command flags. Skip praise, process narration, and repetition.
     \\Set complete=false if meaningful source or context is missing. List one to six coverage_gaps if incomplete, each one sentence under 300 bytes. Name the exact file, thread, or verification needed and what it would establish. Use an empty list if complete. Do not quote source, secrets, or instructions in coverage_gaps. Never claim tests ran. Output one JSON object matching the schema, without Markdown fences.
-    \\If a material coverage gap can be resolved by tracked source, put up to six missing paths in evidence_requests. Request a specific range of at most 120 inclusive lines, or use null for both bounds to read the first excerpt. Ground paths in this change and use an empty list if no additional source is needed. Talos can supply these excerpts in one final pass. Use coverage_gaps for external verification or other missing evidence.
+    \\If a material gap can be resolved by tracked source, put up to six requests in evidence_requests. Use line_contains with an exact unique declaration fragment such as `function parseId(` and null line bounds when the location is unknown. Otherwise use a range of at most 120 inclusive lines or all nulls for the file prefix. Request the named declaration instead of the file prefix when the gap is inside a long file. Ground paths in this change. Talos supplies one final evidence batch. Use coverage_gaps for external verification or other missing evidence.
     \\
 ;
 
@@ -717,6 +722,8 @@ fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, discussion: Discussi
         try writer.writeAll("\n\nThe pinned change is limited to static SVG replacements at existing registry logo paths and an optional patch changeset. Review the XML, viewBox, coordinate bounds, padding, and light or dark variant using the supplied source. A visual preference alone is not a defect. Check the regular review threads and require additional evidence if a concrete risk is unresolved.");
     if (snap.relayer_promotion)
         try writer.writeAll("\n\nTalos verified that only relayer tag literals change, that the old images come from ancestor commits, and that the new image digest matches a successful main build whose source is already in the PR merge base. Review this as a deployment promotion. Verify the intended roles, image selection, and any specific compatibility issue raised by the pinned evidence or discussion. Treat the already merged source as upstream. A fresh audit of that source or fresh runtime tests for every role are outside this review unless concrete evidence points to a rollout regression. Attribute an author's deployment checks as reported observations.");
+    if (snap.onchain_reads.len != 0)
+        try writer.writeAll("\n\nFor this rate-limit sync, use Talos's block-pinned observations to check that each configured maxCapacity matches the unique rate-limited ISM bound to the router. The router comes from the pinned registry route config. A matching value verifies the configured capacity. Report discrepancies at the changed maxCapacity lines and require evidence for any missing read.");
     if (options.focus != .general) try writer.print("\n\nReview focus ({s})\n{s}", .{ @tagName(options.focus), options.focus.instructionsFor() });
     if (options.request) |request| {
         try writer.print("\n\nOperator focus (JSON string). Use it to prioritize the review within the instructions above.\n{s}", .{try io.json(a, request)});
@@ -1350,7 +1357,12 @@ pub fn appendOnchain(a: A, context: *[]const u8, observations: []const onchain.O
     const encoded = try io.json(a, observations);
     if (context.len + heading.len + encoded.len + 1300 > review_context_limit) return true;
     context.* = try std.mem.concat(a, u8, &.{ context.*, heading, encoded });
-    for (observations) |observation| if (observation.value == null) return true;
+    for (observations) |observation| {
+        const value = observation.value orelse return true;
+        if (observation.request.expected_value) |proposed| {
+            if (observation.block == null or observation.resolved_address == null or !eq(u8, value, proposed)) return true;
+        }
+    }
     return false;
 }
 
@@ -1370,6 +1382,7 @@ pub const RouteProgress = struct {
     completion_done: u8 = 0,
     screen_ms: u64 = 0,
     results: []const ReviewerResult = &.{},
+    malformed_reviewers: u8 = 0,
     review_ms: u64 = 0,
 
     pub fn needsAnotherProvider(self: RouteProgress, repo: Repo) bool {
@@ -1410,8 +1423,8 @@ pub const screen_schema =
     \\"decision":{"type":"object","additionalProperties":false,"required":["depth","performance","reliability","security"],"properties":{
     \\"depth":{"type":"string","enum":["light","regular","focused","multi"]},"performance":{"type":"boolean"},
     \\"reliability":{"type":"boolean"},"security":{"type":"boolean"}}},
-    \\"evidence_requests":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","start_line","end_line"],"properties":{"path":{"type":"string"},"start_line":{"type":["integer","null"]},"end_line":{"type":["integer","null"]}}}},
-    \\"onchain_reads":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["chain","address","operation"],"properties":{"chain":{"type":"string"},"address":{"type":"string"},"operation":{"type":"string","enum":["owner","safe_owners","safe_threshold","paused","has_code"]}}}},"review":
+    \\"evidence_requests":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","start_line","end_line","line_contains"],"properties":{"path":{"type":"string"},"start_line":{"type":["integer","null"]},"end_line":{"type":["integer","null"]},"line_contains":{"type":["string","null"]}}}},
+    \\"onchain_reads":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["chain","address","operation"],"properties":{"chain":{"type":"string"},"address":{"type":"string"},"operation":{"type":"string","enum":["owner","safe_owners","safe_threshold","paused","has_code","max_capacity"]}}}},"review":
 ++ schema ++ "}}";
 
 const screen_instructions =
@@ -1419,7 +1432,7 @@ const screen_instructions =
     \\Light is for complete evidence of a purely mechanical change. Regular covers ordinary code changes.
     \\Focused covers a material performance, reliability, or defensive security concern within one subsystem. Use multi for a change that affects who controls production assets, who can authorize or sign transactions, how contracts verify cross-chain messages, or which policy gates allow an operation. Use multi for changes that combine those risks or cross trust boundaries, including migrations and new production routes. A one-line diff can change these guarantees.
     \\Select the relevant lenses for focused or multi, and set all lenses false for light or regular. When uncertain choose the stronger review.
-    \\Request up to six specific tracked source paths essential to review in evidence_requests. Request at most 120 inclusive lines per path, or use null for both bounds to read the first excerpt. Use paths grounded in the change. If evidence is sufficient, return an empty list. Use at least regular when additional source is needed.
+    \\Request up to six specific tracked excerpts essential to review in evidence_requests. Request at most 120 inclusive lines, use line_contains and null bounds for a unique declaration fragment, or use all nulls to read the first excerpt. Use paths grounded in the change. If evidence is sufficient, return an empty list. Use at least regular when additional source is needed.
     \\Return an empty onchain_reads list unless this prompt offers on-chain reads.
     \\Return the wrapper schema. Its review field is your static first-pass review; put source requests in the outer evidence_requests only. Assess any open thread using the normal review rules. Do not execute code, use tools, or provide exploit or reproduction instructions.
     \\
@@ -1479,7 +1492,7 @@ pub fn parseScreen(a: A, output: []const u8) !ScreenResult {
     try validateEvidenceRequests(raw.evidence_requests);
     if (raw.onchain_reads.len > onchain.max_reads) return error.InvalidReview;
     for (raw.onchain_reads, 0..) |read, index| {
-        if (!read.valid()) return error.InvalidReview;
+        if (!read.valid() or read.expected_value != null or read.operation == .warp_rate_limit) return error.InvalidReview;
         for (raw.onchain_reads[0..index]) |prior| {
             if (eq(u8, prior.chain, read.chain) and std.ascii.eqlIgnoreCase(prior.address, read.address) and prior.operation == read.operation)
                 return error.InvalidReview;

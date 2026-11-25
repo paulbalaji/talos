@@ -7,6 +7,7 @@ const onchain = @import("onchain.zig");
 const routing = @import("routing.zig");
 const registry_logo = @import("registry_logo.zig");
 const agent_image = @import("agent_image.zig");
+const warp_capacity = @import("warp_capacity.zig");
 const A = io.A;
 const eq = io.eq;
 
@@ -272,6 +273,7 @@ pub const Git = struct {
                 if (content) |blob| try appendBlob(&evidence, a, name, blob, &remaining);
             }
         }
+        var onchain_reads: []const onchain.Request = &.{};
         if (core.registryMain(self.object_cache.repo, pr)) {
             var route_bytes: usize = 6 * 1024;
             var route_files: usize = 0;
@@ -288,6 +290,7 @@ pub const Git = struct {
                 try writer.print("\nPinned base Warp route config {s}{s}:\n{s}\n", .{ config, if (excerpt.len == blob.len) "" else " (excerpt)", excerpt });
                 route_bytes -= config.len + excerpt.len + 64;
             }
+            onchain_reads = try self.warpCapacityRequests(path, pr, merge_base, files);
         }
         var image: AgentEvidence = .{};
         if (std.ascii.eqlIgnoreCase(self.object_cache.repo.name, github.registry_pin_source)) {
@@ -300,7 +303,39 @@ pub const Git = struct {
                 }
             }
         }
-        return .{ .merge_base = merge_base, .evidence = evidence.items, .limited = coverage.items.len != 0, .coverage_reasons = coverage.items, .registry_logo_only = logo_only, .relayer_promotion = image.promotion, .optional_evidence_start = image.optional_start };
+        return .{ .merge_base = merge_base, .evidence = evidence.items, .limited = coverage.items.len != 0, .coverage_reasons = coverage.items, .registry_logo_only = logo_only, .relayer_promotion = image.promotion, .optional_evidence_start = image.optional_start, .onchain_reads = onchain_reads };
+    }
+
+    fn warpCapacityRequests(self: Git, path: []const u8, pr: core.Pull, merge_base: []const u8, files: []const github.File) ![]const onchain.Request {
+        if (files.len == 0 or files.len > 2) return &.{};
+        const suffix = "-deploy.yaml";
+        var deployment: ?[]const u8 = null;
+        for (files) |file| {
+            if (file.previous_filename != null or !core.validPath(file.filename) or sensitive(file.filename)) return &.{};
+            if (std.mem.startsWith(u8, file.filename, "deployments/warp_routes/") and std.mem.endsWith(u8, file.filename, suffix) and eq(u8, file.status, "modified")) {
+                if (deployment != null) return &.{};
+                deployment = file.filename;
+            } else if (!(std.mem.startsWith(u8, file.filename, ".changeset/") and std.mem.endsWith(u8, file.filename, ".md") and eq(u8, file.status, "added"))) return &.{};
+        }
+        const name = deployment orelse return &.{};
+        const raw = self.gitWithin(path, &.{ "diff", "--name-status", "--no-renames", "-z", merge_base, pr.headRefOid, "--" }, "", 5) catch return &.{};
+        var entries = std.mem.tokenizeScalar(u8, raw, 0);
+        var count: usize = 0;
+        while (entries.next()) |status| {
+            const changed = entries.next() orelse return &.{};
+            for (files) |file| {
+                const expected_status = if (eq(u8, file.status, "modified")) "M" else "A";
+                if (eq(u8, file.filename, changed) and eq(u8, status, expected_status)) break;
+            } else return &.{};
+            count += 1;
+        }
+        if (count != files.len) return &.{};
+        const config = try io.fmt(self.cmd.a, "{s}-config.yaml", .{name[0 .. name.len - suffix.len]});
+        const route = self.pinnedOid(path, pr.baseRefOid, config) catch return &.{};
+        if (!eq(u8, route, self.pinnedOid(path, pr.headRefOid, config) catch return &.{})) return &.{};
+        const before = self.pinnedBlob(path, self.pinnedOid(path, merge_base, name) catch return &.{}) catch return &.{};
+        const after = self.pinnedBlob(path, self.pinnedOid(path, pr.headRefOid, name) catch return &.{}) catch return &.{};
+        return warp_capacity.requests(self.cmd.a, before, after, self.pinnedBlob(path, route) catch return &.{});
     }
 
     fn appendStaticRegistryLogos(self: Git, path: []const u8, base: []const u8, head: []const u8, files: []const github.File, evidence: *std.ArrayList(u8), remaining: usize) !bool {
@@ -780,7 +815,9 @@ pub const Git = struct {
             };
             const read_pin = entry.value_ptr.* orelse continue;
             result.block = read_pin.height;
-            result.value = client.read(result.request, read_pin) catch null;
+            const reading = client.read(result.request, read_pin) catch continue;
+            result.value = reading.value;
+            result.resolved_address = reading.resolved_address;
         }
         return results;
     }
@@ -846,15 +883,15 @@ pub const Git = struct {
     fn appendExcerpt(self: Git, cache_path: []const u8, head: []const u8, request: core.EvidenceRequest, anchor_line: ?u32, evidence: *std.ArrayList(u8), remaining: *usize) !bool {
         const a = self.cmd.a;
         if (!core.validPath(request.path) or sensitive(request.path)) return error.DisallowedExcerptPath;
-        const lines = try excerptRange(request.start_line, request.end_line);
         if (remaining.* <= request.path.len + 160) return error.ExcerptBudget;
         const blob = try self.pinnedBlob(cache_path, try self.pinnedOid(cache_path, head, request.path));
+        const lines = if (request.line_contains) |needle| try anchoredRange(blob, needle) else try excerptRange(request.start_line, request.end_line);
         const excerpt = try excerptLines(blob, lines);
         if (anchor_line) |line| {
             if (excerpt.end < line) return error.ExcerptPastEnd;
         }
         const prefix = excerpt.text[0..core.safePrefix(excerpt.text, remaining.* - request.path.len - 160)];
-        const complete = !(excerpt.more and (lines.clipped or request.end_line == null)) and prefix.len == excerpt.text.len;
+        const complete = !(excerpt.more and (lines.clipped or (request.end_line == null and request.line_contains == null))) and prefix.len == excerpt.text.len;
         const start = evidence.items.len;
         try evidence.writer(a).print("\nPinned head file {s}, lines {d}-{d}{s}:\n{s}\n", .{
             request.path, lines.start, excerpt.end, if (complete) "" else " (excerpt clipped by budget)", prefix,
@@ -1045,6 +1082,19 @@ fn excerptRange(start: ?u32, end: ?u32) !ExcerptRange {
     return .{ .start = first, .end = @min(last, limit), .clipped = last > limit };
 }
 
+fn anchoredRange(blob: []const u8, needle: []const u8) !ExcerptRange {
+    var lines = std.mem.splitScalar(u8, blob, '\n');
+    var line: u32 = 1;
+    var anchor_index: ?u32 = null;
+    while (lines.next()) |text| : (line += 1) {
+        if (std.mem.indexOf(u8, text, needle) == null) continue;
+        if (anchor_index != null) return error.ExcerptAnchorAmbiguous;
+        anchor_index = line;
+    }
+    const match = anchor_index orelse return error.ExcerptAnchorMissing;
+    return excerptRange(@max(1, match -| 6), match +| 80);
+}
+
 fn excerptLines(blob: []const u8, request: ExcerptRange) !struct { text: []const u8, end: u32, more: bool } {
     var remaining = blob;
     var line: u32 = 1;
@@ -1076,6 +1126,8 @@ fn excerptOmission(err: anyerror) []const u8 {
         error.ExcerptTooLarge => "file exceeds the size limit",
         error.ExcerptNotText => "file is not UTF-8 text",
         error.ExcerptPastEnd => "range starts after the end of the file",
+        error.ExcerptAnchorMissing => "anchor missing at the pinned head",
+        error.ExcerptAnchorAmbiguous => "anchor matches multiple lines",
         else => "source could not be read",
     };
 }
@@ -1401,4 +1453,15 @@ test "source excerpts cap requested lines and preserve the last line without a n
     try t.expect(!excerpt.more);
     try t.expect((try excerptLines("one\ntwo\nthree", try excerptRange(2, 2))).more);
     try t.expectError(error.ExcerptPastEnd, excerptLines("one\n", try excerptRange(2, null)));
+}
+
+test "an exact source anchor fetches a declaration beyond the first excerpt" {
+    const t = std.testing;
+    const source = "// prefix\n" ** 180 ++ "function parseId(value: unknown) {\n  return value;\n}\n" ++ "// suffix\n" ** 100;
+    const span = try anchoredRange(source, "function parseId(");
+    try t.expectEqual(@as(u32, 175), span.start);
+    const excerpt = try excerptLines(source, span);
+    try t.expect(std.mem.indexOf(u8, excerpt.text, "return value;") != null);
+    try t.expectError(error.ExcerptAnchorAmbiguous, anchoredRange(source, "// prefix"));
+    try t.expectError(error.ExcerptAnchorMissing, anchoredRange(source, "function absent("));
 }

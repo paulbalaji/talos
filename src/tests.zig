@@ -440,6 +440,26 @@ test "dropping optional image patch excerpts does not veto a covered approval" {
     try t.expect(std.mem.indexOf(u8, fake.prompt_text, "ZZZZ") == null);
 }
 
+test "a capacity sync requires the proposed value from a pinned resolved module" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const address = "0x1234567890abcdef1234567890abcdef12345678";
+    var reading: @import("onchain.zig").Observation = .{
+        .request = .{ .chain = "base", .address = address, .operation = .warp_rate_limit, .expected_value = "1500" },
+        .block = 42,
+        .value = "1500",
+        .resolved_address = address,
+    };
+    var context: []const u8 = "review";
+    try t.expect(!try core.appendOnchain(a, &context, &.{reading}));
+    reading.value = "1501";
+    try t.expect(try core.appendOnchain(a, &context, &.{reading}));
+    reading.value = "1500";
+    reading.resolved_address = null;
+    try t.expect(try core.appendOnchain(a, &context, &.{reading}));
+}
+
 test "a same-head approval and its warning are not posted twice" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
