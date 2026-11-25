@@ -117,6 +117,19 @@ pub const Context = struct {
     native: ?NativeRef = null,
 };
 
+pub fn inheritsAllModels(context: Context, jobs: []const core.Job) bool {
+    if (context.pins.len < 2) return false;
+    for (context.pins[0 .. context.pins.len - 1]) |pin| {
+        if (!pin.reviewable()) continue;
+        const job = matchingJob(jobs, pin) orelse continue;
+        const report = job.route_report orelse continue;
+        const input = job.review_input orelse continue;
+        if (job.phase == .complete and report.all_models and io.eq(u8, input.base.oid, pin.baseRefOid))
+            return true;
+    }
+    return false;
+}
+
 pub const Position = struct { stack_index: usize, member_index: usize };
 
 pub fn find(stacks: []const Stack, number: u32) ?Position {
@@ -485,7 +498,7 @@ pub fn syncNative(entry: *core.Entry, a: io.A, discovered: []const NativeGroup) 
     entry.stacks = groups.items;
 }
 
-pub fn queueNative(entry: *core.Entry, a: io.A, group: NativeGroup) !usize {
+pub fn queueNative(entry: *core.Entry, a: io.A, group: NativeGroup, options: ?core.ReviewOptions) !usize {
     var count: usize = 0;
     for (group.pins) |pin| {
         if (pin.reviewable()) count += 1;
@@ -507,7 +520,7 @@ pub fn queueNative(entry: *core.Entry, a: io.A, group: NativeGroup) !usize {
     }
     try syncNative(entry, a, groups.items);
     for (group.pins) |pin| {
-        if (pin.reviewable()) try entry.queue(a, pin.pull(), null);
+        if (pin.reviewable()) try entry.queue(a, pin.pull(), options);
     }
     return count;
 }
@@ -547,6 +560,54 @@ const fixture_child: Pin = .{
     .state = .OPEN,
     .isDraft = false,
 };
+
+test "a dependent PR inherits maximum depth only from a reviewed matching ancestor" {
+    const t = std.testing;
+    var parent = fixture_parent;
+    var pins = [_]Pin{ parent, fixture_child };
+    const context: Context = .{ .pins = &pins };
+    var job: core.Job = .{
+        .number = parent.number,
+        .head = parent.headRefOid,
+        .phase = .complete,
+        .review_input = .{ .base = .fromPull(parent.pull()), .merge_base = parent.baseRefOid, .discussion = @splat(0) },
+        .route_report = .{ .mode = .adaptive, .suggested = .{}, .applied = .{}, .providers = &.{.codex}, .screen_ms = 0, .review_ms = 0, .all_models = true },
+    };
+    try t.expect(inheritsAllModels(context, &.{job}));
+    job.phase = .pending;
+    try t.expect(!inheritsAllModels(context, &.{job}));
+    job.phase = .complete;
+    pins[0].baseRefOid = child_head;
+    try t.expect(!inheritsAllModels(context, &.{job}));
+    parent.state = .MERGED;
+    pins[0] = parent;
+    try t.expect(!inheritsAllModels(context, &.{job}));
+}
+
+test "explicit all-model requeue preserves same-head receipt safety and is idempotent" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var entry: core.Entry = .{ .repo = fixture_repo };
+    const pr = fixture_parent.pull();
+    const options: core.ReviewOptions = .{ .all_models = true };
+    try entry.queue(a, pr, null);
+    const job = &entry.jobs[0];
+    job.phase = .uncertain;
+    job.receipt = 42;
+    try t.expectError(error.PublicationUnconfirmed, entry.queue(a, pr, options));
+    job.phase = .complete;
+    try entry.queue(a, pr, options);
+    try t.expectEqual(core.Phase.pending, job.phase);
+    try t.expect(job.followup and job.options.all_models);
+    try t.expectEqual(@as(?u64, 42), job.receipt);
+    const id = job.followup_id;
+    job.phase = .complete;
+    try entry.queue(a, pr, options);
+    try t.expectEqual(core.Phase.complete, job.phase);
+    try t.expectEqual(id, job.followup_id);
+}
 
 test "stack registration checks order and blocks the child on a failed parent across restart" {
     const t = std.testing;
@@ -776,7 +837,7 @@ test "GitHub order is authoritative for a 26-member stack" {
     const report = try statuses(a, entry);
     try t.expectEqual(@as(?u32, 23), report[0].native_number);
     try t.expectEqual(@as(u32, 1025), report[0].members[25].number);
-    try t.expectEqual(@as(usize, 25), try queueNative(&entry, a, group));
+    try t.expectEqual(@as(usize, 25), try queueNative(&entry, a, group, null));
     try t.expect(blocked(entry, entry.jobs[0]));
     try t.expect(!blocked(entry, entry.jobs[1]));
     pins[1].state = .MERGED;

@@ -137,6 +137,8 @@ Adaptive routing uses four levels.
 
 Talos routes contract changes, ownership and signing changes, deployment permissions, and changes to access policy directly to multi-provider review. Other clear risks go to the relevant focused review. A configured lightweight model can recommend a stronger route for ambiguous changes. Manual modes and prompts take precedence. GitHub approvals require a full review.
 
+In adaptive routing, changes to Hyperlane's production CCIP Read verification and commit/reveal authentication use the security, reliability, and performance lenses with every configured full reviewer at maximum effort. Dependent PRs inherit that route from a reviewed open ancestor at the same pinned revision. To request it for all current open members of a GitHub stack, run `talos stack OWNER/REPO STACK_NUMBER --all-maxxing`.
+
 On scheduled reviews, the screening model can request up to six specific files or excerpts from the pinned commit. Talos fetches those itself before starting the full review. A multi review with findings may use one more reviewer start for synthesis. If the current tick has no starts left, Talos saves the completed passes and finishes on a later tick.
 
 ### Configure provider fallback
@@ -152,7 +154,7 @@ List only providers approved to receive the repo’s source and discussions. Tal
 
 `talos usage` counts starts made by this Talos state directory. It includes screening, failed attempts, and previews. Daily caps reset at midnight UTC. A cap of `0` means unlimited. The count estimates local workload. It has no view of requests made by other tools or of the provider’s remaining subscription quota.
 
-Every model start also counts against the per-tick budget. Adaptive routing reserves enough starts for its strongest possible route and releases unused starts after the job returns. Routing reports and accumulated passes are private local state. Screens use standard speed and skip advisor calls.
+Every model start also counts against the per-tick budget. Adaptive routing reserves starts for the review and releases unused starts after the job returns. All-model review and synthesis can resume across ticks when the reservation runs out. Routing reports and accumulated passes are private local state. Screens use standard speed and skip advisor calls.
 
 ### Verify on-chain claims
 

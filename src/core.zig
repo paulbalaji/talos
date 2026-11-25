@@ -506,11 +506,29 @@ pub const Entry = struct {
     }
 
     pub fn queue(self: *Entry, a: A, pr: Pull, options: ?ReviewOptions) !void {
+        const all_models = if (options) |requested| requested.all_models else false;
         for (self.jobs) |*job| {
             if (job.number != pr.number or !eq(u8, job.head, pr.headRefOid)) continue;
             if (job.phase == .uncertain) {
+                if (all_models and !job.options.all_models) return error.PublicationUnconfirmed;
                 job.next = 0;
                 job.attempts = 0;
+            } else if (all_models) {
+                if (job.options.all_models or (job.route_report != null and job.route_report.?.all_models)) {
+                    if (job.phase != .failed) return;
+                }
+                job.options = options.?;
+                job.phase = .pending;
+                job.next = 0;
+                job.attempts = 0;
+                job.outcome = null;
+                job.analysis = null;
+                job.route_progress = null;
+                job.route_report = null;
+                job.review_input = null;
+                // Use a fresh receipt without republishing unchanged findings.
+                job.followup = job.receipt != null or job.last_review != null;
+                if (job.followup) std.crypto.random.bytes(&job.followup_id);
             } else if (job.followup and (job.phase == .pending or job.phase == .failed)) {
                 job.phase = .pending;
                 job.next = 0;
@@ -695,6 +713,7 @@ pub const ReviewOptions = struct {
     request: ?[]const u8 = null,
     publish_prompted: bool = false,
     explicit_mode: bool = false,
+    all_models: bool = false,
 
     pub fn allowRouting(self: ReviewOptions) bool {
         return !self.explicit_mode and self.general();
@@ -1349,6 +1368,7 @@ pub const Prepared = struct {
     evidence_offset: usize,
     route_depth: routing.Depth = .regular,
     options: ReviewOptions,
+    all_models: bool = false,
     dry: bool,
     review_input: ?ReviewInput = null,
     synthesis_provider: ?Engine = null,
@@ -1393,10 +1413,16 @@ pub const RouteProgress = struct {
     results: []const ReviewerResult = &.{},
     malformed_reviewers: u8 = 0,
     review_ms: u64 = 0,
+    all_models: bool = false,
+
+    pub fn requiredReviewers(self: RouteProgress, repo: Repo, decision: routing.Decision) usize {
+        if (self.all_models) return repo.providerCount();
+        return if (decision.depth == .multi) @max(2, repo.reviewSize()) else repo.reviewSize();
+    }
 
     pub fn needsAnotherProvider(self: RouteProgress, repo: Repo) bool {
         const decision = self.decision orelse return false;
-        return repo.routing_mode == .adaptive and decision.depth == .multi and repo.providerCount() < 2;
+        return !self.all_models and repo.routing_mode == .adaptive and decision.depth == .multi and repo.providerCount() < 2;
     }
 
     pub fn needsCompletion(self: RouteProgress, result: ReviewerResult) bool {
@@ -1424,6 +1450,7 @@ pub const RouteReport = struct {
     full_findings: ?usize = null,
     full_only_anchors: ?usize = null,
     evidence_passes: u8 = 0,
+    all_models: bool = false,
     onchain_observations: []const onchain.Observation = &.{},
 };
 
@@ -1570,6 +1597,7 @@ pub const SavedAnalysis = struct {
         hash.update(&.{0});
         hash.update(try io.json(a, prepared.inherited.pins));
         hash.update(&.{0});
+        if (prepared.all_models) hash.update("all-model review\x00");
         hash.update(prepared.context);
         return hash.finalResult();
     }
@@ -1660,7 +1688,7 @@ pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?P
     const engines = try repo.engines(a);
     try validateEngines(engines);
     var context = try reviewPrompt(a, repo, pr, snap, discussion, previous, job.last_review, prior_delta, inherited, options);
-    const context_limit: usize = if (repo.routing_mode == .adaptive and options.allowRouting()) review_context_limit - 4096 else review_context_limit;
+    const context_limit: usize = if (options.all_models or (repo.routing_mode == .adaptive and options.allowRouting())) review_context_limit - 4096 else review_context_limit;
     if (context.len > context_limit and prior_delta.evidence.len != 0) {
         prior_delta.evidence = "";
         prior_delta.coverage_reasons = try std.mem.concat(a, []const u8, &.{

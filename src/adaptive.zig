@@ -39,12 +39,9 @@ fn unavailable(err: anyerror) bool {
 }
 
 fn appliedDecision(plan: Plan, progress: core.RouteProgress) routing.Decision {
+    if (progress.all_models) return routing.all_lenses;
     if (plan.repo.routing_mode != .adaptive or !plan.prepared.options.allowRouting()) return .{};
     return progress.decision orelse plan.screen.floor;
-}
-
-pub fn requestedCount(repo: core.Repo, decision: routing.Decision) usize {
-    return if (decision.depth == .multi) @max(2, repo.reviewSize()) else repo.reviewSize();
 }
 
 fn hasProvider(results: []const core.ReviewerResult, engine: core.Engine) bool {
@@ -108,7 +105,7 @@ pub fn run(a: io.A, reviewer: anytype, plan: Plan) !Outcome {
         return outcome;
     }
 
-    const required = requestedCount(plan.repo, applied);
+    const required = progress.requiredReviewers(plan.repo, applied);
     if (plan.providers.len < required) {
         // Keep the decision and pin for discovery without retaining a review.
         progress.screen_result = null;
@@ -321,6 +318,7 @@ fn report(a: io.A, plan: Plan, progress: core.RouteProgress, applied: routing.De
         .screen_ms = progress.screen_ms,
         .review_ms = progress.review_ms,
         .evidence_passes = @popCount(progress.completion_attempted),
+        .all_models = progress.all_models,
         .onchain_observations = progress.onchain_observations orelse &.{},
     };
     if (progress.screen_result) |candidate| {
@@ -396,6 +394,35 @@ const MockReviewer = struct {
 const requesting_result =
     \\{"complete":false,"coverage_gaps":["Need the retry caller to check the pending item."],"summary":"Initial fixture review.","findings":[],"existing_open_findings":[],"non_blocking_threads":[],"evidence_requests":[{"path":"caller.zig","start_line":10,"end_line":12}]}
 ;
+
+test "all-model review waits for every authorized provider and then verifies claims" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var plan = sample_plan;
+    plan.repo.fallback_engines = &.{ .claude, .kimi };
+    plan.providers = &.{ .codex, .claude, .kimi };
+    plan.progress.all_models = true;
+    plan.screen = .{ .floor = routing.all_lenses, .ask_model = false };
+    plan.start_limit = 2;
+    var first: MockReviewer = .{ .singleton = true, .unavailable_engine = .kimi };
+    const pending = try run(a, &first, plan);
+    try t.expectEqualSlices(core.Engine, &.{ .codex, .claude }, first.calls[0..first.count]);
+    try t.expect(pending.report == null and pending.failure == null);
+    try t.expect(!workflow.waitsForSynthesis(plan.repo, pending.progress));
+
+    plan.progress = try io.parse(a, core.RouteProgress, try io.json(a, pending.progress));
+    var retry: MockReviewer = .{};
+    const finished = try run(a, &retry, plan);
+    try t.expectEqual(core.Engine.kimi, retry.calls[0]);
+    try t.expect(std.mem.indexOf(u8, retry.prompts[0], "Primary lens: performance") != null);
+    try t.expectEqual(@as(u32, 2), retry.count);
+    try t.expect(finished.report.?.all_models);
+    try t.expectEqualSlices(core.Engine, plan.providers, finished.report.?.providers);
+    try t.expectEqual(routing.all_lenses, finished.report.?.applied);
+    try t.expect(finished.report.?.synthesis_provider != null);
+}
 
 test "an invalid full reviewer falls through to authorized providers across ticks" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

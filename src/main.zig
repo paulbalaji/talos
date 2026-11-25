@@ -33,7 +33,7 @@ const usage =
     \\talos [--home DIR] followup THREAD_URL [--dry-run | --merge-when-ready]
     \\talos [--home DIR] followup status [--json]
     \\talos [--home DIR] followup pause|resume THREAD_URL
-    \\talos [--home DIR] stack OWNER/REPO STACK_NUMBER
+    \\talos [--home DIR] stack OWNER/REPO STACK_NUMBER [--all-maxxing]
     \\talos [--home DIR] stack OWNER/REPO NAME PR PR [PR ...]
     \\talos [--home DIR] unstack OWNER/REPO NAME
     \\talos [--home DIR] run-once [OWNER/REPO [PR [--mode MODE] [--prompt TEXT]]]
@@ -424,10 +424,11 @@ const ReviewWorker = struct {
     }
 
     pub fn routeReview(self: *ReviewWorker, engine: core.Engine, model: ?[]const u8, schema: []const u8, prompt: []const u8) ![]const u8 {
-        const profile = if (model) |light|
+        var profile = if (model) |light|
             runner.Profile{ .model = light, .effort = .default }
         else
             reviewerProfile(self.adapter.repo, engine);
+        if (model == null and self.prepared.all_models) profile.effort = .max;
         return invokeReviewer(self.tools, engine, profile, schema, prompt) catch |err| {
             self.noteRateLimit(engine, err);
             return err;
@@ -1085,6 +1086,10 @@ const Main = struct {
         work.* = .{ .job = job, .batch = batch };
         work.adapter = try self.adapter(entry, state, &work.gh_env);
         work.prepared = (try core.prepare(self.a, &work.adapter, entry.repo, job, .scheduled)) orelse return;
+        work.prepared.all_models = work.prepared.options.all_models or
+            (entry.repo.routing_mode == .adaptive and work.prepared.options.allowRouting() and
+                (routing.messageVerificationChanged(entry.repo.name, work.adapter.files) or
+                    stack.inheritsAllModels(work.prepared.inherited, entry.jobs)));
         if (job.analysis) |saved| {
             if (try saved.matches(self.a, entry.repo, work.prepared)) {
                 if (try self.db.paused(entry.repo.name)) return;
@@ -1128,6 +1133,10 @@ const Main = struct {
                 screen.ask_model = false;
             }
             if (work.prepared.onchain_available and screen.floor.depth == .multi) screen.ask_model = true;
+            if (work.prepared.all_models) {
+                progress.all_models = true;
+                screen.floor = routing.all_lenses;
+            }
             if (progress.onchain_reads.len != 0 and progress.onchain_observations == null) {
                 progress.onchain_observations = try work.adapter.onchainReads(work.prepared.pr, progress.onchain_reads);
             }
@@ -1261,18 +1270,19 @@ const Main = struct {
     }
 
     fn registerStack(self: Main, state: *store.State, args: []const []const u8) !void {
-        if (args.len != 2 and (args.len < 4 or args.len > stack.max_members + 2)) return error.Usage;
+        const all_models = args.len == 3 and eq(u8, args[2], "--all-maxxing");
+        if (!all_models and args.len != 2 and (args.len < 4 or args.len > stack.max_members + 2)) return error.Usage;
         const entry = state.find(args[0]) orelse return error.UnknownRepository;
         const tools = self.local(entry.repo);
         const env = try tools.githubEnv();
         const client = try tools.gh(&env, entry.repo.name);
-        if (args.len == 2) {
+        if (all_models or args.len == 2) {
             const number = try prNumber(args[1]);
             if (!std.ascii.eqlIgnoreCase(entry.repo.login, try client.identity())) return error.GitHubIdentityChanged;
             const group = try client.nativeByNumber(number);
-            const count = try stack.queueNative(entry, self.a, group);
+            const count = try stack.queueNative(entry, self.a, group, if (all_models) .{ .all_models = true } else null);
             try self.db.save(state);
-            return self.out("Queued {s} GitHub stack #{d} with {d} open PRs\n", .{ entry.repo.name, number, count });
+            return self.out("Queued {s} GitHub stack #{d} with {d} open PRs{s}\n", .{ entry.repo.name, number, count, if (all_models) " for all-model review" else "" });
         }
         const name = args[1];
         var members: [stack.max_members]u32 = undefined;
@@ -1416,7 +1426,7 @@ const Main = struct {
                 // Show pins and scheduling separately without echoing stored PR text.
                 summary.stacks = &.{};
                 summary.jobs = try self.a.dupe(core.Job, entry.jobs);
-                const PendingRoute = struct { number: u32, head: []const u8, decision: ?routing.Decision, completed_passes: usize };
+                const PendingRoute = struct { number: u32, head: []const u8, decision: ?routing.Decision, completed_passes: usize, all_models: bool };
                 var pending: std.ArrayList(PendingRoute) = .empty;
                 for (summary.jobs) |*job| {
                     if (job.route_progress) |progress| try pending.append(self.a, .{
@@ -1424,6 +1434,7 @@ const Main = struct {
                         .head = job.head,
                         .decision = progress.decision,
                         .completed_passes = progress.results.len,
+                        .all_models = progress.all_models,
                     });
                     job.analysis = null;
                     job.route_progress = null;

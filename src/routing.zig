@@ -39,6 +39,39 @@ pub const Screen = struct {
     ask_model: bool,
 };
 
+pub const all_lenses: Decision = .{ .depth = .multi, .security = true, .reliability = true, .performance = true };
+
+fn hyperlaneMessageVerification(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, "rust/main/agents/relayer/src/msg/metadata/ccip_read/") or
+        std.mem.eql(u8, path, "rust/main/hyperlane-core/src/offchain_lookup.rs") or
+        std.mem.eql(u8, path, "typescript/ccip-server/src/utils/ccsAuth.ts") or
+        std.mem.eql(u8, path, "typescript/ccip-server/src/services/CallCommitmentsService.ts") or
+        std.mem.eql(u8, path, "typescript/relayer/src/metadata/ccipread.ts");
+}
+
+pub fn messageVerificationChanged(repo: []const u8, files: anytype) bool {
+    if (!std.ascii.eqlIgnoreCase(repo, "hyperlane-xyz/hyperlane-monorepo")) return false;
+    for (files) |file| {
+        if (hyperlaneMessageVerification(file.filename)) return true;
+        if (file.previous_filename) |old| if (hyperlaneMessageVerification(old)) return true;
+    }
+    return false;
+}
+
+test "production message verification changes escalate but docs and tests do not" {
+    const File = struct { filename: []const u8, previous_filename: ?[]const u8 = null };
+    const repo = "hyperlane-xyz/hyperlane-monorepo";
+    const root = "rust/main/agents/relayer/src/msg/metadata/ccip_read/mod.rs";
+    try std.testing.expect(messageVerificationChanged(repo, &[_]File{.{ .filename = root }}));
+    try std.testing.expect(messageVerificationChanged(repo, &[_]File{.{ .filename = "new.ts", .previous_filename = "typescript/ccip-server/src/utils/ccsAuth.ts" }}));
+    try std.testing.expect(!messageVerificationChanged("example/repo", &[_]File{.{ .filename = root }}));
+    try std.testing.expect(!messageVerificationChanged(repo, &[_]File{
+        .{ .filename = "typescript/ccip-server/CCS_AUTH.md" },
+        .{ .filename = "typescript/ccip-server/tests/services/CcsAuth.test.ts" },
+        .{ .filename = "typescript/relayer/src/metadata/ccipread.test.ts" },
+    }));
+}
+
 const authority_risk: Decision = .{ .depth = .multi, .security = true, .reliability = true };
 
 fn contains(path: []const u8, part: []const u8) bool {
