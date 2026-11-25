@@ -88,7 +88,7 @@ pub const Client = struct {
         return combined.toOwnedSlice(a);
     }
 
-    const ready_query =
+    const open_query =
         \\query($owner: String!, $name: String!, $endCursor: String) {
         \\  repository(owner: $owner, name: $name) {
         \\    pullRequests(first: 100, after: $endCursor, states: [OPEN]) {
@@ -99,17 +99,17 @@ pub const Client = struct {
         \\}
     ;
 
-    pub fn ready(self: Client) ![]const core.Pull {
+    pub fn openPulls(self: Client) ![]const core.Pull {
         const a = self.cmd.a;
         const fields = try self.repoFields();
         const args = [_][]const u8{
-            "--paginate", "--slurp", "-f", try io.fmt(a, "query={s}", .{ready_query}),
+            "--paginate", "--slurp", "-f", try io.fmt(a, "query={s}", .{open_query}),
         } ++ fields;
         const raw = self.api("graphql", &args, "") catch |err| return transportFailure(err, error.GitHubListFailed);
-        return decodeReady(a, raw);
+        return decodeOpen(a, raw);
     }
 
-    fn decodeReady(a: A, raw: []const u8) ![]const core.Pull {
+    fn decodeOpen(a: A, raw: []const u8) ![]const core.Pull {
         const Data = struct { repository: struct { pullRequests: Connection(core.Pull) } };
         const responses = try io.parse(a, []const GraphResponse(Data), raw);
         if (responses.len == 0) return error.InvalidPagination;
@@ -689,14 +689,14 @@ test "a paginated scan rejects partial responses and preserves discovery order" 
     const page2 =
         \\{"data":{"repository":{"pullRequests":{"nodes":[{"number":10,"headRefOid":"bbb","isDraft":true}],"pageInfo":{"hasNextPage":false,"endCursor":"final"}}}}}
     ;
-    const pulls = try Client.decodeReady(a, "[" ++ page1 ++ "," ++ page2 ++ "]");
+    const pulls = try Client.decodeOpen(a, "[" ++ page1 ++ "," ++ page2 ++ "]");
     try std.testing.expectEqual(@as(usize, 2), pulls.len);
     try std.testing.expectEqual(@as(u32, 20), pulls[0].number);
     try std.testing.expect(pulls[1].isDraft);
-    try std.testing.expectError(error.InvalidPagination, Client.decodeReady(a, "[" ++ page1 ++ "]"));
-    try std.testing.expectError(error.InvalidPagination, Client.decodeReady(a, "[" ++ page1 ++ "," ++ page1 ++ "]"));
-    try std.testing.expectError(error.GitHubListFailed, Client.decodeReady(a, "[" ++ page1 ++ ",{\"errors\":[{}]}]"));
-    try std.testing.expectError(error.GitHubRateLimited, Client.decodeReady(a, "[{\"errors\":[{\"type\":\"RATE_LIMITED\"}]}]"));
+    try std.testing.expectError(error.InvalidPagination, Client.decodeOpen(a, "[" ++ page1 ++ "]"));
+    try std.testing.expectError(error.InvalidPagination, Client.decodeOpen(a, "[" ++ page1 ++ "," ++ page1 ++ "]"));
+    try std.testing.expectError(error.GitHubListFailed, Client.decodeOpen(a, "[" ++ page1 ++ ",{\"errors\":[{}]}]"));
+    try std.testing.expectError(error.GitHubRateLimited, Client.decodeOpen(a, "[{\"errors\":[{\"type\":\"RATE_LIMITED\"}]}]"));
 }
 
 test "review readback matches original inline coordinates and rejects replies or foreign reviews" {

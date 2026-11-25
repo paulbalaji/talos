@@ -1,6 +1,6 @@
 # Talos
 
-Talos reviews GitHub pull requests from your machine using Codex, Claude Code, or Kimi Code. It records the ready PRs that already exist, then picks up new ready PRs, drafts that become ready, and new heads. It also rereviews heads it has reviewed when the discussion or effective diff changes. Reviews stay local by default. Each repo can opt into comments and approvals separately.
+Talos reviews open GitHub pull requests, including drafts, from your machine using Codex, Claude Code, or Kimi Code. It baselines existing PRs and picks up new PRs and new heads. Existing drafts are baselined on upgrade and get reviewed on their next head or when marked ready. Talos can post findings on drafts. A clean draft gets a fresh approval decision when it is marked ready. Each repo can opt into comments and approvals separately.
 
 ## Use Talos
 
@@ -96,7 +96,7 @@ With `--merge-when-ready`, Talos submits the current head for normal GitHub merg
 
 ### Review a PR stack
 
-When Talos scans ready PRs, it uses the number and member order GitHub recorded for each `gh stack`. It reads that metadata through the GitHub API. Stack detection keeps the baseline intact and groups existing per-head jobs.
+When Talos scans open PRs, it uses the number and member order GitHub recorded for each `gh stack`. It reads that metadata through the GitHub API. Stack detection keeps the baseline intact and groups existing per-head jobs.
 
 For PRs without a GitHub stack, Talos can infer a linear chain when each PR targets the previous PR's branch and exact head in the same repo. Ambiguous or branched relationships stay in the ordinary queue. You can also define a local stack with two to eight ready PRs in one repo, bottom to top.
 

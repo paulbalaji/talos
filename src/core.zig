@@ -228,6 +228,7 @@ pub const ReviewInput = struct {
     base: ReviewBase,
     merge_base: []const u8,
     discussion: [Sha256.digest_length]u8,
+    is_draft: bool = false,
     // Keep the old values for receipts and for the first scan of an older job.
     checks_passed: bool = false,
     material_discussion: ?[Sha256.digest_length]u8 = null,
@@ -237,6 +238,7 @@ pub const ReviewInput = struct {
             .base = .fromPull(pr),
             .merge_base = merge_base,
             .discussion = try discussion.fingerprint(a, repo.login, true),
+            .is_draft = pr.isDraft,
             .material_discussion = try discussion.fingerprint(a, repo.login, false),
         };
     }
@@ -321,7 +323,7 @@ pub const Event = enum { COMMENT, APPROVE };
 pub const Inline = struct { path: []const u8, line: u32, side: []const u8 = "RIGHT", body: []const u8 };
 pub const Payload = struct { commit_id: []const u8, event: Event, body: []const u8, comments: []const Inline };
 
-const ApprovalBlocker = enum { focused_review, limited_coverage, new_findings, open_findings, unassessed_threads, light_review, approvals_disabled, own_pr, unknown_author };
+const ApprovalBlocker = enum { focused_review, limited_coverage, new_findings, open_findings, unassessed_threads, light_review, approvals_disabled, own_pr, unknown_author, draft };
 const ReviewerCoverage = struct { engine: Engine, complete: bool, gaps: []const []const u8 };
 const UnassessedThread = struct { engine: Engine, path: []const u8, line: ?u32 };
 const Coverage = struct {
@@ -404,6 +406,7 @@ pub const Job = struct {
     followup: bool = false,
     // Completed clean reviews that the old policy held for CI get one rereview.
     awaiting_checks: bool = false,
+    awaiting_ready: bool = false,
     followup_id: [16]u8 = @splat(0),
 
     pub fn schedulable(self: Job) bool {
@@ -427,7 +430,8 @@ pub const Job = struct {
     pub fn observeReviewInput(self: *Job, current: ReviewInput, legacy_changed: bool, approvals_enabled: bool) void {
         if (self.phase != .complete) return;
         const discussion_or_diff = if (self.review_input) |old| !old.same(current) else false;
-        const changed = discussion_or_diff or legacy_changed or (self.awaiting_checks and approvals_enabled);
+        const ready_for_approval = self.awaiting_ready and !current.is_draft;
+        const changed = discussion_or_diff or legacy_changed or ((self.awaiting_checks or ready_for_approval) and approvals_enabled);
         if (!changed) {
             if (self.review_input) |*recorded| {
                 recorded.base = current.base;
@@ -447,7 +451,7 @@ pub const Job = struct {
         self.options = .{};
     }
 };
-pub const Seen = struct { number: u32, head: []const u8 };
+pub const Seen = struct { number: u32, head: []const u8, is_draft: bool = false };
 pub const ReviewBase = struct {
     oid: []const u8,
     ref: []const u8,
@@ -463,6 +467,7 @@ pub const ReviewBase = struct {
 
 const Discovery = struct {
     observed: bool = false,
+    was_draft: bool = false,
     queued: bool = false,
     ready_base: ?ReviewBase = null,
 };
@@ -478,6 +483,7 @@ pub const SeenContext = struct {
 pub const Entry = struct {
     repo: Repo,
     seen: []Seen = &.{},
+    drafts_baselined: bool = false,
     jobs: []Job = &.{},
     last_scan: i64 = 0,
     next_scan: i64 = 0,
@@ -541,6 +547,7 @@ pub const Entry = struct {
             const slot = try index.getOrPut(a, seen);
             if (!slot.found_existing) slot.value_ptr.* = .{};
             slot.value_ptr.observed = true;
+            slot.value_ptr.was_draft = seen.is_draft;
         }
         for (self.jobs) |job| {
             const slot = try index.getOrPut(a, .{ .number = job.number, .head = job.head });
@@ -548,13 +555,13 @@ pub const Entry = struct {
             slot.value_ptr.queued = true;
         }
 
-        var ready: std.ArrayList(Seen) = .empty;
-        errdefer ready.deinit(a);
+        var open: std.ArrayList(Seen) = .empty;
+        errdefer open.deinit(a);
         for (pulls) |pr| {
-            if (!isReady(pr)) continue;
+            if (!isReviewable(pr)) continue;
             if (!validOid(pr.headRefOid)) return error.InvalidCommit;
-            const seen: Seen = .{ .number = pr.number, .head = pr.headRefOid };
-            try ready.append(a, seen);
+            const seen: Seen = .{ .number = pr.number, .head = pr.headRefOid, .is_draft = pr.isDraft };
+            try open.append(a, seen);
             const slot = try index.getOrPut(a, seen);
             if (!slot.found_existing) slot.value_ptr.* = .{};
             slot.value_ptr.ready_base = .fromPull(pr);
@@ -580,17 +587,19 @@ pub const Entry = struct {
             }
         }
         if (!baseline) {
-            for (ready.items) |seen| {
+            for (open.items) |seen| {
                 const flags = index.getPtr(seen).?;
-                if (flags.observed or flags.queued) continue;
+                if (flags.queued or (seen.is_draft and !self.drafts_baselined)) continue;
+                if (flags.observed and (!flags.was_draft or seen.is_draft)) continue;
                 try retained.append(a, .{ .number = seen.number, .head = seen.head, .last_review = prior.get(seen.number) });
                 flags.queued = true;
             }
         }
-        const next_seen = try ready.toOwnedSlice(a);
+        const next_seen = try open.toOwnedSlice(a);
         errdefer a.free(next_seen);
         self.jobs = try retained.toOwnedSlice(a);
         self.seen = next_seen;
+        self.drafts_baselined = true;
     }
 
     pub fn due(self: *Entry, now: i64) ?*Job {
@@ -638,12 +647,12 @@ pub fn validOid(oid: []const u8) bool {
     return true;
 }
 
-pub fn isReady(pr: Pull) bool {
-    return eq(u8, pr.state, "OPEN") and !pr.isDraft;
+pub fn isReviewable(pr: Pull) bool {
+    return eq(u8, pr.state, "OPEN");
 }
 
 fn sameTarget(before: Pull, after: Pull) bool {
-    return isReady(after) and before.number == after.number and
+    return isReviewable(after) and before.number == after.number and before.isDraft == after.isDraft and
         eq(u8, before.headRefOid, after.headRefOid) and ReviewBase.fromPull(before).same(.fromPull(after));
 }
 
@@ -1617,7 +1626,7 @@ pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?P
         .scheduled => try adapter.pull(job.number),
         .preview => |preview| preview.pull orelse try adapter.pull(job.number),
     };
-    if (pr.number != job.number or !isReady(pr) or !eq(u8, pr.headRefOid, job.head)) return error.TargetChanged;
+    if (pr.number != job.number or !isReviewable(pr) or !eq(u8, pr.headRefOid, job.head)) return error.TargetChanged;
     if (!validOid(pr.headRefOid) or !validOid(pr.baseRefOid)) return error.InvalidCommit;
     const inherited: stack.Context = if (supports_stacks) try adapter.stackContext(pr, dry) else .{};
     var discussion = try adapter.reviewDiscussion(pr.number);
@@ -1629,7 +1638,7 @@ pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?P
     for (discussion.comments) |comment| {
         if (comment.truncated) try snap.markLimited(a, "A PR conversation comment was truncated");
     }
-    const retry_held_approval = job.awaiting_checks and repo.approvals;
+    const retry_held_approval = (job.awaiting_checks or (job.awaiting_ready and !pr.isDraft)) and repo.approvals;
     if (!dry and job.followup and !retry_held_approval and job.review_input != null and job.review_input.?.same(review_input)) {
         job.phase = .complete;
         job.analysis = null;
@@ -1742,9 +1751,14 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
     }
     const own_pr = if (latest.author) |author| std.ascii.eqlIgnoreCase(author.login, repo.login) else true;
     reviewed.awaiting_checks = job.awaiting_checks and !repo.approvals and !own_pr and result.event == .APPROVE;
+    reviewed.awaiting_ready = latest.isDraft and repo.approvals and !own_pr and result.event == .APPROVE;
     if (!prepared.dry and result.event == .APPROVE and (!repo.approvals or own_pr)) {
         blockers.setPresent(.approvals_disabled, !repo.approvals);
         if (own_pr) blockers.insert(if (latest.author == null) .unknown_author else .own_pr);
+        result.event = .COMMENT;
+    }
+    if (latest.isDraft and result.event == .APPROVE) {
+        blockers.insert(.draft);
         result.event = .COMMENT;
     }
     reviewed.event = result.event;
@@ -1806,6 +1820,7 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
     if (supports_stacks) try adapter.saveStackContext(pr, snap, result);
     job.review_input = reviewed.review_input;
     job.awaiting_checks = reviewed.awaiting_checks;
+    job.awaiting_ready = reviewed.awaiting_ready;
     job.last_review = try recordReview(a, prepared, job.last_review, results);
     if (permitted) {
         var public = result;

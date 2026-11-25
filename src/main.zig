@@ -21,7 +21,7 @@ const onchain = @import("onchain.zig");
 const eq = io.eq;
 const A = io.A;
 const usage =
-    \\Talos tracks ready GitHub pull requests and reviews new commits.
+    \\Talos tracks open GitHub pull requests and reviews new commits.
     \\
     \\talos [--home DIR] add OWNER/REPO [options]
     \\talos [--home DIR] defaults [--engine ENGINE[,ENGINE...]]
@@ -199,7 +199,7 @@ const Adapter = struct {
             break :local try self.github_client.stackPulls(numbers[0..prefix.len]);
         };
         const target = pins[pins.len - 1];
-        if (target.number != pr.number or !target.ready() or !eq(u8, target.headRefOid, pr.headRefOid) or !eq(u8, target.baseRefOid, pr.baseRefOid))
+        if (target.number != pr.number or !target.reviewable() or !eq(u8, target.headRefOid, pr.headRefOid) or !eq(u8, target.baseRefOid, pr.baseRefOid))
             return error.StackChanged;
         const parent_count = pins.len - 1;
         const detail_start = parent_count -| stack.context_members;
@@ -207,7 +207,7 @@ const Adapter = struct {
         for (prefix, pins, 0..) |member, pin, index| {
             if (member.pin.number != pin.number or (item.native == null and pin.nativeStack != null)) return error.StackChanged;
             if (!preview and !stack.samePin(member.pin, pin)) return error.StackChanged;
-            if (pin.state != .MERGED and !pin.ready()) return error.StackChanged;
+            if (pin.state != .MERGED and !pin.reviewable()) return error.StackChanged;
             if (item.native == null and index > 0 and pin.state != .MERGED and pins[index - 1].state != .MERGED and
                 !stack.linked(self.repo.name, pins[index - 1], pin)) return error.StackChanged;
         }
@@ -268,7 +268,7 @@ const Adapter = struct {
         // Refuse to publish a standalone review for it before persisting intent.
         const pins = try self.github_client.stackPulls(&.{target.number});
         const pin = pins[0];
-        if (pin.nativeStack != null or !pin.ready() or !eq(u8, pin.headRefOid, target.headRefOid) or
+        if (pin.nativeStack != null or !pin.reviewable() or !eq(u8, pin.headRefOid, target.headRefOid) or
             !eq(u8, pin.baseRefOid, target.baseRefOid)) return error.StackChanged;
     }
 
@@ -713,7 +713,7 @@ const Main = struct {
             try self.db.save(state);
             try self.out("Updated {s} as {s}\n", .{ name, repo.login });
         } else {
-            const pulls = try client.ready();
+            const pulls = try client.openPulls();
             const natives = try client.nativeGroups(pulls);
             var repo_dir = (try self.objectCache(repo).repoDir(true)) orelse return error.RepositoryDirectoryMissing;
             repo_dir.close();
@@ -725,7 +725,7 @@ const Main = struct {
             entry.next_scan = entry.last_scan + repo.interval;
             try state.add(self.a, entry);
             try self.db.save(state);
-            try self.out("Added {s} as {s} with {d} ready PRs baselined\n", .{ name, repo.login, entry.seen.len });
+            try self.out("Added {s} as {s} with {d} open PRs baselined\n", .{ name, repo.login, entry.seen.len });
         }
     }
 
@@ -758,13 +758,18 @@ const Main = struct {
         const env = try local_tools.githubEnv();
         const client = try local_tools.gh(&env, entry.repo.name);
         if (!std.ascii.eqlIgnoreCase(entry.repo.login, try client.identity())) return error.GitHubIdentityChanged;
-        const available = try client.ready();
+        const available = try client.openPulls();
         const pulls = if (managed.len == 0) available else tracked: {
             var unmatched: std.ArrayList(core.Pull) = .empty;
             pull_loop: for (available) |pull| {
                 for (managed) |job| {
                     if (!std.ascii.eqlIgnoreCase(job.source.repo, entry.repo.name)) continue;
                     if (job.pr == pull.number) continue :pull_loop;
+                    if (job.pr == null and job.stage == .drafting and pull.isDraft) {
+                        const head_repo = pull.headRepository orelse continue;
+                        if (std.ascii.eqlIgnoreCase(head_repo.nameWithOwner, entry.repo.name) and
+                            eq(u8, pull.headRefName, try job.source.branch(self.a))) continue :pull_loop;
+                    }
                 }
                 try unmatched.append(self.a, pull);
             }
@@ -788,7 +793,7 @@ const Main = struct {
             const job = &entry.jobs[index];
             if (job.phase != .complete) continue;
             for (pulls) |pull| {
-                if (pull.number != job.number or !core.isReady(pull) or !eq(u8, pull.headRefOid, job.head)) continue;
+                if (pull.number != job.number or !core.isReviewable(pull) or !eq(u8, pull.headRefOid, job.head)) continue;
                 self.refreshReviewInput(entry.repo, client, job, pull) catch |err| {
                     if (err == error.GitHubRateLimited) return err;
                     try entry.problem(self.a, std.time.timestamp(), job.number, @errorName(err));
@@ -1267,7 +1272,7 @@ const Main = struct {
             const group = try client.nativeByNumber(number);
             const count = try stack.queueNative(entry, self.a, group);
             try self.db.save(state);
-            return self.out("Queued {s} GitHub stack #{d} with {d} ready PRs\n", .{ entry.repo.name, number, count });
+            return self.out("Queued {s} GitHub stack #{d} with {d} open PRs\n", .{ entry.repo.name, number, count });
         }
         const name = args[1];
         var members: [stack.max_members]u32 = undefined;
@@ -1285,7 +1290,7 @@ const Main = struct {
         const env = try tools.githubEnv();
         const gh = try tools.gh(&env, entry.repo.name);
         const pr = try gh.pull(number);
-        if (!core.isReady(pr)) return error.PullRequestNotReady;
+        if (!core.isReviewable(pr)) return error.PullRequestNotReady;
         if (!core.validOid(pr.headRefOid)) return error.InvalidCommit;
         return pr;
     }
@@ -1501,7 +1506,7 @@ const Main = struct {
                     try self.out("  {s} {s} (bottom to top)\n", .{ if (item.automatic) "Auto stack" else "Stack", item.name });
                 }
                 for (item.members) |member| {
-                    try self.out("    #{d} {s} {s}", .{ member.number, member.state, member.review });
+                    try self.out("    #{d} {s}{s} {s}", .{ member.number, member.state, if (member.is_draft) " (draft)" else "", member.review });
                     if (member.blocked_by) |reason|
                         try self.out(" | Blocked by #{d} ({s})", .{ reason.number, reason.reason });
                     try self.out("\n", .{});

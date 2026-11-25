@@ -27,8 +27,8 @@ pub const Pin = struct {
         return self.number != 0 and core.validOid(self.headRefOid) and core.validOid(self.baseRefOid);
     }
 
-    pub fn ready(self: Pin) bool {
-        return self.state == .OPEN and !self.isDraft;
+    pub fn reviewable(self: Pin) bool {
+        return self.state == .OPEN;
     }
 
     pub fn pull(self: Pin) core.Pull {
@@ -45,8 +45,8 @@ pub const Pin = struct {
         };
     }
 
-    fn fromReady(pr: core.Pull) ?Pin {
-        if (!core.isReady(pr) or !core.validOid(pr.headRefOid) or !core.validOid(pr.baseRefOid) or
+    fn fromOpen(pr: core.Pull) ?Pin {
+        if (!core.isReviewable(pr) or !core.validOid(pr.headRefOid) or !core.validOid(pr.baseRefOid) or
             pr.headRefName.len == 0 or pr.baseRefName.len == 0) return null;
         return .{
             .number = pr.number,
@@ -175,7 +175,7 @@ pub fn register(entry: *core.Entry, a: io.A, name: []const u8, pins: []const Pin
     try validateRegistration(entry.*, name, numbers_buffer[0..pins.len]);
     for (pins, 0..) |pin, index| {
         if (pin.nativeStack != null) return error.PreferGitHubStack;
-        if (!pin.valid() or !pin.ready()) return error.PullRequestNotReady;
+        if (!pin.valid() or !pin.reviewable()) return error.PullRequestNotReady;
         if (index > 0 and !linked(entry.repo.name, pins[index - 1], pin)) return error.InvalidStackDependency;
     }
     const members = try a.alloc(Member, pins.len);
@@ -219,7 +219,7 @@ pub fn samePin(before: Pin, after: Pin) bool {
         if (after.headRepository) |other| std.ascii.eqlIgnoreCase(repository.nameWithOwner, other.nameWithOwner) else false
     else
         after.headRepository == null;
-    return before.number == after.number and before.state == after.state and before.isDraft == after.isDraft and
+    return before.number == after.number and before.state == after.state and
         sameRef(before.nativeStack, after.nativeStack) and
         io.eq(u8, before.headRefOid, after.headRefOid) and io.eq(u8, before.baseRefOid, after.baseRefOid) and
         io.eq(u8, before.headRefName, after.headRefName) and io.eq(u8, before.baseRefName, after.baseRefName) and same_head_repo;
@@ -273,7 +273,7 @@ pub fn autogroup(entry: *core.Entry, a: io.A, pulls: []const core.Pull) !void {
     }
     var nodes: std.ArrayList(Node) = .empty;
     for (pulls) |pr| {
-        const pin = Pin.fromReady(pr) orelse continue;
+        const pin = Pin.fromOpen(pr) orelse continue;
         try nodes.append(a, .{
             .pin = pin,
             .ambiguous = pin.nativeStack != null or inNative(entry.stacks, pin.number) or inExplicit(entry.stacks, pin.number),
@@ -407,6 +407,7 @@ pub fn refresh(entry: *core.Entry, a: io.A, observed: []const Pin) !void {
                 if (member.digest) |*digest| digest.findings = "";
             }
             if (samePin(member.pin, updated)) {
+                member.pin = updated;
                 if (prefix_changed) try refreshJob(entry, a, updated, item.automatic);
                 continue;
             }
@@ -487,9 +488,9 @@ pub fn syncNative(entry: *core.Entry, a: io.A, discovered: []const NativeGroup) 
 pub fn queueNative(entry: *core.Entry, a: io.A, group: NativeGroup) !usize {
     var count: usize = 0;
     for (group.pins) |pin| {
-        if (pin.ready()) count += 1;
+        if (pin.reviewable()) count += 1;
     }
-    if (count == 0) return error.NoReadyStackMembers;
+    if (count == 0) return error.NoOpenStackMembers;
     var groups: std.ArrayList(NativeGroup) = .empty;
     try groups.append(a, group);
     for (entry.stacks) |item| {
@@ -506,13 +507,13 @@ pub fn queueNative(entry: *core.Entry, a: io.A, group: NativeGroup) !usize {
     }
     try syncNative(entry, a, groups.items);
     for (group.pins) |pin| {
-        if (pin.ready()) try entry.queue(a, pin.pull(), null);
+        if (pin.reviewable()) try entry.queue(a, pin.pull(), null);
     }
     return count;
 }
 
 fn refreshJob(entry: *core.Entry, a: io.A, pin: Pin, automatic: bool) !void {
-    if (!pin.ready()) return;
+    if (!pin.reviewable()) return;
     if (matchingJob(entry.jobs, pin)) |job| {
         if (job.phase == .uncertain) return;
     } else if (automatic) return;
@@ -567,6 +568,31 @@ test "stack registration checks order and blocks the child on a failed parent ac
     try t.expectEqual(@as(u32, 11), report[0].members[1].blocked_by.?.number);
     entry.jobs[0].phase = .complete;
     try t.expect(!blocked(entry, entry.jobs[1]));
+}
+
+test "draft descendants wait for review and readiness alone preserves stack results" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var entry = core.Entry{ .repo = fixture_repo };
+    var parent = fixture_parent;
+    parent.isDraft = true;
+    var child = fixture_child;
+    child.isDraft = true;
+    try register(&entry, a, "drafts", &.{ parent, child });
+    try t.expect(!blocked(entry, entry.jobs[0]));
+    try t.expect(blocked(entry, entry.jobs[1]));
+    entry.jobs[0].phase = .complete;
+    entry.jobs[0].awaiting_ready = true;
+    parent.isDraft = false;
+    try refresh(&entry, a, &.{ parent, child });
+    try t.expectEqual(.complete, entry.jobs[0].phase);
+    try t.expect(entry.jobs[0].awaiting_ready);
+    try t.expect(!blocked(entry, entry.jobs[1]));
+    const report = try statuses(a, entry);
+    try t.expect(!report[0].members[0].is_draft);
+    try t.expect(report[0].members[1].is_draft);
 }
 
 test "moving and merging ancestors invalidate descendant local results without losing receipts" {
@@ -771,7 +797,7 @@ pub fn blocker(entry: core.Entry, item: Stack, index: usize) ?Block {
     for (item.members[0 .. index + 1], 0..) |member, member_index| {
         const pin = member.pin;
         if (pin.state == .MERGED and member_index < index) continue;
-        if (!pin.ready()) return .{ .number = pin.number, .reason = if (pin.isDraft) "draft" else "not open" };
+        if (!pin.reviewable()) return .{ .number = pin.number, .reason = "not open" };
         if (member_index > 0 and item.native == null) {
             const before = item.members[member_index - 1].pin;
             if (before.state != .MERGED and !linked(entry.repo.name, before, pin))
@@ -798,6 +824,7 @@ pub const MemberStatus = struct {
     head: []const u8,
     base: []const u8,
     state: []const u8,
+    is_draft: bool,
     review: []const u8,
     blocked_by: ?Block = null,
 };
@@ -823,6 +850,7 @@ pub fn statuses(a: io.A, entry: core.Entry) ![]Status {
                 .head = pin.headRefOid,
                 .base = pin.baseRefOid,
                 .state = @tagName(pin.state),
+                .is_draft = pin.isDraft,
                 .review = review,
                 .blocked_by = blocked_by,
             };

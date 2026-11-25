@@ -47,7 +47,7 @@ const Fake = struct {
     lose_response: bool = false,
     lose_readback: bool = false,
     lose_inline_readback: bool = false,
-    move_during_review: enum { none, head, base, base_ref } = .none,
+    move_during_review: enum { none, head, base, base_ref, draft } = .none,
     inherited: stack.Context = .{},
     move_ancestor_during_review: bool = false,
     join_native_before_post: bool = false,
@@ -125,6 +125,7 @@ const Fake = struct {
             .head => self.target.headRefOid = changed,
             .base => self.target.baseRefOid = changed,
             .base_ref => self.target.baseRefName = "release",
+            .draft => self.target.isDraft = true,
         }
         if (engine == self.fail_engine) return error.ClaudeFailed;
         const extra = self.reviews_run -| 2;
@@ -776,7 +777,7 @@ test "late native stack membership aborts before the durable publication intent"
     try t.expect(job.receipt == null);
 }
 
-test "first scan baselines ready PRs, then queues drafts becoming ready, new heads, and explicit selections" {
+test "discovery baselines open PRs and queues new draft heads and drafts becoming ready" {
     var allocator = std.heap.ArenaAllocator.init(t.allocator);
     defer allocator.deinit();
     const a = allocator.allocator();
@@ -785,7 +786,7 @@ test "first scan baselines ready PRs, then queues drafts becoming ready, new hea
     draft.number = 43;
     draft.isDraft = true;
     try entry.discover(a, &.{ fixture_pull, draft }, true);
-    try t.expectEqual(@as(usize, 1), entry.seen.len);
+    try t.expectEqual(@as(usize, 2), entry.seen.len);
     try t.expectEqual(@as(usize, 0), entry.jobs.len);
 
     try entry.queue(a, fixture_pull, null);
@@ -798,6 +799,7 @@ test "first scan baselines ready PRs, then queues drafts becoming ready, new hea
     updated.headRefOid = changed;
     var new = fixture_pull;
     new.number = 44;
+    new.isDraft = true;
     try entry.discover(a, &.{ updated, draft, new }, false);
     try t.expectEqual(@as(usize, 3), entry.jobs.len);
     try t.expectEqual(@as(u32, 43), entry.jobs[0].number);
@@ -805,6 +807,59 @@ test "first scan baselines ready PRs, then queues drafts becoming ready, new hea
     try t.expectEqual(@as(u32, 44), entry.jobs[2].number);
     try entry.discover(a, &.{ updated, draft, new }, false);
     try t.expectEqual(@as(usize, 3), entry.jobs.len);
+}
+
+test "upgrading baselines existing drafts and reviews their next heads" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var entry = try io.parse(a, core.Entry, "{\"repo\":{\"name\":\"example/repo\",\"login\":\"reviewer\"},\"seen\":[{\"number\":42,\"head\":\"" ++ head ++ "\"}]}");
+    var draft = fixture_pull;
+    draft.number = 43;
+    draft.isDraft = true;
+    try entry.discover(a, &.{ fixture_pull, draft }, false);
+    try t.expectEqual(@as(usize, 0), entry.jobs.len);
+    draft.headRefOid = changed;
+    try entry.discover(a, &.{ fixture_pull, draft }, false);
+    try t.expectEqual(@as(usize, 1), entry.jobs.len);
+    try t.expectEqual(@as(u32, 43), entry.jobs[0].number);
+}
+
+test "draft findings publish while clean draft approvals wait until ready" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var configured = repo;
+    configured.approvals = true;
+    var draft = fixture_pull;
+    draft.isDraft = true;
+
+    var with_issue: Fake = .{ .a = a, .target = draft };
+    var issue_job: core.Job = .{ .number = 42, .head = head };
+    _ = try core.run(a, &with_issue, configured, &issue_job, .scheduled);
+    try t.expectEqual(@as(usize, 1), with_issue.posts);
+    try t.expectEqual(.COMMENT, with_issue.posted_result.?.event);
+    try t.expect(!issue_job.awaiting_ready);
+
+    var covered: Fake = .{ .a = a, .target = draft, .result = clean };
+    var job: core.Job = .{ .number = 42, .head = head };
+    const result = (try core.run(a, &covered, configured, &job, .scheduled)).?;
+    try t.expectEqual(.local, result.explanation.?.publication);
+    try t.expectEqualSlices(@TypeOf(result.explanation.?.blockers[0]), &.{.draft}, result.explanation.?.blockers);
+    try t.expect(job.awaiting_ready);
+    try t.expectEqual(@as(usize, 0), covered.posts);
+    job.observeReviewInput(try core.ReviewInput.init(a, configured, draft, base, .{}), false, true);
+    try t.expectEqual(.complete, job.phase);
+
+    covered.target = fixture_pull;
+    const ready_input = try core.ReviewInput.init(a, configured, fixture_pull, base, .{});
+    job.observeReviewInput(ready_input, false, true);
+    try t.expectEqual(.pending, job.phase);
+    _ = try core.run(a, &covered, configured, &job, .scheduled);
+    try t.expectEqual(@as(usize, 1), covered.posts);
+    try t.expectEqual(.APPROVE, covered.posted_result.?.event);
+    job.observeReviewInput(ready_input, false, true);
+    try t.expectEqual(.complete, job.phase);
 }
 
 test "publishes one commit-bound comment, verifies it, and deduplicates a second review" {
@@ -925,7 +980,7 @@ test "head and base changes during analysis prevent any publication" {
     var allocator = std.heap.ArenaAllocator.init(t.allocator);
     defer allocator.deinit();
     const a = allocator.allocator();
-    for ([_]@FieldType(Fake, "move_during_review"){ .head, .base, .base_ref }) |move| {
+    for ([_]@FieldType(Fake, "move_during_review"){ .head, .base, .base_ref, .draft }) |move| {
         var fake: Fake = .{ .a = a, .move_during_review = move };
         var work: core.Job = .{ .number = fixture_pull.number, .head = head };
         try t.expectError(error.TargetChanged, core.run(a, &fake, repo, &work, .scheduled));
