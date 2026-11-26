@@ -60,6 +60,12 @@ talos status                          # See scans, queue, errors, and cache size
 
 Open [the local dashboard](http://127.0.0.1:8749) after starting it. The queue shows tracked jobs, active reviewers, and completed source sections. The displayed percentage counts completed sections. Reviewers working on a section can still require additional evidence or synthesis, so the percentage is a coverage milestone and does not estimate time remaining. Look up a PR by URL or repository and number. You can also queue a PR or GitHub stack and select all-model review. The dashboard uses the same queue and publication policy as the CLI.
 
+These screenshots use simulated repositories and review activity.
+
+![Talos queue with active reviews, section progress, stack dependencies, and queue controls](docs/dashboard-queue.png)
+
+![Talos usage with daily calls, token coverage, CLI profiles, and reported model usage](docs/dashboard-usage.png)
+
 The dashboard binds to loopback. Browser queue writes require a matching local origin. Keep it on the machine running Talos. Use `talos dashboard remove` to stop the macOS service, or `talos dashboard --port 8750` to run on another local port.
 
 Talos retains up to 90 UTC days of local attempt and verdict metadata. Attempt records include repository, PR, head, stage, reviewer, model, elapsed time, outcome, and provider-reported tokens when available. The dashboard gives totals by PR and review, and shows advisor model usage separately when the CLI attributes it. Cached input and reasoning tokens are parts of the corresponding input and output totals. The recorded-token share shows how much of the selected range can support token totals. CLI versions with no reported usage still contribute attempt counts. Previously saved verdicts appear in history, and token history begins when the telemetry-enabled watcher starts recording. The telemetry logs store metadata only.
