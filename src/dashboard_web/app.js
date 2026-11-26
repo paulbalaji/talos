@@ -41,6 +41,8 @@ let detailRequest = null;
 let displayChart = "calls";
 let chartObserver = null;
 let pollTimer = null;
+let queueLookup = null;
+let queueSending = null;
 const renderKeys = new Map();
 const openStacks = new Set();
 
@@ -101,16 +103,19 @@ function validNumber(value) {
 
 function parseTarget(value, fallback = "") {
   const text = value.trim();
-  if (/^https?:\/\//i.test(text)) {
+  const bareLink = /^github\.com\//i.test(text);
+  if (bareLink || /^https?:\/\//i.test(text)) {
     try {
-      const url = new URL(text);
+      const url = new URL(bareLink ? `https://${text}` : text);
       if (url.origin !== "https://github.com" || url.username || url.password) return null;
       const parts = url.pathname.replace(/\/$/, "").split("/").slice(1);
-      const [owner, repository, type, id] = parts;
+      const [owner, repository, type, id, detail] = parts;
       const repo = `${owner}/${repository}`;
       const kind = type === "pull" ? "pr" : ["stack", "stacks"].includes(type) ? "stack" : "";
       const number = Number(id);
-      if (parts.length === 4 && repoPattern.test(repo) && kind && /^\d+$/.test(id) && validNumber(number)) {
+      const validPath = parts.length === 4 ||
+        (kind === "pr" && parts.length === 5 && ["files", "commits", "checks", "changes"].includes(detail));
+      if (validPath && repoPattern.test(repo) && kind && /^\d+$/.test(id) && validNumber(number)) {
         return { repo, number, kind };
       }
     } catch {
@@ -131,6 +136,14 @@ function sameRepo(first, second) {
 
 function keyOf(repo, number) {
   return `${repo}#${number}`;
+}
+
+function stackAccent(repo, identity) {
+  let hash = 0;
+  for (const char of `${repo.toLowerCase()}#${identity}`) {
+    hash = (Math.imul(31, hash) + char.charCodeAt(0)) >>> 0;
+  }
+  return `stack-color-${hash % 8}`;
 }
 
 function gitHubLink(repo, number, reviewId = null) {
@@ -160,7 +173,7 @@ async function request(path, options = {}) {
     const code = data?.error;
     const message = typeof code === "string" ?
       (Object.hasOwn(errorLabels, code) ? errorLabels[code] : humanize(code)) : `Request failed (${response.status}).`;
-    throw new Error(message);
+    throw Object.assign(new Error(message), { status: response.status });
   }
   return data;
 }
@@ -266,7 +279,7 @@ function providersLabel(values, allModels) {
   return group;
 }
 
-function reviewKey(item, head = null, showDetails = true) {
+function reviewKey(item, head = null, showDetails = true, stack = null) {
   const wrap = element("div", "review-key");
   const label = element("button", "review-link", `#${item.number}`);
   label.type = "button";
@@ -275,11 +288,15 @@ function reviewKey(item, head = null, showDetails = true) {
   label.addEventListener("click", () => openReview(item.repo, item.number, head, item.at ?? null, item.review_id ?? null));
   wrap.append(label);
   if (showDetails && item.title) wrap.append(element("span", "review-title", item.title));
-  if (showDetails) wrap.append(element("span", "review-repo", phrase([item.repo, item.draft && "Draft", item.stack && `Stack #${item.stack}`])));
+  if (showDetails) {
+    const metadata = element("span", "review-repo", phrase([item.repo, item.draft && "Draft"]));
+    if (stack) metadata.append(element("span", "stack-label", ` · ${stack.label}`));
+    wrap.append(metadata);
+  }
   return wrap;
 }
 
-function renderTable(headers, rows, emptyMessage) {
+function renderTable(headers, rows, emptyMessage, rowClasses = []) {
   if (!rows.length) return element("p", "empty", emptyMessage);
   const table = element("table");
   const header = element("thead");
@@ -292,8 +309,8 @@ function renderTable(headers, rows, emptyMessage) {
   }
   header.append(headRow);
   const body = element("tbody");
-  for (const row of rows) {
-    const tr = element("tr");
+  for (const [rowIndex, row] of rows.entries()) {
+    const tr = element("tr", rowClasses[rowIndex]);
     for (const [index, cell] of row.entries()) {
       const col = headers[index];
       const td = element("td", typeof col === "string" ? "" : col[1]);
@@ -322,6 +339,12 @@ function filterRows(rows, query) {
 
 function renderQueue() {
   const jobs = list(snapshot?.jobs);
+  const memberships = new Map();
+  for (const stack of list(snapshot?.stacks)) {
+    const label = stack.number ? `Stack #${stack.number}` : `Stack ${stack.name}`;
+    const accent = stackAccent(stack.repo, stack.number || stack.name);
+    for (const member of list(stack.members)) memberships.set(keyOf(stack.repo, member.number), { label, accent });
+  }
   const active = jobs.filter((job) => !["baseline", "complete"].includes(job.phase));
   const running = active.filter((job) => list(job.active_providers).length > 0);
   const pending = active.filter((job) => job.phase === "pending" && !list(job.active_providers).length).length;
@@ -339,11 +362,12 @@ function renderQueue() {
   };
   const ordered = [...selected].sort((first, second) => rank(first) - rank(second) ||
     first.repo.localeCompare(second.repo) || second.number - first.number);
-  const statuses = ordered.map((job) => [job, chooseStage(job, now)]);
+  const statuses = ordered.map((job) => [job, chooseStage(job, now), memberships.get(keyOf(job.repo, job.number)) ||
+    (job.stack ? { label: `Stack #${job.stack}`, accent: stackAccent(job.repo, job.stack) } : null)]);
   update("queue", statuses, () => {
-    replace(byId("queue-results"), renderTable(["Pull request", "State", "Progress", "Reviewers"], statuses.map(([job, status]) => [
-      reviewKey(job), phaseLabel(status), progressLabel(job), providersLabel(list(job.active_providers), job.all_models),
-    ]), snapshot ? "No matching reviews." : "Loading queue…"));
+    replace(byId("queue-results"), renderTable(["Pull request", "State", "Progress", "Reviewers"], statuses.map(([job, status, stack]) => [
+      reviewKey(job, null, true, stack), phaseLabel(status), progressLabel(job), providersLabel(list(job.active_providers), job.all_models),
+    ]), snapshot ? "No matching reviews." : "Loading queue…", statuses.map(([, , stack]) => stack ? `linked-row ${stack.accent}` : "")));
   });
 
   const activeKeys = new Set(active.map((job) => keyOf(job.repo, job.number)));
@@ -352,7 +376,7 @@ function renderQueue() {
   update("stacks", stacks, () => {
     const group = element("div", "stack-items");
     for (const stack of stacks) {
-      const details = element("details", "stack");
+      const details = element("details", `stack ${stackAccent(stack.repo, stack.number || stack.name)}`);
       const stackKey = phrase([stack.repo, stack.number || stack.name]);
       details.open = openStacks.has(stackKey);
       details.addEventListener("toggle", () => {
@@ -460,6 +484,8 @@ function drawChart(canvas, series) {
   const height = canvas.clientHeight;
   if (width < 90 || height < 70) return;
   const scale = Math.min(2, window.devicePixelRatio || 1);
+  const colors = getComputedStyle(canvas);
+  const color = (name) => colors.getPropertyValue(`--${name}`).trim();
   canvas.width = Math.round(width * scale);
   canvas.height = Math.round(height * scale);
   context.scale(scale, scale);
@@ -482,10 +508,10 @@ function drawChart(canvas, series) {
   context.textBaseline = "middle";
   for (const tick of ticks) {
     const level = y(tick);
-    context.fillStyle = "#a6b1a7";
+    context.fillStyle = color("muted");
     context.textAlign = "right";
     context.fillText(compact.format(tick), left - 7, level);
-    context.strokeStyle = "#343e36";
+    context.strokeStyle = color("line");
     context.beginPath();
     context.moveTo(left, level + .5);
     context.lineTo(width - axes.right, level + .5);
@@ -496,14 +522,14 @@ function drawChart(canvas, series) {
     if (!(total > 0)) continue;
     const x = left + step * (index + .5) - thickness / 2;
     const first = tokenMode ? Math.min(total, point.input_tokens ?? 0) : Math.min(total, point.reported ?? 0);
-    context.fillStyle = "#536a59";
+    context.fillStyle = color("chart-secondary");
     context.fillRect(x, y(total), thickness, bottom - y(total));
     if (first) {
-      context.fillStyle = "#d4eb8c";
+      context.fillStyle = color("accent");
       context.fillRect(x, y(first), thickness, bottom - y(first));
     }
   }
-  context.fillStyle = "#a6b1a7";
+  context.fillStyle = color("muted");
   context.textBaseline = "bottom";
   context.textAlign = "left";
   context.fillText(chartDay(series[0].day), left, height - 3);
@@ -811,14 +837,93 @@ function openReview(repo, number, head = null, at = null, reviewId = null) {
   refreshDetail();
 }
 
-function syncTarget() {
-  const target = parseTarget(byId("queue-target").value);
-  if (!target) return;
-  if (target.repo) {
-    const repo = list(snapshot?.repos).find((item) => sameRepo(item.name, target.repo));
-    if (repo) byId("queue-repo").value = repo.name;
+function queueTarget() {
+  const parsed = parseTarget(byId("queue-target").value);
+  if (!parsed) return null;
+  const fallback = !parsed.repo;
+  const repo = parsed.repo || byId("queue-repo").value;
+  return { ...parsed, fallback, repo, kind: parsed.kind || (fallback ? byId("queue-form").elements.kind.value : "pr") };
+}
+
+function lookupKey(target) {
+  return target?.kind === "pr" && repoPattern.test(target.repo) ? keyOf(target.repo.toLowerCase(), target.number) : null;
+}
+
+function renderQueueTarget() {
+  const target = queueTarget();
+  const valid = target && repoPattern.test(target.repo);
+  const key = lookupKey(target);
+  const matching = key && queueLookup?.key === key ? queueLookup : null;
+  const primary = byId("queue-submit");
+  const stack = byId("queue-stack-submit");
+  const status = byId("queue-target-status");
+  const suggestion = validNumber(matching?.stack);
+  const soleRepo = list(snapshot?.repos).length === 1 && byId("queue-repo").value;
+  byId("queue-repo-field").hidden = !target?.fallback || Boolean(soleRepo);
+  byId("queue-kind-field").hidden = !target?.fallback;
+  const action = valid ? `Queue ${target.kind === "stack" ? "stack" : "PR"} #${target.number}` : "Queue review";
+  primary.textContent = queueSending?.wholeStack === false ? "Queueing…" : action;
+  primary.disabled = Boolean(queueSending);
+  stack.hidden = !suggestion;
+  stack.textContent = queueSending?.wholeStack ? "Queueing…" : suggestion ? `Queue whole stack #${matching.stack}` : "Queue whole stack";
+  stack.disabled = Boolean(queueSending);
+  if (matching?.state === "waiting") note(status, "Checking stack membership…");
+  else if (matching?.state === "unavailable") note(status, "Stack membership unavailable.");
+  else note(status, "");
+}
+
+function syncTarget(refreshMembership = false) {
+  const target = queueTarget();
+  const key = lookupKey(target);
+  if (!refreshMembership && key === (queueLookup?.key ?? null)) {
+    renderQueueTarget();
+    return;
   }
-  if (target.kind) byId("queue-form").elements.kind.value = target.kind;
+  if (queueLookup) {
+    clearTimeout(queueLookup.timer);
+    queueLookup.controller.abort();
+  }
+  queueLookup = null;
+  if (key) {
+    const lookup = { key, state: "waiting", stack: null, controller: new AbortController(), timer: null };
+    queueLookup = lookup;
+    const query = new URLSearchParams({ repo: target.repo, number: String(target.number) });
+    lookup.timer = setTimeout(async () => {
+      try {
+        const result = await request(`/api/queue-target?${query}`, {
+          headers: { "X-Talos-Request": "1" },
+          signal: lookup.controller.signal,
+        });
+        if (queueLookup !== lookup) return;
+        lookup.stack = validNumber(result.stack_number) ? result.stack_number : null;
+        lookup.state = "done";
+      } catch {
+        if (queueLookup !== lookup) return;
+        lookup.state = "unavailable";
+      }
+      renderQueueTarget();
+    }, 300);
+  }
+  renderQueueTarget();
+}
+
+function queueInputChanged() {
+  note(byId("queue-message"), "");
+  syncTarget();
+}
+
+function queuePayload(target, wholeStack, form) {
+  if (!target) return;
+  const payload = { repo: target.repo, number: target.number, kind: target.kind, all_models: form.elements.all_models.checked };
+  if (form.elements.mode.value) payload.mode = form.elements.mode.value;
+  if (wholeStack) {
+    const key = lookupKey(target);
+    if (!key || queueLookup?.key !== key || !validNumber(queueLookup.stack)) return;
+    payload.number = queueLookup.stack;
+    payload.kind = "stack";
+    payload.member = target.number;
+  }
+  return payload;
 }
 
 function findPull(event) {
@@ -853,33 +958,41 @@ async function queueReview(event) {
   const form = byId("queue-form");
   const input = byId("queue-target");
   const message = byId("queue-message");
-  const button = byId("queue-submit");
-  if (button.disabled) return;
-  const target = parseTarget(input.value, byId("queue-repo").value);
+  if (queueSending) return;
+  const target = queueTarget();
   if (!target || !repoPattern.test(target.repo)) {
     note(message, "Enter a GitHub link or select a repository and enter a number.", "error");
     return;
   }
-  button.disabled = true;
-  button.textContent = "Queueing…";
-  const kind = target.kind || form.elements.kind.value;
+  const wholeStack = event.submitter === byId("queue-stack-submit");
+  const payload = queuePayload(target, wholeStack, form);
+  if (!payload) {
+    note(message, "Select a current stack to queue.", "error");
+    syncTarget();
+    return;
+  }
+  queueSending = { wholeStack };
+  for (const control of form.elements) control.disabled = true;
+  renderQueueTarget();
   note(message, "");
   try {
-    const payload = { repo: target.repo, number: target.number, kind, all_models: form.elements.all_models.checked };
     const queued = await request("/api/queue", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Talos-Request": "1" },
       body: JSON.stringify(payload),
     });
-    const description = kind === "stack" ? `Stack #${target.number}` : `#${target.number}`;
-    note(message, queued.message || `Queued ${description} in ${target.repo}.`);
+    const description = payload.kind === "stack" ? `Stack #${payload.number}` : `#${payload.number}`;
+    note(message, queued.message || `Queued ${description} in ${payload.repo}.`);
     input.value = "";
+    syncTarget();
     await refreshState();
   } catch (error) {
     note(message, error.message, "error");
+    if (wholeStack && error.status === 409) syncTarget(true);
   } finally {
-    button.disabled = false;
-    button.textContent = "Queue review";
+    queueSending = null;
+    for (const control of form.elements) control.disabled = false;
+    renderQueueTarget();
   }
 }
 
@@ -966,7 +1079,9 @@ byId("queue-search").addEventListener("input", () => {
 });
 byId("queue-filter").addEventListener("change", renderQueue);
 byId("queue-form").addEventListener("submit", queueReview);
-byId("queue-target").addEventListener("input", syncTarget);
+byId("queue-target").addEventListener("input", queueInputChanged);
+byId("queue-repo").addEventListener("change", queueInputChanged);
+byId("queue-kind-field").addEventListener("change", queueInputChanged);
 byId("history-search").addEventListener("input", renderHistory);
 byId("history-filter").addEventListener("change", renderHistory);
 byId("metrics-range").addEventListener("change", refreshMetrics);

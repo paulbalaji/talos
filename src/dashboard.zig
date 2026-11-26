@@ -7,7 +7,7 @@ const eq = std.ascii.eqlIgnoreCase;
 pub const default_port: u16 = 8749;
 
 pub const Request = struct {
-    route: enum { state, metrics, review, queue },
+    route: enum { state, metrics, review, queue, queue_target },
     query: []const u8,
     body: []const u8,
 };
@@ -23,6 +23,8 @@ const max_body = 4 * 1024;
 const max_response = 8 * 1024 * 1024;
 const socket_deadline = 3 * std.time.ns_per_s;
 const workers = 4;
+const max_stack_lookups = 2;
+const LookupCount = std.atomic.Value(usize);
 
 const Hosts = struct {
     ip: []const u8,
@@ -60,21 +62,22 @@ pub fn serve(port: u16, context: anytype) !void {
     var localhost_buffer: [32]u8 = undefined;
     const hosts = try Hosts.init(listener.listen_address.getPort(), &ip_buffer, &localhost_buffer);
     try io.out("Talos dashboard at http://{s}\n", .{hosts.ip});
+    var stack_lookups: LookupCount = .init(0);
     for (1..workers) |_| {
-        const thread = std.Thread.spawn(.{}, acceptLoop, .{ &listener, hosts, context }) catch break;
+        const thread = std.Thread.spawn(.{}, acceptLoop, .{ &listener, hosts, &stack_lookups, context }) catch break;
         thread.detach();
     }
-    acceptLoop(&listener, hosts, context);
+    acceptLoop(&listener, hosts, &stack_lookups, context);
 }
 
-fn acceptLoop(listener: *std.net.Server, hosts: Hosts, context: anytype) noreturn {
+fn acceptLoop(listener: *std.net.Server, hosts: Hosts, stack_lookups: *LookupCount, context: anytype) noreturn {
     while (true) {
         const conn = listener.accept() catch {
             std.Thread.sleep(250 * std.time.ns_per_ms);
             continue;
         };
         defer conn.stream.close();
-        handle(conn.stream.handle, hosts, context) catch {};
+        handle(conn.stream.handle, hosts, stack_lookups, context) catch {};
     }
 }
 
@@ -82,6 +85,7 @@ const Destination = union(enum) {
     index,
     stylesheet,
     script,
+    tiles,
     api: @FieldType(Request, "route"),
 };
 
@@ -89,10 +93,12 @@ const destinations = std.StaticStringMap(Destination).initComptime(.{
     .{ "/", .index },
     .{ "/app.css", .stylesheet },
     .{ "/app.js", .script },
+    .{ "/tiles.png", .tiles },
     .{ "/api/state", Destination{ .api = .state } },
     .{ "/api/metrics", Destination{ .api = .metrics } },
     .{ "/api/review", Destination{ .api = .review } },
     .{ "/api/queue", Destination{ .api = .queue } },
+    .{ "/api/queue-target", Destination{ .api = .queue_target } },
 });
 
 const Parsed = struct {
@@ -112,7 +118,7 @@ fn parseHead(raw: []const u8, hosts: Hosts) HeadError!Parsed {
 
     var host: ?[]const u8 = null;
     var origin: ?[]const u8 = null;
-    var queue_marker: ?[]const u8 = null;
+    var marker: ?[]const u8 = null;
     var fetch_site: ?[]const u8 = null;
     var content_type: ?[]const u8 = null;
     var lines = std.mem.splitSequence(u8, raw, "\r\n");
@@ -136,7 +142,7 @@ fn parseHead(raw: []const u8, hosts: Hosts) HeadError!Parsed {
         else if (eq(name, "origin"))
             &origin
         else if (eq(name, "x-talos-request"))
-            &queue_marker
+            &marker
         else if (eq(name, "sec-fetch-site"))
             &fetch_site
         else if (eq(name, "content-type"))
@@ -164,12 +170,18 @@ fn parseHead(raw: []const u8, hosts: Hosts) HeadError!Parsed {
         if (fetch_site) |site| if (!eq(site, "same-origin") and !eq(site, "none")) return error.ForeignOrigin;
         if (destination.api == .queue) {
             if (head.method != .POST) return error.MethodNotAllowed;
-            if (origin == null or !eq(queue_marker orelse "", "1")) return error.ForeignOrigin;
+            if (origin == null or !eq(marker orelse "", "1")) return error.ForeignOrigin;
             if (query.len != 0 or length == 0) return error.InvalidRequest;
             if (length > max_body) return error.BodyTooLarge;
             const media_type = content_type orelse return error.UnsupportedMediaType;
             if (!eq(media_type, "application/json") and !eq(media_type, json_type)) return error.UnsupportedMediaType;
             return .{ .destination = destination, .method = .POST, .query = "", .body_len = @intCast(length) };
+        }
+        if (destination.api == .queue_target) {
+            if (head.method != .GET) return error.MethodNotAllowed;
+            // A same-origin GET may omit Origin. The custom header keeps
+            // passive browser requests from spending a GitHub call.
+            if (!eq(marker orelse "", "1")) return error.ForeignOrigin;
         }
     }
     if (head.method != .GET and head.method != .HEAD) return error.MethodNotAllowed;
@@ -237,7 +249,7 @@ fn reject(fd: posix.socket_t, status: http.Status, comptime message: []const u8,
     return respond(fd, status, json_type, "{\"error\":\"" ++ message ++ "\"}", head_only);
 }
 
-fn handle(fd: posix.socket_t, hosts: Hosts, context: anytype) !void {
+fn handle(fd: posix.socket_t, hosts: Hosts, stack_lookups: *LookupCount, context: anytype) !void {
     var timer = try std.time.Timer.start();
     var header_buffer: [max_head]u8 = undefined;
     var used: usize = 0;
@@ -268,11 +280,20 @@ fn handle(fd: posix.socket_t, hosts: Hosts, context: anytype) !void {
         .index => return respond(fd, .ok, "text/html; charset=utf-8", @embedFile("dashboard_web/index.html"), head_only),
         .stylesheet => return respond(fd, .ok, "text/css; charset=utf-8", @embedFile("dashboard_web/app.css"), head_only),
         .script => return respond(fd, .ok, "text/javascript; charset=utf-8", @embedFile("dashboard_web/app.js"), head_only),
+        .tiles => return respond(fd, .ok, "image/png", @embedFile("dashboard_web/tiles.png"), head_only),
         .api => |route| {
             var body: [max_body]u8 = undefined;
             @memcpy(body[0..received.len], received);
             var read: usize = received.len;
             while (read < request.body_len) read += try receive(fd, body[read..request.body_len], &timer);
+            const lookup = route == .queue_target;
+            if (lookup and stack_lookups.fetchAdd(1, .monotonic) >= max_stack_lookups) {
+                _ = stack_lookups.fetchSub(1, .monotonic);
+                return reject(fd, .too_many_requests, "Stack lookups are busy. Try again in a moment.", head_only);
+            }
+            defer if (lookup) {
+                _ = stack_lookups.fetchSub(1, .monotonic);
+            };
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const response = context.api(arena.allocator(), .{ .route = route, .query = request.query, .body = body[0..read] }) catch |err| {
@@ -310,6 +331,17 @@ test "dashboard rejects external hosts and cross-origin queue writes" {
     try t.expectError(error.MethodNotAllowed, parseHead("GET /api/queue HTTP/1.1\r\n" ++ headers ++ "\r\n", test_hosts));
 }
 
+test "smart queue lookup needs an active same-origin GET" {
+    const t = std.testing;
+    const request = "GET /api/queue-target?repo=owner%2Frepo&number=4 HTTP/1.1\r\n";
+    const marker = "X-Talos-Request: 1\r\n";
+    try t.expectEqual(.queue_target, (try parseHead(request ++ headers ++ marker ++ "\r\n", test_hosts)).destination.api);
+    try t.expectError(error.ForeignOrigin, parseHead(request ++ headers ++ "\r\n", test_hosts));
+    try t.expectError(error.ForeignOrigin, parseHead(request ++ headers ++ marker ++ "Origin: http://localhost:8749\r\n\r\n", test_hosts));
+    try t.expectError(error.ForeignOrigin, parseHead(request ++ headers ++ marker ++ "Sec-Fetch-Site: cross-site\r\n\r\n", test_hosts));
+    try t.expectError(error.MethodNotAllowed, parseHead("HEAD /api/queue-target HTTP/1.1\r\n" ++ headers ++ marker ++ "\r\n", test_hosts));
+}
+
 test "dashboard accepts only bounded unencoded request bodies" {
     const t = std.testing;
     try t.expectError(error.BodyTooLarge, parseHead("POST /api/queue HTTP/1.1\r\n" ++ queue_headers ++ "Content-Length: 4097\r\n\r\n", test_hosts));
@@ -339,6 +371,7 @@ test "dashboard loopback transport applies security headers and reads the declar
         }
     };
     var calls: usize = 0;
+    var stack_lookups: LookupCount = .init(0);
     var ip_buffer: [32]u8 = undefined;
     var localhost_buffer: [32]u8 = undefined;
     const hosts = try Hosts.init(port, &ip_buffer, &localhost_buffer);
@@ -355,7 +388,7 @@ test "dashboard loopback transport applies security headers and reads the declar
         );
         var timer = try std.time.Timer.start();
         try sendAll(client.handle, bytes, &timer);
-        try handle(conn.stream.handle, hosts, Mock{ .calls = &calls });
+        try handle(conn.stream.handle, hosts, &stack_lookups, Mock{ .calls = &calls });
     }
     var buffer: [1024]u8 = undefined;
     var reader = client.reader(&.{});
