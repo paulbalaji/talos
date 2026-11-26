@@ -2100,7 +2100,6 @@ const Main = struct {
     fn dispatch(self: Main, args: []const []const u8) !void {
         const cmd = args[0];
         const params = args[1..];
-        if (eq(u8, cmd, "dashboard")) return self.dashboardCommand(params);
         if (eq(u8, cmd, "metrics")) {
             const days = if (params.len == 0) 30 else if (params.len == 2 and eq(u8, params[0], "--days")) try metricsDays(params[1]) else return error.Usage;
             return self.out("{s}\n", .{try dashboard_data.metricsJson(self.a, self.db, days, std.time.timestamp())});
@@ -2313,6 +2312,12 @@ fn start(a: A) !void {
     if (args.len == 0 or eq(u8, args[0], "--help") or eq(u8, args[0], "-h")) return io.out("{s}\n", .{usage});
     var db = try store.Store.open(a, root);
     defer db.dir.close();
+    if (eq(u8, args[0], "dashboard")) {
+        // HTTP queue requests own their scratch. The long-lived server can
+        // exit through launchd without leaving an empty process directory.
+        const app: Main = .{ .a = a, .env = &env, .home = home, .db = db, .scratch = try a.dupeZ(u8, db.path), .scratch_dir = db.dir };
+        return app.dashboardCommand(args[1..]);
+    }
     const scratch = try io.temp(a);
     defer std.fs.deleteTreeAbsolute(scratch) catch {};
     var dir = try std.fs.openDirAbsolute(scratch, .{ .iterate = true });
