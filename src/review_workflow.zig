@@ -97,13 +97,17 @@ pub fn synthesisPrompt(a: io.A, context: []const u8, results: []const core.Revie
 }
 
 pub fn overCapacity(a: io.A, results: []const core.ReviewerResult) !Synthesis {
+    return unverified(a, results, "The candidate findings exceeded the verification context limit. Their source claims remain unverified.");
+}
+
+pub fn unverified(a: io.A, results: []const core.ReviewerResult, summary: []const u8) !Synthesis {
     const checked = try a.dupe(core.ReviewerResult, results);
     for (checked) |*result| {
         result.complete_before_synthesis = result.review.complete;
         result.review.findings = &.{};
         result.review.complete = false;
     }
-    return .{ .results = checked, .summary = "The candidate findings exceeded the verification context limit. Their source claims remain unverified." };
+    return .{ .results = checked, .summary = summary };
 }
 
 fn validText(text: []const u8, max: usize) bool {

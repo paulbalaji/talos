@@ -1295,6 +1295,23 @@ test "an approval is discarded when a thread opens before posting" {
     try t.expect(fake.saved_result == null);
 }
 
+test "a new automation-only thread does not discard a completed review" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var configured = repo;
+    configured.approvals = true;
+    var thread = open_nit;
+    var reply = thread.replies[0];
+    reply.author = .{ .login = "automation[bot]", .kind = "Bot" };
+    thread.replies = &.{reply};
+    var fake: Fake = .{ .a = a, .result = clean, .late_discussion = &.{thread} };
+    var job: core.Job = .{ .number = fixture_pull.number, .head = head };
+    const result = (try core.run(a, &fake, configured, &job, .scheduled)).?;
+    try t.expectEqual(.APPROVE, result.event);
+    try t.expectEqual(@as(usize, 1), fake.posts);
+}
+
 test "a clipped historical delta permits approval only with complete current evidence and assessed threads" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();

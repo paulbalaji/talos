@@ -1154,6 +1154,7 @@ const Main = struct {
                     if (!eq(u8, &prior, &evidence_key)) {
                         progress.results = &.{};
                         progress.malformed_reviewers = 0;
+                        progress.rejected_synthesizers = 0;
                         progress.review_ms = 0;
                         progress.initial_evidence_limited = false;
                         progress.completion_requests = null;

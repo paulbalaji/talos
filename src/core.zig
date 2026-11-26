@@ -1412,6 +1412,7 @@ pub const RouteProgress = struct {
     screen_ms: u64 = 0,
     results: []const ReviewerResult = &.{},
     malformed_reviewers: u8 = 0,
+    rejected_synthesizers: u8 = 0,
     review_ms: u64 = 0,
     all_models: bool = false,
 
@@ -1751,10 +1752,23 @@ pub fn analyze(a: A, reviewer: anytype, engines: []const Engine, context: []cons
     return results;
 }
 
-fn checkDiscussion(a: A, adapter: anytype, number: u32, original: []const u8) !void {
+fn checkDiscussion(a: A, adapter: anytype, number: u32, original: Discussion) !void {
     var latest = try adapter.reviewDiscussion(number);
+    var threads: std.ArrayList(Thread) = .empty;
+    for (latest.threads) |thread| {
+        const known = for (original.threads) |prior| {
+            if (eq(u8, prior.id, thread.id)) break true;
+        } else false;
+        if (!known and thread.replies.len != 0) {
+            for (thread.replies) |reply| {
+                if (reply.author == null or Discussion.human(reply, null)) break;
+            } else continue;
+        }
+        try threads.append(a, thread);
+    }
+    latest.threads = threads.items;
     latest.comments = try latest.materialComments(a);
-    if (!eq(u8, original, try io.json(a, latest))) return error.ThreadsChanged;
+    if (!eq(u8, try io.json(a, original), try io.json(a, latest))) return error.ThreadsChanged;
 }
 
 pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared, results: []const ReviewerResult) !?Result {
@@ -1763,7 +1777,7 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
     const threads = prepared.threads;
     const inherited = prepared.inherited;
     const snap = prepared.snap;
-    const original_discussion = try io.json(a, Discussion{ .threads = threads, .comments = prepared.comments });
+    const original_discussion: Discussion = .{ .threads = threads, .comments = prepared.comments };
     try checkDiscussion(a, adapter, pr.number, original_discussion);
     const latest = try adapter.pull(job.number);
     if (!sameTarget(pr, latest)) return error.TargetChanged;

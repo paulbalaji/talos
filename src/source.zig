@@ -20,6 +20,7 @@ const thread_excerpt_limit = 2 * 1024;
 const max_thread_excerpts = 12;
 pub const max_requests = core.max_evidence_requests;
 const supplement_limit = 16 * 1024;
+const scraper_context_limit = 10 * 1024;
 const delta_limit = 12 * 1024;
 const excerpt_blob_limit = 128 * 1024;
 const excerpt_line_limit = 120;
@@ -253,6 +254,17 @@ pub const Git = struct {
         if (sensitive_count != 0) try coverage.append(a, try io.fmt(a, "Sensitive changed paths omitted: {d}.", .{sensitive_count}));
         if (patch_count != 0) try coverage.append(a, try io.fmt(a, "Files without a GitHub patch: {d}.", .{patch_count}));
         if (invalid_path_count != 0) try coverage.append(a, try io.fmt(a, "Unsupported changed paths omitted: {d}.", .{invalid_path_count}));
+        if (std.ascii.eqlIgnoreCase(self.object_cache.repo.name, github.registry_pin_source)) {
+            var scraper_bytes: usize = @min(scraper_context_limit, remaining);
+            const budget = scraper_bytes;
+            for (scraperEvidenceRequests(files, patch)) |request| {
+                _ = self.appendExcerpt(path, pr.headRefOid, request, null, &evidence, &scraper_bytes) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => continue,
+                };
+            }
+            remaining -= budget - scraper_bytes;
+        }
         const logo_only = core.registryMain(self.object_cache.repo, pr) and coverage.items.len == 0 and
             registry_logo.candidate(files, patch) and try self.appendStaticRegistryLogos(path, merge_base, pr.headRefOid, files, &evidence, remaining);
         var offset: usize = 0;
@@ -299,6 +311,7 @@ pub const Git = struct {
                 for (files) |file| {
                     if (!eq(u8, file.filename, agent_image.pin_path) or !eq(u8, file.status, "modified")) continue;
                     image = try self.appendAgentImages(path, pr, merge_base, files.len == 1, &evidence, &coverage);
+                    if (scraperPinsTouched(patch)) try self.appendScraperImages(path, merge_base, pr.headRefOid, &evidence, &coverage);
                     break;
                 }
             }
@@ -487,7 +500,7 @@ pub const Git = struct {
                     error.OutOfMemory => return err,
                     else => break :check false,
                 };
-                const run = client.agentImageBuild(commit, tag, digest, &timer, registry.limit) catch |err| switch (err) {
+                const run = client.agentImageBuild(.agent, commit, tag, digest, &timer, registry.limit) catch |err| switch (err) {
                     error.OutOfMemory, error.GitHubRateLimited => return err,
                     else => break :check false,
                 };
@@ -502,6 +515,91 @@ pub const Git = struct {
             return .{ .promotion = true, .optional_start = try self.appendPromotionConfig(path, rollout.previous, rollout.commit, evidence) };
         }
         return .{ .optional_start = try self.appendAgentDiff(path, before, after, commits, evidence, coverage) };
+    }
+
+    fn appendScraperImages(self: Git, path: []const u8, base: []const u8, head: []const u8, evidence: *std.ArrayList(u8), coverage: *std.ArrayList([]const u8)) !void {
+        const before = agent_image.scraperPins(self.readAgentPinFile(path, base) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return,
+        }) orelse return;
+        const after = agent_image.scraperPins(self.readAgentPinFile(path, head) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return,
+        }) orelse return;
+        var any_changed = false;
+        for (before, after) |old, new| if (!eq(u8, old, new)) {
+            any_changed = true;
+            break;
+        };
+        if (!any_changed) return;
+        const a = self.cmd.a;
+        const writer = evidence.writer(a);
+        try writer.writeAll("\nPinned scraper and scraper-proxy rollout evidence:\n");
+        var excerpt_bytes: usize = 6 * 1024;
+        const deployment_sources = [_]core.EvidenceRequest{
+            .{ .path = "typescript/infra/config/environments/mainnet3/agent.ts", .start_line = null, .end_line = null, .line_contains = "tag: mainnetDockerTags.scraper," },
+            .{ .path = "typescript/infra/config/environments/testnet4/agent.ts", .start_line = null, .end_line = null, .line_contains = "tag: testnetDockerTags.scraper," },
+            .{ .path = "rust/main/helm/hyperlane-agent/templates/scraper-deployment.yaml", .start_line = 1, .end_line = 90 },
+            .{ .path = "rust/main/helm/hyperlane-agent/templates/scraper-proxy-deployment.yaml", .start_line = 1, .end_line = 90 },
+        };
+        for (deployment_sources) |request| {
+            _ = self.appendExcerpt(path, head, request, null, evidence, &excerpt_bytes) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => continue,
+            };
+        }
+        var timer = try std.time.Timer.start();
+        var network_env = std.process.EnvMap.init(a);
+        defer network_env.deinit();
+        var command = self.cmd;
+        command.env = &network_env;
+        const curl = io.executable(a, self.cmd.env.get("PATH") orelse "/usr/bin:/bin", "curl") catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => "",
+        };
+        const client: github.Client = .{ .cmd = self.cmd, .gh = self.gh, .repo = self.object_cache.repo.name, .calls = self.github_calls };
+        for ([_]agent_image.Image{ .agent, .node_services }, 0..) |image, role| {
+            var tags: std.ArrayList([]const u8) = .empty;
+            for (0..agent_image.environments.len) |env| {
+                const index = env * agent_image.scraper_roles.len + role;
+                if (eq(u8, before[index], after[index])) continue;
+                for ([_][]const u8{ before[index], after[index] }) |tag| {
+                    for (tags.items) |known| {
+                        if (eq(u8, tag, known)) break;
+                    } else try tags.append(a, tag);
+                }
+            }
+            if (tags.items.len == 0) continue;
+            const registry: agent_image.Client = .{ .cmd = command, .curl = curl, .timer = &timer, .limit = 45, .image = image };
+            const token = if (curl.len == 0) null else registry.token() catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => null,
+            };
+            for (tags.items) |tag| {
+                const verified = check: {
+                    if (!agent_image.validTag(tag)) break :check false;
+                    const bearer = token orelse break :check false;
+                    const commit = self.resolveAgentCommit(path, tag) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => break :check false,
+                    };
+                    const digest = registry.digest(bearer, tag) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => break :check false,
+                    };
+                    const run = client.agentImageBuild(image, commit, tag, digest, &timer, registry.limit) catch |err| switch (err) {
+                        error.OutOfMemory, error.GitHubRateLimited => return err,
+                        else => {
+                            try writer.print("Observed ghcr.io/{s}:{s}@{s}. The tag names source {s}. Talos could not corroborate the digest from the main build.\n", .{ image.repository(), tag, digest, commit });
+                            break :check false;
+                        },
+                    };
+                    try writer.print("Verified ghcr.io/{s}:{s}@{s} against main workflow run {d} at source {s}.\n", .{ image.repository(), tag, digest, run, commit });
+                    break :check true;
+                };
+                if (!verified) try coverage.append(a, try io.fmt(a, "Could not verify the published digest against a main build for {s}:{s}.", .{ image.repository(), tag }));
+            }
+        }
     }
 
     fn agentPromotion(self: Git, path: []const u8, pr: core.Pull, base: []const u8, before: agent_image.Pins, after: agent_image.Pins, tag: []const u8) !?AgentPromotion {
@@ -950,6 +1048,52 @@ pub const Git = struct {
         return blobs;
     }
 };
+
+fn scraperEvidenceRequests(files: []const github.File, diff: []const u8) []const core.EvidenceRequest {
+    for (files) |file| {
+        if (eq(u8, file.filename, "typescript/scraper-proxy/src/scraperdb/scraperdb.service.ts") or
+            eq(u8, file.filename, "rust/main/agents/scraper/src/near_head/store.rs") or
+            eq(u8, file.filename, "rust/main/agents/scraper/src/near_head/store/snapshot.rs")) break;
+    } else return &.{};
+    const snapshot = std.mem.indexOf(u8, diff, "merkle_tree_snapshot") != null;
+    const insertion = std.mem.indexOf(u8, diff, "confirmed_merkle_tree_insertion") != null;
+    const snapshot_sources = [_]core.EvidenceRequest{
+        .{ .path = "rust/main/agents/scraper/migration/src/m20261125_000022_merkle_tree_snapshot.rs", .start_line = 1, .end_line = 44 },
+        .{ .path = "rust/main/agents/scraper/src/near_head/store.rs", .start_line = null, .end_line = null, .line_contains = "pub async fn confirm(" },
+    };
+    const insertion_sources = [_]core.EvidenceRequest{
+        .{ .path = "rust/main/agents/scraper/migration/src/frontier_publication.sql", .start_line = null, .end_line = null, .line_contains = "CREATE VIEW confirmed_merkle_tree_insertion AS" },
+    };
+    const proxy_sources = [_]core.EvidenceRequest{
+        .{ .path = "typescript/scraper-proxy/src/live/protocol.ts", .start_line = null, .end_line = null, .line_contains = "export function parseId(" },
+        .{ .path = "typescript/scraper-proxy/src/db/db.service.ts", .start_line = null, .end_line = null, .line_contains = "pg.types.setTypeParser(17," },
+    };
+    if (snapshot and insertion) return &(snapshot_sources ++ insertion_sources ++ proxy_sources);
+    if (snapshot) return &(snapshot_sources ++ proxy_sources);
+    if (insertion) return &(insertion_sources ++ proxy_sources);
+    return &.{};
+}
+
+fn scraperPinsTouched(diff: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, diff, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0 or (line[0] != '+' and line[0] != '-')) continue;
+        const field = std.mem.trimStart(u8, line[1..], " \t");
+        if (std.mem.startsWith(u8, field, "scraper:") or std.mem.startsWith(u8, field, "scraperProxy:")) return true;
+    }
+    return false;
+}
+
+test "scraper projection evidence includes the migration and writer from the pinned tree" {
+    const files = &[_]github.File{.{ .filename = "typescript/scraper-proxy/src/scraperdb/scraperdb.service.ts" }};
+    const requests = scraperEvidenceRequests(files, "+FROM merkle_tree_snapshot");
+    try std.testing.expectEqual(@as(usize, 4), requests.len);
+    try std.testing.expect(std.mem.endsWith(u8, requests[0].path, "m20261125_000022_merkle_tree_snapshot.rs"));
+    try std.testing.expectEqualStrings("pub async fn confirm(", requests[1].line_contains.?);
+    try std.testing.expectEqual(@as(usize, 0), scraperEvidenceRequests(&.{.{ .filename = "README.md" }}, "+merkle_tree_snapshot").len);
+    try std.testing.expect(scraperPinsTouched("+  scraperProxy: '340f0f9-20261126-095428',"));
+    try std.testing.expect(!scraperPinsTouched("   scraper: 'existing-tag',\n+  relayer: 'new-tag',"));
+}
 
 fn registryPatchComplete(file: github.File) bool {
     const additions = file.additions orelse return false;

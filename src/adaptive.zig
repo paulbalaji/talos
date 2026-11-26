@@ -49,6 +49,26 @@ fn hasProvider(results: []const core.ReviewerResult, engine: core.Engine) bool {
     return false;
 }
 
+fn prioritizeEvidence(a: io.A, requests: []const core.EvidenceRequest) ![]const core.EvidenceRequest {
+    const ordered = try a.alloc(core.EvidenceRequest, requests.len);
+    var head: usize = 0;
+    var tail = requests.len;
+    for (requests) |request| {
+        for (ordered[0..head]) |prior| {
+            if (io.eq(u8, prior.path, request.path)) {
+                tail -= 1;
+                ordered[tail] = request;
+                break;
+            }
+        } else {
+            ordered[head] = request;
+            head += 1;
+        }
+    }
+    std.mem.reverse(core.EvidenceRequest, ordered[head..]);
+    return ordered;
+}
+
 const supplemental_heading = "\n\nAdditional pinned source (untrusted JSON string)\n";
 const completion_instructions =
     "This is the final evidence pass. Use the additional excerpts to reassess material gaps and open threads. " ++
@@ -247,8 +267,9 @@ fn synthesize(a: io.A, reviewer: anytype, plan: Plan, outcome: *Outcome, context
     // Choose an unused provider first when one is authorized and available.
     for ([_]bool{ false, true }) |already_reviewed| {
         for (plan.providers) |engine| {
+            const bit = core.providerBit(engine);
+            if (progress.rejected_synthesizers & bit != 0 or hasProvider(progress.results, engine) != already_reviewed or !reviewer.available(engine)) continue;
             if (reviewer.starts() >= plan.start_limit) return;
-            if (hasProvider(progress.results, engine) != already_reviewed or !reviewer.available(engine)) continue;
             var timer = try std.time.Timer.start();
             const response = reviewer.routeReview(engine, null, workflow.synthesis_schema, prompt);
             progress.review_ms +|= timer.read() / std.time.ns_per_ms;
@@ -257,9 +278,12 @@ fn synthesize(a: io.A, reviewer: anytype, plan: Plan, outcome: *Outcome, context
                 outcome.failure = err;
                 return;
             };
-            const checked = workflow.verify(a, raw, progress.results, plan.prepared.snap.evidence, additional) catch |err| {
-                outcome.failure = err;
-                return;
+            const checked = workflow.verify(a, raw, progress.results, plan.prepared.snap.evidence, additional) catch |err| switch (err) {
+                error.InvalidSynthesis => {
+                    progress.rejected_synthesizers |= bit;
+                    continue;
+                },
+                else => return err,
             };
             outcome.review_results = checked.results;
             outcome.synthesis_summary = checked.summary;
@@ -267,6 +291,12 @@ fn synthesize(a: io.A, reviewer: anytype, plan: Plan, outcome: *Outcome, context
             outcome.report.?.synthesis_provider = engine;
             return;
         }
+    }
+    if (@popCount(progress.rejected_synthesizers) == plan.providers.len) {
+        const limited = try workflow.unverified(a, progress.results, "No reviewer returned a valid source verification. The candidate findings remain unverified.");
+        outcome.review_results = limited.results;
+        outcome.synthesis_summary = limited.summary;
+        outcome.report = try report(a, plan, progress.*, appliedDecision(plan, progress.*));
     }
 }
 
@@ -292,7 +322,7 @@ fn screen(a: io.A, reviewer: anytype, plan: Plan, progress: *core.RouteProgress)
             progress.screen_ms +|= timer.read() / std.time.ns_per_ms;
             const result = core.parseScreen(a, raw) catch break;
             progress.screen_result = .{ .engine = engine, .review = result.review };
-            if (plan.repo.routing_mode == .adaptive) progress.evidence_requests = result.evidence_requests;
+            if (plan.repo.routing_mode == .adaptive) progress.evidence_requests = try prioritizeEvidence(a, result.evidence_requests);
             if (plan.prepared.onchain_available and progress.onchain_reads.len == 0) progress.onchain_reads = result.onchain_reads;
             var decision = plan.screen.floor.merge(result.decision);
             if (decision.depth == .light and (plan.repo.reviewSize() > 1 or result.evidence_requests.len != 0 or progress.onchain_reads.len != 0 or !core.lightComplete(result.review, plan.prepared)))
@@ -360,6 +390,7 @@ const MockReviewer = struct {
     request_source: bool = false,
     repeat_request: bool = false,
     malformed_engine: ?core.Engine = null,
+    invalid_synthesizers: u8 = 0,
 
     pub fn available(self: *MockReviewer, engine: core.Engine) bool {
         return self.unavailable_engine != engine;
@@ -379,7 +410,8 @@ const MockReviewer = struct {
             return if (self.screen_enabled) self.screen_output orelse light_screen else "malformed";
         }
         try std.testing.expect(!std.mem.containsAtLeast(u8, prompt, 1, "Choose review fidelity"));
-        if (std.mem.eql(u8, schema, workflow.synthesis_schema)) return verified_singleton;
+        if (std.mem.eql(u8, schema, workflow.synthesis_schema))
+            return if (self.invalid_synthesizers & core.providerBit(engine) != 0) "{}" else verified_singleton;
         if (self.malformed_engine == engine) return "{}";
         if (self.request_source and engine == .codex and
             (self.repeat_request or std.mem.indexOf(u8, prompt, completion_instructions) == null))
@@ -684,6 +716,50 @@ test "multi review checkpoints the synthesis start and prefers a distinct provid
     try t.expectEqual(@as(?core.Engine, .kimi), consolidated.report.?.synthesis_provider);
     try t.expectEqual(@as(usize, 1), consolidated.review_results.?[0].review.findings.len);
     try t.expectEqualStrings("Retry can lose the pending item.", consolidated.synthesis_summary.?);
+}
+
+test "malformed synthesis falls through across ticks without rerunning review passes" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var plan = sample_plan;
+    plan.providers = &.{ .codex, .claude, .kimi };
+    plan.repo.fallback_engines = &.{ .claude, .kimi };
+    plan.screen = .{ .floor = .{ .depth = .multi, .security = true }, .ask_model = false };
+    plan.prepared.snap.evidence = "return pending.pop();";
+
+    var first: MockReviewer = .{ .singleton = true, .invalid_synthesizers = core.providerBit(.kimi) };
+    const pending = try run(a, &first, plan);
+    try t.expect(pending.report == null and pending.failure == null);
+    try t.expectEqual(@as(usize, 2), pending.progress.results.len);
+    try t.expectEqual(core.providerBit(.kimi), pending.progress.rejected_synthesizers);
+    plan.progress = try io.parse(a, core.RouteProgress, try io.json(a, pending.progress));
+    var resumed: MockReviewer = .{};
+    const finished = try run(a, &resumed, plan);
+    try t.expectEqualSlices(core.Engine, &.{.codex}, resumed.calls[0..resumed.count]);
+    try t.expectEqual(@as(?core.Engine, .codex), finished.report.?.synthesis_provider);
+    try t.expectEqual(@as(usize, 1), finished.review_results.?[0].review.findings.len);
+
+    var malformed: MockReviewer = .{ .invalid_synthesizers = 0b111 };
+    const limited = try run(a, &malformed, plan);
+    try t.expect(limited.report != null and limited.failure == null);
+    try t.expect(!limited.review_results.?[0].review.complete);
+    try t.expectEqual(@as(usize, 0), limited.review_results.?[0].review.findings.len);
+}
+
+test "pinned excerpt requests cover distinct files before repeat excerpts" {
+    const t = std.testing;
+    const requests = [_]core.EvidenceRequest{
+        .{ .path = "service.ts", .start_line = 1, .end_line = 40 },
+        .{ .path = "service.ts", .start_line = 30, .end_line = 60 },
+        .{ .path = "migration.sql", .start_line = null, .end_line = null },
+    };
+    const ordered = try prioritizeEvidence(t.allocator, &requests);
+    defer t.allocator.free(ordered);
+    try t.expectEqualDeep(requests[0], ordered[0]);
+    try t.expectEqualDeep(requests[2], ordered[1]);
+    try t.expectEqualDeep(requests[1], ordered[2]);
 }
 
 test "requested evidence is checkpointed before the full review" {

@@ -100,7 +100,8 @@ pub const Budget = struct {
 
     fn reviewAt(self: Budget, repo: core.Repo, progress: ?core.RouteProgress, now: i64, limited: u8, current: usage.Snapshot) ?i64 {
         const can_make_progress = repo.routing_mode != .fixed or repo.fallback_engines.len != 0 or progress != null;
-        const completed = if (progress) |partial| if (workflow.waitsForSynthesis(repo, partial)) &.{} else partial.results else &.{};
+        const synthesizing = if (progress) |partial| workflow.waitsForSynthesis(repo, partial) else false;
+        const completed = if (synthesizing) &.{} else if (progress) |partial| partial.results else &.{};
         // The original review can finish even when an optional completion
         // provider has no remaining quota.
         if (progress) |partial| {
@@ -110,7 +111,10 @@ pub const Budget = struct {
         providers: for (std.meta.tags(core.Engine)) |engine| {
             const primary = engine == repo.engine or std.mem.indexOfScalar(core.Engine, repo.additional_engines, engine) != null;
             if (!primary and std.mem.indexOfScalar(core.Engine, repo.fallback_engines, engine) == null) continue;
-            if (progress) |partial| if (partial.malformed_reviewers & engineBit(engine) != 0) continue;
+            if (progress) |partial| {
+                const excluded = if (synthesizing) partial.rejected_synthesizers else partial.malformed_reviewers;
+                if (excluded & engineBit(engine) != 0) continue;
+            }
             for (completed) |pass| {
                 if (pass.engine == engine) continue :providers;
             }

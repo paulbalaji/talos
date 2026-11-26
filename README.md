@@ -68,6 +68,8 @@ After a review, Talos checks for substantive PR conversation, human replies to r
 
 Talos puts files with active review threads and risky code early in the bounded diff. It also reads pinned source around current right-side thread anchors. Incomplete current evidence and unassessed open threads prevent approval. Reviewers can still approve when the current head is fully covered and the only gap is a clipped historical delta.
 
+A new thread containing only automated replies does not invalidate an in-flight review. Edits to reviewed threads and new human threads still require current inputs.
+
 If a rereview finds an issue after an approval, its comment flags the earlier approval for a person to reassess. On upgrade, Talos uses newer human replies to catch up completed reviews. It tracks resolution changes from the first successful scan.
 
 Rereviews update the local verdict. Talos posts new actionable findings, an approval for a commit that does not already have one from the configured GitHub account, or a warning when an earlier approval needs reassessing. See summaries and coverage details in `talos result`. A custom review with `--publish` can post its requested summary.
@@ -139,7 +141,7 @@ Talos routes contract changes, ownership and signing changes, deployment permiss
 
 In adaptive routing, changes to Hyperlane's production CCIP Read verification and commit/reveal authentication use the security, reliability, and performance lenses with every configured full reviewer at maximum effort. Dependent PRs inherit that route from a reviewed open ancestor at the same pinned revision. To request it for all current open members of a GitHub stack, run `talos stack OWNER/REPO STACK_NUMBER --all-maxxing`.
 
-On scheduled reviews, the screening model can request up to six specific files or excerpts from the pinned commit. Talos fetches those itself before starting the full review. A multi review with findings may use one more reviewer start for synthesis. If the current tick has no starts left, Talos saves the completed passes and finishes on a later tick.
+On scheduled reviews, the screening model can request up to six specific files or excerpts from the pinned commit. Talos reads one excerpt per distinct file before repeats. Changes to Hyperlane Merkle snapshot and insertion projections also get pinned schema, writer, and database adapter excerpts. Multi review uses a synthesis pass to verify candidate claims. If that response is malformed, Talos retains the independent passes and tries an eligible provider, resuming on a later tick if needed.
 
 ### Configure provider fallback
 
@@ -171,6 +173,8 @@ When a PR in `hyperlane-xyz/hyperlane-monorepo` changes `.registryrc`, Talos rea
 ### Review relayer image pins
 
 For PRs targeting `hyperlane-xyz/hyperlane-monorepo` main, Talos recognizes relayer image tags of the form `abcdef0-20261124-185322` in `typescript/infra/config/docker.ts`. It reads the pinned deployment selectors, hashes the public GHCR manifests, and matches each tagged digest to a successful main build log for the exact source commit. Reviewers receive the changed build input inventory for each image pair and bounded patch excerpts, with bundled runtime configuration first. These read-only observations describe the tags at review time. Missing build records, an incomplete inventory, or a material gap identified by a reviewer withhold automatic approval.
+
+Scraper and scraper-proxy pins use the same digest verification with their respective Rust agent and Node services workflows. Talos supplies the pinned rollout configuration for assessing migration order.
 
 When the entire change advances only relayer pins to one verified build already in the PR merge base, Talos reviews the deployment promotion in a regular pass. It checks that the previous builds are ancestors and verifies the affected deployment selectors. The reviewer checks the rollout and any concrete compatibility concerns. Normal discussion and approval rules apply.
 
