@@ -35,6 +35,8 @@ pub const FullPass = struct {
     engine: core.Engine,
     lens_index: usize,
     prompt: []const u8,
+    depth: ?routing.Depth = null,
+    completion: bool = false,
 };
 
 fn unavailable(err: anyerror) bool {
@@ -387,7 +389,7 @@ fn fullReviews(a: io.A, reviewer: anytype, plan: Plan, progress: *core.RouteProg
             occupied.set(lens);
             const prompt = try workflow.workerPrompt(a, context, applied, lens, required);
             if (prompt.len > core.review_context_limit) return error.ReviewContextLimit;
-            requests[count] = .{ .engine = engine, .lens_index = lens, .prompt = prompt };
+            requests[count] = .{ .engine = engine, .lens_index = lens, .prompt = prompt, .depth = applied.depth };
             count += 1;
             tried |= bit;
         }
@@ -433,8 +435,15 @@ fn runPasses(reviewer: anytype, requests: []const FullPass, responses: []anyerro
     if (comptime supportsParallel(@TypeOf(reviewer))) {
         if (requests.len > 1) return reviewer.routeParallel(requests, responses);
     }
+    const Reviewer = switch (@typeInfo(@TypeOf(reviewer))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(reviewer),
+    };
     for (requests, responses) |request, *response| {
-        response.* = reviewer.routeReview(request.engine, null, core.schema, request.prompt);
+        response.* = if (comptime @hasDecl(Reviewer, "routePass"))
+            reviewer.routePass(request)
+        else
+            reviewer.routeReview(request.engine, null, core.schema, request.prompt);
     }
 }
 
@@ -473,7 +482,7 @@ fn completeReviews(a: io.A, reviewer: anytype, plan: Plan, progress: *core.Route
         })});
         const prior_visible = prompt.len + prior.len <= core.review_context_limit;
         const retry_prompt = if (prior_visible) try std.mem.concat(a, u8, &.{ prompt, prior }) else prompt;
-        requests[count] = .{ .engine = result.engine, .prompt = retry_prompt, .lens_index = result.lens_index orelse index };
+        requests[count] = .{ .engine = result.engine, .prompt = retry_prompt, .lens_index = result.lens_index orelse index, .depth = applied.depth, .completion = true };
         recipients[count] = .{ .index = index, .prior_visible = prior_visible };
         count += 1;
     }

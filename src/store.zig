@@ -3,6 +3,7 @@ const io = @import("io.zig");
 const core = @import("core.zig");
 const queue = @import("queue.zig");
 const followup = @import("followup.zig");
+const telemetry = @import("telemetry.zig");
 const A = io.A;
 
 pub const State = struct {
@@ -145,11 +146,16 @@ pub const Store = struct {
             saved.history = history[0 .. count + retained];
         }
         try io.writeJson(self.dir, try self.resultPath(repo, number), saved);
+        if (saved.explanation) |detail| {
+            if (detail.publication == .local) self.recordVerdict(repo, number, saved.commit_id, saved.event, detail);
+        }
     }
 
     pub fn confirmResult(self: Store, repo: []const u8, number: u32, head: []const u8, followup_id: []const u8, event: core.Event, id: u64) !void {
         var saved = (try self.loadResult(repo, number)) orelse return;
-        if (saved.event != event or !io.eq(u8, saved.commit_id, head) or !confirmExplanation(&saved.explanation, followup_id, id)) {
+        const detail = if (saved.event == event and io.eq(u8, saved.commit_id, head) and confirmExplanation(&saved.explanation, followup_id, id))
+            saved.explanation.?
+        else historical: {
             // An ambiguous submission can outlive a newer head's verdict.
             for (saved.history, 0..) |prior, index| {
                 if (prior.event != event or !io.eq(u8, prior.commit_id, head)) continue;
@@ -158,10 +164,27 @@ pub const Store = struct {
                 const history = try self.a.dupe(core.PastResult, saved.history);
                 history[index] = updated;
                 saved.history = history;
-                break;
+                break :historical updated.explanation.?;
             } else return;
-        }
+        };
         try io.writeJson(self.dir, try self.resultPath(repo, number), saved);
+        self.recordVerdict(repo, number, head, event, detail);
+    }
+
+    fn recordVerdict(self: Store, repo: []const u8, number: u32, head: []const u8, event: core.Event, detail: core.Explanation) void {
+        if (detail.at <= 0) return;
+        telemetry.recordVerdict(self.dir, .{
+            .repo = repo,
+            .pr = number,
+            .head = head,
+            .event = event,
+            .at = detail.at,
+            .review_id = detail.followup_id,
+            .route = detail.route,
+            .complete = detail.coverage.complete,
+            .publication = if (detail.publication == .verified) .verified else .local,
+            .github_review_id = detail.github_review_id,
+        }) catch |err| std.log.warn("verdict telemetry: {s}", .{@errorName(err)});
     }
 };
 

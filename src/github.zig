@@ -93,7 +93,7 @@ pub const Client = struct {
         \\  repository(owner: $owner, name: $name) {
         \\    pullRequests(first: 100, after: $endCursor, states: [OPEN]) {
         \\      pageInfo { hasNextPage endCursor }
-        \\      nodes { number headRefOid baseRefOid headRefName baseRefName headRepository { nameWithOwner } isDraft nativeStack:stack { id number } }
+        \\      nodes { number title headRefOid baseRefOid headRefName baseRefName headRepository { nameWithOwner } isDraft nativeStack:stack { id number } }
         \\    }
         \\  }
         \\}

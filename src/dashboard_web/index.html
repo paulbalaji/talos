@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Talos review queue and usage on this computer">
+  <title>Talos · Review console</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="shell-header">
+    <div class="shell-inner">
+      <a class="wordmark" href="#queue" aria-label="Talos home"><span class="mark" aria-hidden="true"></span>Talos</a>
+      <nav aria-label="Dashboard">
+        <a href="#queue" data-view="queue" aria-current="page">Queue</a>
+        <a href="#history" data-view="history">History</a>
+        <a href="#usage" data-view="usage">Usage</a>
+      </nav>
+      <p id="sync-state" class="sync-state" role="status">Connecting…</p>
+    </div>
+  </header>
+
+  <main id="content" class="page" tabindex="-1">
+    <p id="connection-error" class="notice" role="alert" hidden></p>
+
+    <section id="queue-view" aria-labelledby="queue-title">
+      <header class="page-heading">
+        <h1 id="queue-title">Review queue</h1>
+        <p id="queue-summary" class="heading-meta">Loading reviews…</p>
+      </header>
+      <div class="queue-layout">
+        <div class="queue-main">
+          <form id="find-form" class="toolbar" role="search" aria-label="Find a pull request">
+            <label class="search-field">
+              <span class="sr-only">Find a pull request</span>
+              <input type="search" id="queue-search" placeholder="Find a PR or repository" autocomplete="off" spellcheck="false">
+            </label>
+            <label>
+              <span class="sr-only">Show reviews</span>
+              <select id="queue-filter">
+                <option value="active">Active queue</option>
+                <option value="tracked">All jobs</option>
+              </select>
+            </label>
+            <button type="submit" class="button button-secondary">Find PR</button>
+          </form>
+          <p id="find-message" class="notice" role="status" hidden></p>
+          <div id="queue-results" class="table-wrap"></div>
+          <section id="stacks-panel" class="subsection" aria-labelledby="stack-title" hidden>
+            <header class="section-heading">
+              <h2 id="stack-title">Active stacks</h2>
+            </header>
+            <div id="stacks"></div>
+          </section>
+        </div>
+        <aside class="rail" aria-label="Queue and watcher controls">
+          <section class="panel queue-panel" aria-labelledby="new-title">
+            <h2 id="new-title">Queue a review</h2>
+            <form id="queue-form">
+              <fieldset class="segmented">
+                <legend class="sr-only">Review target kind</legend>
+                <label><input type="radio" name="kind" value="pr" checked><span>Pull request</span></label>
+                <label><input type="radio" name="kind" value="stack"><span>Stack</span></label>
+              </fieldset>
+              <label class="field">
+                <span>GitHub link or number</span>
+                <input id="queue-target" name="target" required type="text" placeholder="With or without a repo" autocomplete="off" spellcheck="false" maxlength="360">
+              </label>
+              <label class="field">
+                <span>Repository</span>
+                <select id="queue-repo" name="repo"><option value="">Select a repository</option></select>
+              </label>
+              <label class="checkbox-field">
+                <input type="checkbox" name="all_models">
+                <span>All-model review</span>
+              </label>
+              <button type="submit" class="button button-primary" id="queue-submit">Queue review</button>
+              <p id="queue-message" role="status" hidden></p>
+            </form>
+          </section>
+          <section class="panel repo-panel" aria-labelledby="repo-title">
+            <header class="section-heading">
+              <h2 id="repo-title">Repositories</h2>
+              <span id="repo-count" class="minor mono"></span>
+            </header>
+            <ul id="repositories" class="repositories"></ul>
+          </section>
+        </aside>
+      </div>
+    </section>
+
+    <section id="history-view" aria-labelledby="history-title" hidden>
+      <header class="page-heading">
+        <h1 id="history-title">Review history</h1>
+        <p id="history-summary" class="heading-meta">Loading reviews…</p>
+      </header>
+      <div class="toolbar">
+        <label class="search-field">
+          <span class="sr-only">Filter saved reviews</span>
+          <input type="search" id="history-search" placeholder="Filter by PR or repository" autocomplete="off" spellcheck="false">
+        </label>
+        <label>
+          <span class="sr-only">Filter by publication</span>
+          <select id="history-filter">
+            <option value="">All verdicts</option>
+            <option value="published">Published</option>
+            <option value="local">Local only</option>
+          </select>
+        </label>
+      </div>
+      <div id="history-results" class="table-wrap"></div>
+    </section>
+
+    <section id="usage-view" aria-labelledby="usage-title" hidden>
+      <header class="page-heading">
+        <h1 id="usage-title">Reviewer usage</h1>
+        <label class="range-field">
+          <span class="sr-only">Time range</span>
+          <select id="metrics-range">
+            <option value="7">Last 7 days</option>
+            <option value="30" selected>Last 30 days</option>
+            <option value="90">Last 90 days</option>
+          </select>
+        </label>
+      </header>
+      <p id="metrics-notice" class="notice" role="status" hidden></p>
+      <div id="metrics-results" aria-live="off"></div>
+    </section>
+  </main>
+
+  <dialog id="review-dialog" aria-labelledby="detail-title">
+    <header class="dialog-header">
+      <div>
+        <p id="detail-repo" class="minor mono"></p>
+        <h2 id="detail-title">Review detail</h2>
+      </div>
+      <form method="dialog">
+        <button class="button button-secondary" autofocus>Close</button>
+      </form>
+    </header>
+    <div id="detail-body" class="dialog-body"></div>
+  </dialog>
+</body>
+</html>

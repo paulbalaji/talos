@@ -4,6 +4,7 @@ const shared = @import("shared.zig");
 
 pub const auth_env = [_][]const u8{ "KIMI_CODE_HOME", "KIMI_API_KEY" };
 pub const failure = error.KimiFailed;
+pub const default_model = "kimi-code/k3.1-pro";
 
 pub fn configureEnv(env: *std.process.EnvMap, profile: shared.Profile) !void {
     if (profile.effort != .default) try env.put("KIMI_MODEL_THINKING_EFFORT", @tagName(profile.effort));
@@ -22,10 +23,15 @@ pub fn prepare(cmd: io.Command, bin: []const u8, profile: shared.Profile, prompt
         \\
     );
     const args = try cmd.a.dupe([]const u8, &.{
-        bin,  "--skills-dir",                            "skills", "--agent-file", "reviewer.md", "--output-format", "stream-json",
-        "-m", profile.model orelse "kimi-code/k3.1-pro", "-p",     prompt,
+        bin,  "--skills-dir",                     "skills", "--agent-file", "reviewer.md", "--output-format", "stream-json",
+        "-m", profile.model orelse default_model, "-p",     prompt,
     });
     return .{ .args = args, .stdin = "" };
+}
+
+pub fn report(_: io.A, _: []const u8) shared.Report {
+    // Kimi Code’s stream-json prompt mode does not expose token counters.
+    return .{};
 }
 
 pub fn result(cmd: io.Command, output: []const u8) ![]const u8 {

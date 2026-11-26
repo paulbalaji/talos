@@ -203,12 +203,18 @@ pub fn claudeRateLimit(a: A, output: []const u8) bool {
     return eq(u8, envelope.value.type, "result") and envelope.value.is_error and envelope.value.api_error_status == 429;
 }
 
+pub const FailureOutput = struct {
+    context: *anyopaque,
+    observe: *const fn (*anyopaque, std.fs.File) void,
+};
+
 pub const Command = struct {
     a: A,
     env: *const std.process.EnvMap,
     cwd: [:0]const u8,
     dir: std.fs.Dir,
     transport: ?Transport = null,
+    failure_stdout: ?FailureOutput = null,
 
     // Unlinked files bound memory usage and avoid stdin/stdout pipe deadlocks.
     fn stream(self: Command, name: []const u8) !std.fs.File {
@@ -239,6 +245,9 @@ pub const Command = struct {
         defer stdin.close();
         const stdout = try self.stream("stdout");
         defer stdout.close();
+        // The subprocess cleanup below runs first, so an observer can safely
+        // extract a terminal protocol event from an otherwise failed run.
+        errdefer if (self.failure_stdout) |observer| observer.observe(observer.context, stdout);
         const stderr = try self.stream("stderr");
         defer stderr.close();
         try stdin.writeAll(input);

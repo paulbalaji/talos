@@ -6,6 +6,7 @@ const claude = @import("reviewers/claude.zig");
 const kimi = @import("reviewers/kimi.zig");
 const shared = @import("reviewers/shared.zig");
 const usage = @import("usage.zig");
+const metrics = @import("telemetry.zig");
 pub const Profile = shared.Profile;
 
 fn adapter(comptime engine: core.Engine) type {
@@ -28,6 +29,33 @@ pub fn configureEnvironment(engine: core.Engine, profile: Profile, parent: *cons
     }
 }
 
+const FailedOutput = struct {
+    a: io.A,
+    engine: core.Engine,
+    report: *shared.Report,
+
+    fn capture(ptr: *anyopaque, file: std.fs.File) void {
+        const self: *FailedOutput = @ptrCast(@alignCast(ptr));
+        const end = file.getEndPos() catch return;
+        const size: usize = @intCast(@min(end, 512 * 1024));
+        if (size == 0) return;
+        const buffer = self.a.alloc(u8, size) catch return;
+        defer self.a.free(buffer);
+        const count = file.preadAll(buffer, end - size) catch return;
+        self.report.* = switch (self.engine) {
+            inline else => |engine| adapter(engine).report(self.a, buffer[0..count]),
+        };
+    }
+};
+
+fn attemptOutcome(err: anyerror) metrics.Outcome {
+    return switch (err) {
+        error.ReviewerTimedOut => .timed_out,
+        error.CodexRateLimited, error.ClaudeRateLimited, error.KimiRateLimited => .rate_limited,
+        else => .failed,
+    };
+}
+
 pub const Runner = struct {
     cmd: io.Command,
     bin: []const u8,
@@ -35,6 +63,7 @@ pub const Runner = struct {
     profile: Profile,
     starts: ?*u32 = null,
     meter: ?*usage.Ledger = null,
+    telemetry: ?metrics.Recorder = null,
     schema: []const u8 = core.schema,
 
     pub fn review(self: Runner, prompt: []const u8) ![]const u8 {
@@ -46,18 +75,62 @@ pub const Runner = struct {
             inline else => |engine| {
                 const reviewer = adapter(engine);
                 const invocation = try reviewer.prepare(self.cmd, self.bin, self.profile, prompt, self.schema);
-                var cmd = self.cmd;
-                cmd.transport = @field(io.Transport, @tagName(engine));
                 if (self.meter) |meter| try meter.start(engine, std.time.timestamp());
                 if (self.starts) |count| count.* +|= 1;
-                const output = cmd.run(invocation.args, invocation.stdin, self.profile.timeout_seconds) catch |err| return switch (err) {
-                    error.SubprocessTimeout => error.ReviewerTimedOut,
-                    error.CodexRateLimited, error.ClaudeRateLimited, error.KimiRateLimited => err,
-                    else => reviewer.failure,
+                const recorder = self.telemetry orelse return self.run(engine, invocation, null);
+                var random: [16]u8 = undefined;
+                std.crypto.random.bytes(&random);
+                const id = std.fmt.bytesToHex(random, .lower);
+                var event: metrics.Event = .{
+                    .id = &id,
+                    .at = std.time.timestamp(),
+                    .kind = .started,
+                    .scope = recorder.scope,
+                    .engine = engine,
+                    .model = shared.modelLabel(self.profile.model orelse reviewer.default_model),
+                    .effort = self.profile.effort,
+                    .pid = @intCast(std.c.getpid()),
                 };
-                return reviewer.result(self.cmd, output);
+                recorder.write(self.cmd.a, event);
+                var timer = std.time.Timer.start() catch null;
+                var report: shared.Report = .{};
+                const returned = self.run(engine, invocation, &report);
+                event.kind = .finished;
+                event.at = std.time.timestamp();
+                event.duration_ms = if (timer) |*clock| clock.read() / std.time.ns_per_ms else null;
+                event.tokens = report.tokens;
+                event.model_usage = report.model_usage;
+                if (report.model_usage.len == 1) event.model = report.model_usage[0].model;
+                if (returned) |_| {
+                    event.outcome = .success;
+                } else |err| {
+                    event.outcome = attemptOutcome(err);
+                    event.error_name = @errorName(err);
+                }
+                recorder.write(self.cmd.a, event);
+                return returned;
             },
         }
+    }
+
+    fn run(self: Runner, comptime engine: core.Engine, invocation: shared.Invocation, report: ?*shared.Report) ![]const u8 {
+        const reviewer = adapter(engine);
+        var cmd = self.cmd;
+        cmd.transport = @field(io.Transport, @tagName(engine));
+        var failed: FailedOutput = undefined;
+        if (engine != .kimi) {
+            if (report) |capture| {
+                failed = .{ .a = cmd.a, .engine = engine, .report = capture };
+                cmd.failure_stdout = .{ .context = &failed, .observe = FailedOutput.capture };
+            }
+        }
+        const output = cmd.run(invocation.args, invocation.stdin, self.profile.timeout_seconds) catch |err| return switch (err) {
+            error.SubprocessTimeout => error.ReviewerTimedOut,
+            error.CodexRateLimited, error.ClaudeRateLimited, error.KimiRateLimited => err,
+            else => reviewer.failure,
+        };
+        if (report) |capture| capture.* = reviewer.report(cmd.a, output);
+        return reviewer.result(self.cmd, output);
     }
 };
 
@@ -69,6 +142,96 @@ test "reviewer envelope decoding preserves strict validation downstream" {
     const cmd: io.Command = .{ .a = a, .env = &env, .cwd = ".", .dir = std.fs.cwd() };
     try std.testing.expectEqualStrings("{\"complete\":true}", try kimi.result(cmd, "{\"role\":\"assistant\",\"content\":\"{\\\"complete\\\":true}\"}\n{\"role\":\"meta\",\"type\":\"session.resume_hint\"}\n"));
     try std.testing.expectEqualStrings("{\"complete\":true}", try claude.result(cmd, "{\"is_error\":false,\"structured_output\":{\"complete\":true}}"));
+}
+
+test "provider metadata preserves token semantics and does not interpret response text" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const reported = codex.report(a,
+        \\{"type":"turn.completed","usage":{"input_tokens":140,"output_tokens":40,"cached_input_tokens":80,"cache_write_input_tokens":7,"reasoning_output_tokens":21}}
+        \\{"type":"item.completed","usage":{"input_tokens":999}}
+    );
+    try t.expectEqual(@as(?u64, 140), reported.tokens.?.input);
+    try t.expectEqual(@as(?u64, 80), reported.tokens.?.cached_input);
+    try t.expectEqual(@as(?u64, 7), reported.tokens.?.cache_write_input);
+    try t.expectEqual(@as(?u64, 21), reported.tokens.?.reasoning_output);
+    try t.expect(codex.report(a, "{\"type\":\"turn.failed\",\"usage\":{\"input_tokens\":9}}").tokens == null);
+    const claude_report = claude.report(a,
+        \\{"type":"result","is_error":false,"usage":{"input_tokens":30,"output_tokens":14,"cache_read_input_tokens":100,"cache_creation_input_tokens":8},
+        \\"modelUsage":{"claude-opus":{"inputTokens":20,"outputTokens":10,"cacheReadInputTokens":80,"cacheCreationInputTokens":8},
+        \\"claude-fable":{"inputTokens":10,"outputTokens":4,"cacheReadInputTokens":20,"cacheCreationInputTokens":0}}}
+    );
+    try t.expectEqual(@as(?u64, 138), claude_report.tokens.?.input);
+    try t.expectEqual(@as(?u64, 14), claude_report.tokens.?.output);
+    try t.expectEqual(@as(usize, 2), claude_report.model_usage.len);
+    try t.expectEqualStrings("claude-opus", claude_report.model_usage[0].model);
+    try t.expectEqual(@as(?u64, 108), claude_report.model_usage[0].tokens.input);
+    try t.expectEqual(@as(?u64, 30), claude_report.model_usage[1].tokens.input);
+    const partial = claude.report(a, "{\"type\":\"result\",\"is_error\":true,\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}");
+    try t.expectEqual(@as(?u64, null), partial.tokens.?.input);
+    try t.expectEqual(@as(?u64, 0), partial.tokens.?.output);
+    try t.expect(kimi.report(a, "{\"role\":\"assistant\",\"content\":\"1234 tokens\"}").tokens == null);
+}
+
+test "reviewer attempts retain terminal usage through failure and timeout without persisting content" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var workspace = t.tmpDir(.{});
+    defer workspace.cleanup();
+    const cwd = try a.dupeZ(u8, try workspace.dir.realpathAlloc(a, "."));
+    const env = std.process.EnvMap.init(a);
+    const cmd: io.Command = .{ .a = a, .env = &env, .cwd = cwd, .dir = workspace.dir };
+    const recorder: metrics.Recorder = .{
+        .dir = workspace.dir,
+        .scope = .{ .repo = "example/repo", .pr = 15, .head = "0123456789abcdef", .section = 1, .section_count = 3, .stage = .completion },
+    };
+    const script =
+        \\#!/bin/sh
+        \\printf '%s' 'private-response-content' > result.json
+        \\printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":12,"cached_input_tokens":5,"output_tokens":8}}'
+        \\case "${0##*/}" in
+        \\    fail) exit 1;;
+        \\    timeout) /bin/sleep 10;;
+        \\esac
+    ;
+    const cases = [_]struct { name: []const u8, outcome: metrics.Outcome, err: ?anyerror }{
+        .{ .name = "success", .outcome = .success, .err = null },
+        .{ .name = "fail", .outcome = .failed, .err = error.CodexFailed },
+        .{ .name = "timeout", .outcome = .timed_out, .err = error.ReviewerTimedOut },
+    };
+    for (cases, 1..) |case, count| {
+        const bin = try workspace.dir.createFile(case.name, .{ .mode = 0o700 });
+        try bin.writeAll(script);
+        bin.close();
+        const runner: Runner = .{
+            .cmd = cmd,
+            .bin = try workspace.dir.realpathAlloc(a, case.name),
+            .engine = .codex,
+            .profile = .{ .effort = .max, .timeout_seconds = 1 },
+            .telemetry = recorder,
+        };
+        const reply = runner.review("private-review-prompt");
+        if (case.err) |expected| {
+            try t.expectError(expected, reply);
+        } else {
+            try t.expectEqualStrings("private-response-content", try reply);
+        }
+        const events = try metrics.read(a, workspace.dir, .{ .pr = 15 });
+        try t.expectEqual(count * 2, events.len);
+        try t.expectEqualStrings(events[1].id, events[0].id);
+        try t.expectEqual(metrics.Stage.completion, events[0].scope.stage);
+        try t.expectEqual(@as(?metrics.Outcome, case.outcome), events[0].outcome);
+        try t.expect(events[0].duration_ms != null);
+        try t.expectEqual(@as(?u64, 12), events[0].tokens.?.input);
+        try t.expectEqual(@as(?u64, 8), events[0].tokens.?.output);
+        const stored = try io.json(a, events);
+        try t.expect(std.mem.indexOf(u8, stored, "private-review-prompt") == null);
+        try t.expect(std.mem.indexOf(u8, stored, "private-response-content") == null);
+    }
 }
 
 test "reviewer command profiles pin default models and preserve explicit overrides" {

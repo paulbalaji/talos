@@ -44,6 +44,9 @@ talos status                          # See scans, queue, errors, and cache size
 | Remove an explicit local stack definition | `talos unstack OWNER/REPO feature` |
 | Inspect one repo or read JSON | `talos status OWNER/REPO` or `talos status --json` |
 | Show provider starts and cooldowns | `talos usage` |
+| Read review and token metrics as JSON | `talos metrics --days 30` |
+| Open the local dashboard | `talos dashboard` |
+| Keep the dashboard available on macOS | `talos dashboard install` |
 | Set a provider’s starts per UTC day | `talos usage codex 40` |
 | Show or set the review budget per tick | `talos queue-budget` or `talos queue-budget 3` |
 | Pause or resume reviews for a repo | `talos pause OWNER/REPO` or `talos resume OWNER/REPO` |
@@ -52,6 +55,14 @@ talos status                          # See scans, queue, errors, and cache size
 | List flags and commands | `talos --help` |
 
 `run-once` always previews. `tick` uses the configured publication policy. A numbered preview also works while its repo is paused.
+
+### Monitor reviews locally
+
+Open [the local dashboard](http://127.0.0.1:8749) after starting it. The queue shows tracked jobs, active reviewers, and completed source sections. The displayed percentage counts completed sections. Reviewers working on a section can still require additional evidence or synthesis, so the percentage is a coverage milestone and does not estimate time remaining. Look up a PR by URL or repository and number. You can also queue a PR or GitHub stack and select all-model review. The dashboard uses the same queue and publication policy as the CLI.
+
+The dashboard binds to loopback. Browser queue writes require a matching local origin. Keep it on the machine running Talos. Use `talos dashboard remove` to stop the macOS service, or `talos dashboard --port 8750` to run on another local port.
+
+Talos retains up to 90 UTC days of local attempt and verdict metadata. Attempt records include repository, PR, head, stage, reviewer, model, elapsed time, outcome, and provider-reported tokens when available. The dashboard gives totals by PR and review, and shows advisor model usage separately when the CLI attributes it. Cached input and reasoning tokens are parts of the corresponding input and output totals. The recorded-token share shows how much of the selected range can support token totals. CLI versions with no reported usage still contribute attempt counts. Previously saved verdicts appear in history, and token history begins when the telemetry-enabled watcher starts recording. The telemetry logs store metadata only.
 
 ### Focus a review
 

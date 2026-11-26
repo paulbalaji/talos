@@ -17,6 +17,9 @@ const usage_meter = @import("usage.zig");
 const followup = @import("followup.zig");
 const followup_git = @import("followup_git.zig");
 const onchain = @import("onchain.zig");
+const telemetry = @import("telemetry.zig");
+const dashboard = @import("dashboard.zig");
+const dashboard_data = @import("dashboard_data.zig");
 
 const eq = io.eq;
 const A = io.A;
@@ -29,6 +32,8 @@ const usage =
     \\talos [--home DIR] result OWNER/REPO PR
     \\talos [--home DIR] queue-budget [STARTS]
     \\talos [--home DIR] usage [ENGINE DAILY_STARTS]
+    \\talos [--home DIR] metrics [--days DAYS]
+    \\talos [--home DIR] dashboard [install|remove] [--port PORT]
     \\talos [--home DIR] queue OWNER/REPO PR [--all-maxxing] [--mode MODE] [--prompt TEXT [--publish]]
     \\talos [--home DIR] followup THREAD_URL [--dry-run | --merge-when-ready]
     \\talos [--home DIR] followup status [--json]
@@ -82,6 +87,16 @@ const Local = struct {
     programs: Programs,
     counts: ?*queue.TickCounts = null,
     meter: ?*usage_meter.Ledger = null,
+    telemetry: ?telemetry.Recorder = null,
+
+    fn forStage(self: Local, stage: telemetry.Stage, depth: ?routing.Depth) Local {
+        var tools = self;
+        if (tools.telemetry) |*recorder| {
+            recorder.scope.stage = stage;
+            recorder.scope.route = depth orelse recorder.scope.route;
+        }
+        return tools;
+    }
 
     fn command(self: Local, env: *const std.process.EnvMap) io.Command {
         return .{ .a = self.a, .env = env, .cwd = self.scratch, .dir = self.scratch_dir };
@@ -320,7 +335,7 @@ const Adapter = struct {
         const prompt = try core.screenPrompt(a, prepared);
         if (prompt.len > core.review_context_limit) return &.{};
         for (self.repo.light_models) |reviewer| {
-            const response = invokeReviewer(self.tools, reviewer.engine, .{ .model = reviewer.model, .effort = .default }, core.screen_schema, prompt) catch continue;
+            const response = invokeReviewer(self.tools.forStage(.screen, null), reviewer.engine, .{ .model = reviewer.model, .effort = .default }, core.screen_schema, prompt) catch continue;
             const result = core.parseScreen(a, response) catch continue;
             return self.onchainReads(prepared.pr, result.onchain_reads);
         }
@@ -366,6 +381,7 @@ fn invokeReviewer(tools: Local, engine: core.Engine, profile: runner.Profile, sc
         .profile = profile,
         .schema = schema,
         .meter = tools.meter,
+        .telemetry = tools.telemetry,
         .starts = if (tools.counts) |counts| &counts.reviewer_starts else null,
     };
     return reviewer.review(prompt);
@@ -412,6 +428,11 @@ const PreviewReviewer = struct {
     pub fn routeReview(self: PreviewReviewer, engine: core.Engine, _: ?[]const u8, schema: []const u8, prompt: []const u8) ![]const u8 {
         return invokeReviewer(self.adapter.tools, engine, reviewerProfile(self.adapter.repo, engine), schema, prompt);
     }
+
+    pub fn routePass(self: PreviewReviewer, request: adaptive.FullPass) ![]const u8 {
+        const tools = self.adapter.tools.forStage(if (request.completion) .completion else .preview, request.depth);
+        return invokeReviewer(tools, request.engine, reviewerProfile(self.adapter.repo, request.engine), core.schema, request.prompt);
+    }
 };
 
 fn limitedEngine(err: anyerror) ?core.Engine {
@@ -438,7 +459,7 @@ const ParallelPass = struct {
     }
 
     fn runInScratch(self: *ParallelPass) ![]const u8 {
-        var tools = self.worker.tools;
+        var tools = self.worker.tools.forStage(if (self.request.completion) .completion else .review, self.request.depth);
         tools.a = self.arena.allocator();
         tools.counts = &self.counts;
         const name = @tagName(self.request.engine);
@@ -520,8 +541,22 @@ const ReviewWorker = struct {
             runner.Profile{ .model = light, .effort = .default }
         else
             self.fullProfile(engine);
-        return invokeReviewer(self.tools, engine, profile, schema, prompt) catch |err| {
+        const tools = if (model != null)
+            self.tools.forStage(.screen, null)
+        else if (!eq(u8, schema, core.schema))
+            self.tools.forStage(.synthesis, .multi)
+        else
+            self.tools;
+        return invokeReviewer(tools, engine, profile, schema, prompt) catch |err| {
             self.noteRateLimit(engine, err);
+            return err;
+        };
+    }
+
+    pub fn routePass(self: *ReviewWorker, request: adaptive.FullPass) ![]const u8 {
+        const tools = self.tools.forStage(if (request.completion) .completion else .review, request.depth);
+        return invokeReviewer(tools, request.engine, self.fullProfile(request.engine), core.schema, request.prompt) catch |err| {
+            self.noteRateLimit(request.engine, err);
             return err;
         };
     }
@@ -600,8 +635,13 @@ const ReviewWorker = struct {
             .programs = self.adapter.tools.programs,
             .counts = &self.counts,
             .meter = self.batch.meter,
+            .telemetry = self.adapter.tools.telemetry,
         };
         if (self.plan) |plan| {
+            if (self.tools.telemetry) |*recorder| {
+                if (plan.prepared.sections.len != 0 and !plan.prepared.context_update)
+                    recorder.scope.section = plan.progress.sections.index + 1;
+            }
             self.route_outcome = try adaptive.run(a, self, plan);
             return undefined;
         }
@@ -626,6 +666,7 @@ const ReviewWorker = struct {
                 .plan = section.plan,
                 .policy = self.policy,
             };
+            if (worker.adapter.tools.telemetry) |*recorder| recorder.scope.section = section.index + 1;
             if (count == 1) {
                 worker.analyzeSectionWorker();
             } else {
@@ -744,7 +785,15 @@ const FollowupService = struct {
             try evidence.append(a, item);
         }
         const prompt = try followup.prompt(a, job, author.login, thread, file.text, input, evidence.items);
-        const answer = try invokeReviewer(self.app.local(self.repo), engine, reviewerProfile(self.repo, engine), followup.schema, prompt);
+        var tools = self.app.local(self.repo);
+        tools.telemetry = .{ .dir = self.app.db.dir, .scope = .{
+            .repo = self.repo.name,
+            .pr = source_pr.number,
+            .head = source_pr.headRefOid,
+            .mode = .followup,
+            .stage = .followup,
+        } };
+        const answer = try invokeReviewer(tools, engine, reviewerProfile(self.repo, engine), followup.schema, prompt);
         const change = try followup.proposal(a, answer);
         if (change.action != .fix) return .{ .head = parent, .change = change };
         const revised = try followup.edit(a, file.text, change);
@@ -1294,6 +1343,14 @@ const Main = struct {
             (entry.repo.routing_mode == .adaptive and work.prepared.options.allowRouting() and
                 (routing.messageVerificationChanged(entry.repo.name, work.adapter.files) or
                     stack.inheritsAllModels(work.prepared.inherited, entry.jobs)));
+        work.adapter.tools.telemetry = .{ .dir = self.db.dir, .scope = .{
+            .repo = entry.repo.name,
+            .pr = job.number,
+            .head = job.head,
+            .review_id = try core.followupId(self.a, job.*),
+            .focus = work.prepared.options.focus,
+            .section_count = if (work.prepared.sections.len != 0) work.prepared.sections.len else null,
+        } };
         if (job.analysis) |saved| {
             if (try saved.matches(self.a, entry.repo, work.prepared)) {
                 if (try self.db.paused(entry.repo.name)) return;
@@ -1579,15 +1636,9 @@ const Main = struct {
         const all_models = rerun or (args.len == 3 and eq(u8, args[2], "--all-maxxing"));
         if (!all_models and args.len != 2 and (args.len < 4 or args.len > stack.max_members + 2)) return error.Usage;
         const entry = state.find(args[0]) orelse return error.UnknownRepository;
-        const tools = self.local(entry.repo);
-        const env = try tools.githubEnv();
-        const client = try tools.gh(&env, entry.repo.name);
         if (all_models or args.len == 2) {
             const number = try prNumber(args[1]);
-            if (!std.ascii.eqlIgnoreCase(entry.repo.login, try client.identity())) return error.GitHubIdentityChanged;
-            const group = try client.nativeByNumber(number);
-            const count = try stack.queueNative(entry, self.a, group, if (all_models) .{ .all_models = true } else null, rerun);
-            try self.db.save(state);
+            const count = try self.enqueueStack(state, entry, number, all_models, rerun);
             return self.out("Queued {s} GitHub stack #{d} with {d} open PRs{s}\n", .{ entry.repo.name, number, count, if (all_models) " for all-model review" else "" });
         }
         const name = args[1];
@@ -1595,10 +1646,48 @@ const Main = struct {
         const numbers = members[0 .. args.len - 2];
         for (args[2..], numbers) |arg, *number| number.* = try prNumber(arg);
         try stack.validateRegistration(entry.*, name, numbers);
+        const tools = self.local(entry.repo);
+        const env = try tools.githubEnv();
+        const client = try tools.gh(&env, entry.repo.name);
         if (!std.ascii.eqlIgnoreCase(entry.repo.login, try client.identity())) return error.GitHubIdentityChanged;
         try stack.register(entry, self.a, name, try client.stackPulls(numbers));
         try self.db.save(state);
         try self.out("Queued {s} stack {s} with {d} PRs\n", .{ entry.repo.name, name, numbers.len });
+    }
+
+    fn enqueueStack(self: Main, state: *store.State, entry: *core.Entry, number: u32, all_models: bool, rerun: bool) !usize {
+        const group = try self.fetchNativeStack(entry.repo, number);
+        const count = try stack.queueNative(entry, self.a, group, if (all_models) .{ .all_models = true } else null, rerun);
+        try self.db.save(state);
+        return count;
+    }
+
+    fn fetchNativeStack(self: Main, repo: core.Repo, number: u32) !stack.NativeGroup {
+        const tools = self.local(repo);
+        const env = try tools.githubEnv();
+        const client = try tools.gh(&env, repo.name);
+        if (!std.ascii.eqlIgnoreCase(repo.login, try client.identity())) return error.GitHubIdentityChanged;
+        return client.nativeByNumber(number);
+    }
+
+    fn enqueuePull(self: Main, state: *store.State, entry: *core.Entry, number: u32, options: ?core.ReviewOptions) !core.Job {
+        const pull = try self.choose(entry, number);
+        return self.enqueuePinnedPull(state, entry, pull, options);
+    }
+
+    fn enqueuePinnedPull(self: Main, state: *store.State, entry: *core.Entry, pull: core.Pull, options: ?core.ReviewOptions) !core.Job {
+        if (options == null) {
+            for (entry.jobs) |job| {
+                if (job.number != pull.number or !eq(u8, job.head, pull.headRefOid)) continue;
+                if (job.phase == .complete or (job.phase == .pending and job.attempts == 0)) return job;
+            }
+        }
+        try entry.queue(self.a, pull, options);
+        try self.db.save(state);
+        for (entry.jobs) |job| {
+            if (job.number == pull.number and eq(u8, job.head, pull.headRefOid)) return job;
+        }
+        unreachable;
     }
 
     fn choose(self: Main, entry: *core.Entry, number: u32) !core.Pull {
@@ -1664,6 +1753,17 @@ const Main = struct {
             var gh_env: std.process.EnvMap = undefined;
             var live = try self.adapter(entry, state, &gh_env);
             var prepared = (try core.prepare(self.a, &live, entry.repo, &job, .{ .preview = preview })).?;
+            var preview_id: [16]u8 = undefined;
+            std.crypto.random.bytes(&preview_id);
+            live.tools.telemetry = .{ .dir = self.db.dir, .scope = .{
+                .repo = entry.repo.name,
+                .pr = job.number,
+                .head = job.head,
+                .mode = .preview,
+                .stage = .preview,
+                .review_id = try self.a.dupe(u8, &std.fmt.bytesToHex(preview_id, .lower)),
+                .focus = prepared.options.focus,
+            } };
             const observations = try live.previewReads(prepared);
             var context = prepared.context;
             prepared.additional_evidence_limited = try core.appendOnchain(self.a, &context, observations);
@@ -1882,9 +1982,129 @@ const Main = struct {
         };
     }
 
+    fn dashboardCommand(self: Main, args: []const []const u8) !void {
+        const manage = args.len != 0 and (eq(u8, args[0], "install") or eq(u8, args[0], "remove"));
+        const options = if (manage) args[1..] else args;
+        const port = switch (options.len) {
+            0 => dashboard.default_port,
+            2 => if (eq(u8, options[0], "--port")) std.fmt.parseUnsigned(u16, options[1], 10) catch return error.Usage else return error.Usage,
+            else => return error.Usage,
+        };
+        if (port == 0) return error.Usage;
+        if (!manage) return dashboard.serve(port, self);
+        const env = try pick(self.a, self.env, &common_env);
+        return launchd.manageDashboard(self.local(null).command(&env), self.home, self.env.get("PATH") orelse "/usr/bin:/bin", self.db.path, eq(u8, args[0], "install"), port);
+    }
+
+    pub fn api(context: Main, a: A, request: dashboard.Request) !dashboard.Response {
+        var self = context;
+        self.a = a;
+        self.db.a = a;
+        const body = self.dashboardRequest(request) catch |err| {
+            const failure: struct { status: std.http.Status, message: []const u8 } = switch (err) {
+                error.InvalidDashboardQuery => .{ .status = .bad_request, .message = "Invalid or repeated query parameter." },
+                error.BadQueueRequest => .{ .status = .bad_request, .message = "Select a repository and a valid PR or stack number." },
+                error.InvalidMetricsDays => .{ .status = .bad_request, .message = "Choose a range from 1 to 90 days." },
+                error.UnknownRepository => .{ .status = .not_found, .message = "Talos does not track that repository." },
+                error.AlreadyRunning => .{ .status = .conflict, .message = "Talos is saving queue changes. Try again in a moment." },
+                error.DashboardTargetChanged => .{ .status = .conflict, .message = "The repository or PR changed during lookup. Try again." },
+                error.PublicationUnconfirmed => .{ .status = .conflict, .message = "Talos is confirming an existing GitHub review." },
+                error.PullRequestNotReady, error.NoOpenStackMembers => .{ .status = .unprocessable_entity, .message = "There are no open PR heads to queue." },
+                error.GitHubPullFailed, error.GitHubStackFailed => .{ .status = .bad_gateway, .message = "GitHub could not load that PR or stack." },
+                error.GitHubIdentityChanged => .{ .status = .conflict, .message = "The GitHub account differs from the one configured for this repository." },
+                error.GitHubRateLimited => .{ .status = .too_many_requests, .message = "GitHub is rate limiting requests. Try again later." },
+                else => return err,
+            };
+            return .{ .status = failure.status, .body = try io.json(a, .{ .@"error" = failure.message }) };
+        };
+        return .{ .body = body };
+    }
+
+    fn dashboardRequest(self: Main, request: dashboard.Request) ![]const u8 {
+        const now = std.time.timestamp();
+        const query = try parseDashboardQuery(self.a, request.query);
+        switch (request.route) {
+            .state => {
+                if (query.repo != null or query.number != null or query.days != null) return error.InvalidDashboardQuery;
+                return dashboard_data.stateJson(self.a, self.db, query.history orelse false, now);
+            },
+            .metrics => {
+                if (query.repo != null or query.number != null or query.history != null) return error.InvalidDashboardQuery;
+                return dashboard_data.metricsJson(self.a, self.db, query.days orelse 30, now);
+            },
+            .review => {
+                if (query.days != null or query.history != null) return error.InvalidDashboardQuery;
+                const name = query.repo orelse return error.InvalidDashboardQuery;
+                if (!core.validRepoName(name)) return error.InvalidDashboardQuery;
+                return dashboard_data.reviewJson(self.a, self.db, name, query.number orelse return error.InvalidDashboardQuery, now);
+            },
+            .queue => {
+                if (request.query.len != 0) return error.InvalidDashboardQuery;
+                return self.dashboardQueue(request.body);
+            },
+        }
+    }
+
+    fn dashboardQueue(self: Main, body: []const u8) ![]const u8 {
+        const QueueRequest = struct { repo: []const u8, number: u32, kind: enum { pr, stack }, all_models: bool = false };
+        const input = std.json.parseFromSliceLeaky(QueueRequest, self.a, body, .{ .allocate = .alloc_always }) catch return error.BadQueueRequest;
+        if (!core.validRepoName(input.repo) or input.number == 0 or input.number > std.math.maxInt(i32)) return error.BadQueueRequest;
+        var observed = try self.db.load();
+        const earlier = observed.find(input.repo) orelse return error.UnknownRepository;
+        var request_app = self;
+        request_app.scratch = try io.temp(self.a);
+        defer std.fs.deleteTreeAbsolute(request_app.scratch) catch {};
+        request_app.scratch_dir = try std.fs.openDirAbsolute(request_app.scratch, .{});
+        defer request_app.scratch_dir.close();
+        const target: union(enum) { pr: core.Pull, stack: stack.NativeGroup } = switch (input.kind) {
+            .pr => .{ .pr = try request_app.choose(earlier, input.number) },
+            .stack => .{ .stack = try request_app.fetchNativeStack(earlier.repo, input.number) },
+        };
+        // Remote lookups can take seconds. Only the local queue transaction
+        // needs the same lock the CLI and watcher use.
+        const lock = try self.db.lock();
+        defer lock.close();
+        var state = try self.db.load();
+        const entry = state.find(input.repo) orelse return error.UnknownRepository;
+        if (!eq(u8, try io.json(self.a, earlier.repo), try io.json(self.a, entry.repo))) return error.DashboardTargetChanged;
+        const rescanned = entry.last_scan != earlier.last_scan;
+        const options: ?core.ReviewOptions = if (input.all_models) .{ .all_models = true } else null;
+        switch (target) {
+            .pr => |pull| {
+                if (rescanned and dashboardHeadChanged(entry.*, pull.number, pull.headRefOid)) return error.DashboardTargetChanged;
+                const job = try self.enqueuePinnedPull(&state, entry, pull, options);
+                const message = switch (job.phase) {
+                    .complete => "This head already has a review.",
+                    .uncertain => "Queued GitHub receipt reconciliation.",
+                    .pending, .failed => "Review queued.",
+                };
+                return io.json(self.a, .{ .repo = entry.repo.name, .number = input.number, .kind = input.kind, .head = job.head, .message = message });
+            },
+            .stack => |group| {
+                if (rescanned) for (group.pins) |pin| {
+                    if (pin.reviewable() and dashboardHeadChanged(entry.*, pin.number, pin.headRefOid)) return error.DashboardTargetChanged;
+                };
+                const count = try stack.queueNative(entry, self.a, group, options, false);
+                try self.db.save(&state);
+                return io.json(self.a, .{
+                    .repo = entry.repo.name,
+                    .number = input.number,
+                    .kind = input.kind,
+                    .count = count,
+                    .message = try io.fmt(self.a, "Queued stack #{d} with {d} open PRs.", .{ input.number, count }),
+                });
+            },
+        }
+    }
+
     fn dispatch(self: Main, args: []const []const u8) !void {
         const cmd = args[0];
         const params = args[1..];
+        if (eq(u8, cmd, "dashboard")) return self.dashboardCommand(params);
+        if (eq(u8, cmd, "metrics")) {
+            const days = if (params.len == 0) 30 else if (params.len == 2 and eq(u8, params[0], "--days")) try metricsDays(params[1]) else return error.Usage;
+            return self.out("{s}\n", .{try dashboard_data.metricsJson(self.a, self.db, days, std.time.timestamp())});
+        }
         if (eq(u8, cmd, "followup") and params.len > 0 and eq(u8, params[0], "status"))
             return self.followupStatus(try self.db.load(), params[1..]);
         if (eq(u8, cmd, "status")) {
@@ -1960,23 +2180,75 @@ const Main = struct {
         if (eq(u8, cmd, "queue") and params.len >= 2) {
             const options = if (params.len > 2) try reviewOptions(params[2..], true) else null;
             const entry = state.find(params[0]) orelse return error.UnknownRepository;
-            const pull = try self.choose(entry, try prNumber(params[1]));
-            try entry.queue(self.a, pull, options);
-            try self.db.save(&state);
-            for (entry.jobs) |job| {
-                if (job.number != pull.number or !eq(u8, job.head, pull.headRefOid)) continue;
-                if (job.phase == .uncertain) return self.out("Queued receipt reconciliation for {s} #{d} at {s}{s}\n", .{
-                    entry.repo.name,                                                           job.number, job.head,
-                    if (options != null) ". Review options apply only to new reviews" else "",
-                });
-                if (job.phase == .complete) return self.out("Already reviewed {s} #{d} at {s}\n", .{ entry.repo.name, job.number, job.head });
-                break;
-            }
-            return self.out("Selected {s} #{d} at {s}\n", .{ entry.repo.name, pull.number, pull.headRefOid });
+            const job = try self.enqueuePull(&state, entry, try prNumber(params[1]), options);
+            if (job.phase == .uncertain) return self.out("Queued receipt reconciliation for {s} #{d} at {s}{s}\n", .{
+                entry.repo.name,                                                           job.number, job.head,
+                if (options != null) ". Review options apply only to new reviews" else "",
+            });
+            if (job.phase == .complete) return self.out("Already reviewed {s} #{d} at {s}\n", .{ entry.repo.name, job.number, job.head });
+            return self.out("Selected {s} #{d} at {s}\n", .{ entry.repo.name, job.number, job.head });
         }
         return error.Usage;
     }
 };
+
+const DashboardQuery = struct { repo: ?[]const u8 = null, number: ?u32 = null, days: ?u32 = null, history: ?bool = null };
+
+fn dashboardHeadChanged(entry: core.Entry, number: u32, head: []const u8) bool {
+    for (entry.seen) |pull| {
+        if (pull.number == number) return !eq(u8, pull.head, head);
+    }
+    return false;
+}
+
+fn metricsDays(input: []const u8) !u32 {
+    const days = std.fmt.parseUnsigned(u32, input, 10) catch return error.InvalidMetricsDays;
+    if (days == 0 or days > telemetry.retention_days) return error.InvalidMetricsDays;
+    return days;
+}
+
+fn parseDashboardQuery(a: A, raw: []const u8) !DashboardQuery {
+    var query: DashboardQuery = .{};
+    if (raw.len == 0) return query;
+    var args = std.mem.splitScalar(u8, raw, '&');
+    while (args.next()) |arg| {
+        const equal = std.mem.indexOfScalar(u8, arg, '=') orelse return error.InvalidDashboardQuery;
+        const key = arg[0..equal];
+        const value = arg[equal + 1 ..];
+        if (eq(u8, key, "repo") and query.repo == null) {
+            query.repo = try decodeDashboardValue(a, value);
+        } else if (eq(u8, key, "number") and query.number == null) {
+            query.number = prNumber(value) catch return error.InvalidDashboardQuery;
+        } else if (eq(u8, key, "days") and query.days == null) {
+            query.days = try metricsDays(value);
+        } else if (eq(u8, key, "history") and query.history == null) {
+            query.history = if (eq(u8, value, "1")) true else if (eq(u8, value, "0")) false else return error.InvalidDashboardQuery;
+        } else return error.InvalidDashboardQuery;
+    }
+    return query;
+}
+
+fn decodeDashboardValue(a: A, raw: []const u8) ![]const u8 {
+    const value = try a.alloc(u8, raw.len);
+    var input: usize = 0;
+    var output: usize = 0;
+    while (input < raw.len) : (output += 1) {
+        switch (raw[input]) {
+            '%' => {
+                if (raw.len - input < 3) return error.InvalidDashboardQuery;
+                const high = std.fmt.charToDigit(raw[input + 1], 16) catch return error.InvalidDashboardQuery;
+                const low = std.fmt.charToDigit(raw[input + 2], 16) catch return error.InvalidDashboardQuery;
+                value[output] = high * 16 + low;
+                input += 3;
+            },
+            else => {
+                value[output] = raw[input];
+                input += 1;
+            },
+        }
+    }
+    return value[0..output];
+}
 
 fn reviewerTool(engine: core.Engine) Tool {
     return switch (engine) {
@@ -2066,7 +2338,22 @@ test {
     _ = @import("source.zig");
     _ = @import("runner.zig");
     _ = @import("log_retention.zig");
+    _ = @import("dashboard.zig");
+    _ = @import("dashboard_data.zig");
     _ = @import("tests.zig");
+}
+
+test "dashboard query accepts encoded repository names and rejects repeated or malformed parameters" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const query = try parseDashboardQuery(a, "repo=example%2Frepo&number=42");
+    try t.expectEqualStrings("example/repo", query.repo.?);
+    try t.expectEqual(@as(?u32, 42), query.number);
+    try t.expectError(error.InvalidDashboardQuery, parseDashboardQuery(a, "number=1&number=2"));
+    try t.expectError(error.InvalidDashboardQuery, parseDashboardQuery(a, "repo=example%2"));
+    try t.expectError(error.InvalidMetricsDays, parseDashboardQuery(a, "days=91"));
 }
 
 test "each reviewer combination registers with only its selected executables" {
