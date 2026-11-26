@@ -32,6 +32,7 @@ talos status                          # See scans, queue, errors, and cache size
 | Preview the next review in one repo | `talos run-once OWNER/REPO` |
 | Show or set the reviewer default for new repos | `talos defaults` or `talos defaults --engine claude` |
 | Queue a specific PR under the repo's publication policy | `talos queue OWNER/REPO 123` |
+| Queue every configured provider at maximum effort for one PR | `talos queue OWNER/REPO 123 --all-maxxing` |
 | Queue a review with a focus | `talos queue OWNER/REPO 123 --mode perf-maxxing --prompt 'Check allocations on the request path.' --publish` |
 | Read the latest local verdict, its evidence gaps, and recent verdict history | `talos result OWNER/REPO 123` |
 | Open a draft for a deferred finding | `talos followup THREAD_URL` |

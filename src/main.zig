@@ -29,7 +29,7 @@ const usage =
     \\talos [--home DIR] result OWNER/REPO PR
     \\talos [--home DIR] queue-budget [STARTS]
     \\talos [--home DIR] usage [ENGINE DAILY_STARTS]
-    \\talos [--home DIR] queue OWNER/REPO PR [--mode MODE] [--prompt TEXT [--publish]]
+    \\talos [--home DIR] queue OWNER/REPO PR [--all-maxxing] [--mode MODE] [--prompt TEXT [--publish]]
     \\talos [--home DIR] followup THREAD_URL [--dry-run | --merge-when-ready]
     \\talos [--home DIR] followup status [--json]
     \\talos [--home DIR] followup pause|resume THREAD_URL
@@ -1447,6 +1447,10 @@ const Main = struct {
                 options.publish_prompted = true;
                 continue;
             }
+            if (eq(u8, flag, "--all-maxxing") and allow_publish and !options.all_models) {
+                options.all_models = true;
+                continue;
+            }
             if (index == args.len) return error.Usage;
             const value = args[index];
             index += 1;
@@ -2055,6 +2059,9 @@ test "numbered preview accepts each mode and one operator prompt" {
     try t.expectError(error.Usage, Main.reviewOptions(&.{ "--prompt", "Check retries.", "--publish" }, false));
     try t.expectError(error.Usage, Main.reviewOptions(&.{"--publish"}, true));
     try t.expect((try Main.reviewOptions(&.{ "--publish", "--prompt", "Check retries." }, true)).publish_prompted);
+    try t.expect((try Main.reviewOptions(&.{"--all-maxxing"}, true)).all_models);
+    try t.expectError(error.Usage, Main.reviewOptions(&.{"--all-maxxing"}, false));
+    try t.expectError(error.Usage, Main.reviewOptions(&.{ "--all-maxxing", "--all-maxxing" }, true));
 }
 
 test "completion fits encoded excerpts and leaves room for later small requests" {
