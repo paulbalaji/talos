@@ -947,6 +947,7 @@ const Main = struct {
         try entry.discover(self.a, pulls, false);
         try stack.refresh(entry, self.a, pins);
         try stack.syncNative(entry, self.a, natives);
+        try stack.queueActiveNativeMembers(entry, self.a);
         try stack.autogroup(entry, self.a, pulls);
         try self.scanReviewInputs(entry, client, pulls);
     }

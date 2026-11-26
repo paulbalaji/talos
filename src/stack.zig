@@ -498,6 +498,31 @@ pub fn syncNative(entry: *core.Entry, a: io.A, discovered: []const NativeGroup) 
     entry.stacks = groups.items;
 }
 
+pub fn queueActiveNativeMembers(entry: *core.Entry, a: io.A) !void {
+    for (entry.stacks) |item| {
+        if (item.native == null) continue;
+        const active = for (item.members) |member| {
+            if (!member.pin.reviewable()) continue;
+            const job = matchingJob(entry.jobs, member.pin) orelse continue;
+            if (job.schedulable()) break true;
+        } else false;
+        if (!active) continue;
+
+        for (item.members) |member| {
+            const pin = member.pin;
+            if (!pin.reviewable() or matchingJob(entry.jobs, pin) != null) continue;
+            // Discovery applies the normal eligibility filters before recording
+            // these heads, including exclusions for managed followups.
+            for (entry.seen) |pull| {
+                if (pull.number == pin.number and io.eq(u8, pull.head, pin.headRefOid)) {
+                    try entry.queue(a, pin.pull(), null);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 pub fn queueNative(entry: *core.Entry, a: io.A, group: NativeGroup, options: ?core.ReviewOptions, rerun_completed: bool) !usize {
     var count: usize = 0;
     for (group.pins) |pin| {
@@ -857,6 +882,47 @@ test "GitHub order is authoritative for a 26-member stack" {
     pins[1].state = .MERGED;
     try syncNative(&entry, a, &.{group});
     try t.expect(!blocked(entry, entry.jobs[2]));
+}
+
+test "an active native stack queues missing open members and preserves saved work" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ref: NativeRef = .{ .id = "PRS_example", .number = 23 };
+    var parent = fixture_parent;
+    parent.nativeStack = ref;
+    var child = fixture_child;
+    child.nativeStack = ref;
+    var draft = child;
+    draft.number = 13;
+    draft.isDraft = true;
+    draft.headRefOid = updated_head;
+    var unobserved = child;
+    unobserved.number = 14;
+    var pins = [_]Pin{ parent, child, draft, unobserved };
+    const group: NativeGroup = .{ .ref = ref, .pins = &pins };
+    var entry: core.Entry = .{ .repo = fixture_repo };
+    try entry.discover(a, &.{ parent.pull(), child.pull(), draft.pull() }, true);
+    try syncNative(&entry, a, &.{group});
+    try queueActiveNativeMembers(&entry, a);
+    try t.expectEqual(@as(usize, 0), entry.jobs.len);
+
+    try entry.queue(a, child.pull(), null);
+    entry.jobs[0].route_progress = .{ .fingerprint = @splat(42) };
+    try queueActiveNativeMembers(&entry, a);
+    try t.expectEqual(@as(usize, 3), entry.jobs.len);
+    try t.expect(blocked(entry, matchingJob(entry.jobs, child).?));
+    try t.expect(!blocked(entry, matchingJob(entry.jobs, parent).?));
+    try t.expectEqual(core.Phase.pending, matchingJob(entry.jobs, draft).?.phase);
+    try t.expect(matchingJob(entry.jobs, unobserved) == null);
+
+    entry.jobs[1].phase = .complete;
+    try queueActiveNativeMembers(&entry, a);
+    try t.expectEqual(@as(usize, 3), entry.jobs.len);
+    try t.expectEqual(core.Phase.complete, matchingJob(entry.jobs, parent).?.phase);
+    try t.expectEqual(@as(u8, 42), matchingJob(entry.jobs, child).?.route_progress.?.fingerprint[0]);
+    try t.expect(!blocked(entry, matchingJob(entry.jobs, child).?));
 }
 
 pub const Block = struct { number: u32, reason: []const u8 };

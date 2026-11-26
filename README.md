@@ -105,7 +105,7 @@ With `--merge-when-ready`, Talos submits the current head for normal GitHub merg
 
 ### Review a PR stack
 
-When Talos scans open PRs, it uses the number and member order GitHub recorded for each `gh stack`. It reads that metadata through the GitHub API. Stack detection keeps the baseline intact and groups existing per-head jobs.
+When Talos scans open PRs, it uses the number and member order GitHub recorded for each `gh stack`. When a member has pending review work, Talos queues the stack's other open members, including drafts. Idle native stacks stay baselined, and completed reviews for the current heads are retained.
 
 For PRs without a GitHub stack, Talos can infer a linear chain when each PR targets the previous PR's branch and exact head in the same repo. Ambiguous or branched relationships stay in the ordinary queue. You can also define a local stack with two to eight ready PRs in one repo, bottom to top.
 
@@ -117,7 +117,7 @@ talos run-once OWNER/REPO 124
 talos unstack OWNER/REPO feature
 ```
 
-Talos waits for queued ancestor reviews or merges before starting the next scheduled PR. A baselined ancestor can contribute its pinned diff and any available review without starting a new model run. Reviewers see excerpts from the nearest ancestors, and Talos rechecks the entire ordered prefix before publication. Each PR keeps its own diff anchors and publication receipt. Use `status` to see the stack number, order, and why a PR is blocked. `unstack` removes an explicit local definition and keeps its queued jobs. A later scan can detect the chain again. [GitHub stack APIs](https://docs.github.com/en/pull-requests/reference/stacked-pull-requests-apis-and-webhooks)
+Talos waits for queued ancestor reviews or merges before starting the next scheduled PR. In an inferred stack, a baselined ancestor can contribute its pinned diff and any available review without starting a new model run. Reviewers see excerpts from the nearest ancestors, and Talos rechecks the entire ordered prefix before publication. Each PR keeps its own diff anchors and publication receipt. Use `status` to see the stack number, order, and why a PR is blocked. `unstack` removes an explicit local definition and keeps its queued jobs. A later scan can detect the chain again. [GitHub stack APIs](https://docs.github.com/en/pull-requests/reference/stacked-pull-requests-apis-and-webhooks)
 
 ### Route reviews by risk
 
