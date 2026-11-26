@@ -4,15 +4,43 @@ const eq = io.eq;
 
 pub const pin_path = "typescript/infra/config/docker.ts";
 pub const registry_image = "hyperlane-xyz/hyperlane-agent";
+pub const Image = enum {
+    agent,
+    node_services,
+
+    pub fn repository(self: Image) []const u8 {
+        return switch (self) {
+            .agent => registry_image,
+            .node_services => "hyperlane-xyz/hyperlane-node-services",
+        };
+    }
+
+    pub fn workflow(self: Image) []const u8 {
+        return switch (self) {
+            .agent => "rust-docker.yml",
+            .node_services => "node-services-docker.yml",
+        };
+    }
+};
 const registry = "https://ghcr.io";
 pub const max_tags = 6;
 pub const environments = [_][]const u8{ "mainnet3", "testnet4" };
 pub const exports = [_][]const u8{ "mainnetDockerTags", "testnetDockerTags" };
 pub const roles = [_][]const u8{ "relayer", "relayerRC", "relayerFastPath" };
 pub const Pins = [environments.len * roles.len][]const u8;
+pub const scraper_roles = [_][]const u8{ "scraper", "scraperProxy" };
+pub const ScraperPins = [environments.len * scraper_roles.len][]const u8;
 
 pub fn pins(blob: []const u8) ?Pins {
-    var result: Pins = @splat("");
+    return readPins(&roles, blob);
+}
+
+pub fn scraperPins(blob: []const u8) ?ScraperPins {
+    return readPins(&scraper_roles, blob);
+}
+
+fn readPins(comptime fields: []const []const u8, blob: []const u8) ?[environments.len * fields.len][]const u8 {
+    var result: [environments.len * fields.len][]const u8 = @splat("");
     var active: ?usize = null;
     var lines = std.mem.tokenizeScalar(u8, blob, '\n');
     while (lines.next()) |line| {
@@ -25,10 +53,10 @@ pub fn pins(blob: []const u8) ?Pins {
             continue;
         }
         if (eq(u8, line, "};")) active = null;
-        const base = (active orelse continue) * roles.len;
+        const base = (active orelse continue) * fields.len;
         const field = std.mem.trim(u8, line, " \t\r");
         const end = std.mem.indexOfScalar(u8, field, ':') orelse continue;
-        for (roles, 0..) |role, i| {
+        for (fields, 0..) |role, i| {
             if (!eq(u8, field[0..end], role)) continue;
             const value = std.mem.trim(u8, field[end + 1 ..], " \t");
             if (result[base + i].len != 0 or value.len < 4 or value[0] != '\'' or !std.mem.endsWith(u8, value, "',")) return null;
@@ -88,6 +116,7 @@ pub const Client = struct {
     curl: []const u8,
     timer: *std.time.Timer,
     limit: u32,
+    image: Image = .agent,
 
     fn get(self: Client, url: []const u8, headers: []const u8) ![]const u8 {
         const seconds = @min(5, try remainingSeconds(self.timer, self.limit));
@@ -100,7 +129,8 @@ pub const Client = struct {
     }
 
     pub fn token(self: Client) ![]const u8 {
-        const raw = try self.get(registry ++ "/token?scope=repository:" ++ registry_image ++ ":pull", "");
+        const url = try io.fmt(self.cmd.a, registry ++ "/token?scope=repository:{s}:pull", .{self.image.repository()});
+        const raw = try self.get(url, "");
         const response = try io.parse(self.cmd.a, struct { token: []const u8 }, raw);
         if (response.token.len == 0 or response.token.len > 4096 or std.mem.indexOfAny(u8, response.token, " \t\r\n\x00") != null)
             return error.InvalidImageToken;
@@ -110,7 +140,7 @@ pub const Client = struct {
     pub fn digest(self: Client, bearer: []const u8, tag: []const u8) ![]const u8 {
         if (!validTag(tag)) return error.InvalidImageTag;
         const a = self.cmd.a;
-        const url = try io.fmt(a, registry ++ "/v2/" ++ registry_image ++ "/manifests/{s}", .{tag});
+        const url = try io.fmt(a, registry ++ "/v2/{s}/manifests/{s}", .{ self.image.repository(), tag });
         const headers = try io.fmt(a, "Authorization: Bearer {s}\n" ++
             "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json\n", .{bearer});
         const raw = try self.get(url, headers);
@@ -182,6 +212,24 @@ test "relayer pins read only the recognized environment exports" {
     try std.testing.expect(!validTag("30b039z-20261124-095058"));
     try std.testing.expect(!validTag("30b039c-20261124&095058"));
     try std.testing.expect(pins(blob[0 .. blob.len - 50]) == null);
+}
+
+test "scraper pins distinguish agent and node service tags by environment" {
+    const blob =
+        \\export const mainnetDockerTags: MainnetDockerTags = {
+        \\  scraper: '0b9032e-20261123-154044',
+        \\  scraperProxy: '340f0f9-20261126-095428',
+        \\};
+        \\export const testnetDockerTags: BaseDockerTags = {
+        \\  scraper: 'eb9fb6a-20261126-092318',
+        \\  scraperProxy: '9808703-20261120-095742',
+        \\};
+    ;
+    try std.testing.expectEqualStrings("0b9032e-20261123-154044", scraperPins(blob).?[0]);
+    try std.testing.expectEqualStrings("340f0f9-20261126-095428", scraperPins(blob).?[1]);
+    try std.testing.expectEqualStrings("eb9fb6a-20261126-092318", scraperPins(blob).?[2]);
+    try std.testing.expectEqualStrings("9808703-20261120-095742", scraperPins(blob).?[3]);
+    try std.testing.expectEqualStrings("node-services-docker.yml", Image.node_services.workflow());
 }
 
 test "only pure forward relayer pins to a single build qualify" {

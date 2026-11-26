@@ -88,7 +88,7 @@ pub const Client = struct {
         return combined.toOwnedSlice(a);
     }
 
-    const ready_query =
+    const open_query =
         \\query($owner: String!, $name: String!, $endCursor: String) {
         \\  repository(owner: $owner, name: $name) {
         \\    pullRequests(first: 100, after: $endCursor, states: [OPEN]) {
@@ -99,17 +99,17 @@ pub const Client = struct {
         \\}
     ;
 
-    pub fn ready(self: Client) ![]const core.Pull {
+    pub fn openPulls(self: Client) ![]const core.Pull {
         const a = self.cmd.a;
         const fields = try self.repoFields();
         const args = [_][]const u8{
-            "--paginate", "--slurp", "-f", try io.fmt(a, "query={s}", .{ready_query}),
+            "--paginate", "--slurp", "-f", try io.fmt(a, "query={s}", .{open_query}),
         } ++ fields;
         const raw = self.api("graphql", &args, "") catch |err| return transportFailure(err, error.GitHubListFailed);
-        return decodeReady(a, raw);
+        return decodeOpen(a, raw);
     }
 
-    fn decodeReady(a: A, raw: []const u8) ![]const core.Pull {
+    fn decodeOpen(a: A, raw: []const u8) ![]const core.Pull {
         const Data = struct { repository: struct { pullRequests: Connection(core.Pull) } };
         const responses = try io.parse(a, []const GraphResponse(Data), raw);
         if (responses.len == 0) return error.InvalidPagination;
@@ -366,16 +366,16 @@ pub const Client = struct {
         return decodeRegistryFiles(a, raw, before, after);
     }
 
-    pub fn agentImageBuild(self: Client, commit: []const u8, tag: []const u8, digest: []const u8, timer: *std.time.Timer, limit: u32) !u64 {
+    pub fn agentImageBuild(self: Client, image: agent_image.Image, commit: []const u8, tag: []const u8, digest: []const u8, timer: *std.time.Timer, limit: u32) !u64 {
         if (!std.ascii.eqlIgnoreCase(self.repo, registry_pin_source) or !core.validOid(commit) or !agent_image.validTag(tag) or
             !std.mem.startsWith(u8, commit, tag[0..7])) return error.InvalidAgentImageBuild;
         const a = self.cmd.a;
-        const target = try self.endpoint(try io.fmt(a, "actions/workflows/rust-docker.yml/runs?branch=main&status=success&head_sha={s}&per_page=3", .{commit}));
+        const target = try self.endpoint(try io.fmt(a, "actions/workflows/{s}/runs?branch=main&status=success&head_sha={s}&per_page=3", .{ image.workflow(), commit }));
         const raw = try self.invokeWithin(&.{ self.gh, "api", "--hostname", "github.com", target }, "", @min(8, try agent_image.remainingSeconds(timer, limit)));
         const runs = try io.parse(a, struct { workflow_runs: []const AgentImageRun }, raw);
-        const reference = try io.fmt(a, "ghcr.io/" ++ agent_image.registry_image ++ ":{s}@{s}", .{ tag, digest });
+        const reference = try io.fmt(a, "ghcr.io/{s}:{s}@{s}", .{ image.repository(), tag, digest });
         for (runs.workflow_runs[0..@min(3, runs.workflow_runs.len)]) |run| {
-            if (!run.matches(commit)) continue;
+            if (!run.matches(image, commit)) continue;
             const log = self.invokeWithin(&.{
                 self.gh, "run", "view", try io.fmt(a, "{d}", .{run.id}), "--repo", "github.com/" ++ registry_pin_source, "--log",
             }, "", @min(12, try agent_image.remainingSeconds(timer, limit))) catch |err| switch (err) {
@@ -614,9 +614,11 @@ const AgentImageRun = struct {
     conclusion: []const u8,
     head_repository: struct { full_name: []const u8 },
 
-    fn matches(self: AgentImageRun, commit: []const u8) bool {
+    fn matches(self: AgentImageRun, image: agent_image.Image, commit: []const u8) bool {
+        const workflow_prefix = ".github/workflows/";
         return self.id != 0 and eq(u8, self.head_repository.full_name, registry_pin_source) and
-            eq(u8, self.path, ".github/workflows/rust-docker.yml") and eq(u8, self.head_branch, "main") and
+            std.mem.startsWith(u8, self.path, workflow_prefix) and eq(u8, self.path[workflow_prefix.len..], image.workflow()) and
+            eq(u8, self.head_branch, "main") and
             eq(u8, self.head_sha, commit) and eq(u8, self.status, "completed") and eq(u8, self.conclusion, "success") and
             (eq(u8, self.event, "push") or eq(u8, self.event, "workflow_dispatch"));
     }
@@ -635,16 +637,20 @@ test "agent image build evidence comes from the exact successful upstream main c
         .conclusion = "success",
         .head_repository = .{ .full_name = registry_pin_source },
     };
-    try t.expect(run.matches(commit));
-    try t.expect(!run.matches("35afedd"));
+    try t.expect(run.matches(.agent, commit));
+    try t.expect(!run.matches(.agent, "35afedd"));
+    try t.expect(!run.matches(.node_services, commit));
+    run.path = ".github/workflows/node-services-docker.yml";
+    run.event = "workflow_dispatch";
+    try t.expect(run.matches(.node_services, commit));
     run.head_repository.full_name = "fork/hyperlane-monorepo";
-    try t.expect(!run.matches(commit));
+    try t.expect(!run.matches(.node_services, commit));
     run.head_repository.full_name = registry_pin_source;
     run.event = "pull_request";
-    try t.expect(!run.matches(commit));
+    try t.expect(!run.matches(.node_services, commit));
     run.event = "push";
     run.head_branch = "not-main";
-    try t.expect(!run.matches(commit));
+    try t.expect(!run.matches(.node_services, commit));
 }
 
 fn transportFailure(err: anyerror, fallback: anyerror) anyerror {
@@ -689,14 +695,14 @@ test "a paginated scan rejects partial responses and preserves discovery order" 
     const page2 =
         \\{"data":{"repository":{"pullRequests":{"nodes":[{"number":10,"headRefOid":"bbb","isDraft":true}],"pageInfo":{"hasNextPage":false,"endCursor":"final"}}}}}
     ;
-    const pulls = try Client.decodeReady(a, "[" ++ page1 ++ "," ++ page2 ++ "]");
+    const pulls = try Client.decodeOpen(a, "[" ++ page1 ++ "," ++ page2 ++ "]");
     try std.testing.expectEqual(@as(usize, 2), pulls.len);
     try std.testing.expectEqual(@as(u32, 20), pulls[0].number);
     try std.testing.expect(pulls[1].isDraft);
-    try std.testing.expectError(error.InvalidPagination, Client.decodeReady(a, "[" ++ page1 ++ "]"));
-    try std.testing.expectError(error.InvalidPagination, Client.decodeReady(a, "[" ++ page1 ++ "," ++ page1 ++ "]"));
-    try std.testing.expectError(error.GitHubListFailed, Client.decodeReady(a, "[" ++ page1 ++ ",{\"errors\":[{}]}]"));
-    try std.testing.expectError(error.GitHubRateLimited, Client.decodeReady(a, "[{\"errors\":[{\"type\":\"RATE_LIMITED\"}]}]"));
+    try std.testing.expectError(error.InvalidPagination, Client.decodeOpen(a, "[" ++ page1 ++ "]"));
+    try std.testing.expectError(error.InvalidPagination, Client.decodeOpen(a, "[" ++ page1 ++ "," ++ page1 ++ "]"));
+    try std.testing.expectError(error.GitHubListFailed, Client.decodeOpen(a, "[" ++ page1 ++ ",{\"errors\":[{}]}]"));
+    try std.testing.expectError(error.GitHubRateLimited, Client.decodeOpen(a, "[{\"errors\":[{\"type\":\"RATE_LIMITED\"}]}]"));
 }
 
 test "review readback matches original inline coordinates and rejects replies or foreign reviews" {

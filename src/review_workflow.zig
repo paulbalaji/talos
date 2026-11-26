@@ -36,7 +36,9 @@ pub fn workerPrompt(a: io.A, context: []const u8, decision: routing.Decision, or
         "Review the change independently. Spend most of your time on this lens, and still report any other verified material issues and assess open threads.";
     // Two workers can be assigned three routed risk areas. Retain the third
     // lens on the generalist without duplicating the specialist's priority.
-    const extra = if (ordinal == 0 and workers == 2 and decision.security and decision.reliability and decision.performance)
+    const extra = if (workers == 1 and decision.security and decision.reliability and decision.performance)
+        " Also check material reliability and performance regressions along the changed paths."
+    else if (ordinal == 0 and workers == 2 and decision.security and decision.reliability and decision.performance)
         " Also check for material performance regressions along the changed paths."
     else
         "";
@@ -78,8 +80,8 @@ pub fn hasClaims(results: []const core.ReviewerResult) bool {
 
 pub fn waitsForSynthesis(repo: core.Repo, progress: core.RouteProgress) bool {
     const decision = progress.decision orelse return false;
-    return repo.routing_mode == .adaptive and decision.depth == .multi and
-        progress.results.len >= @max(2, repo.reviewSize()) and hasClaims(progress.results);
+    return (progress.all_models or (repo.routing_mode == .adaptive and decision.depth == .multi)) and
+        progress.results.len >= progress.requiredReviewers(repo, decision) and hasClaims(progress.results);
 }
 
 pub fn synthesisPrompt(a: io.A, context: []const u8, results: []const core.ReviewerResult) ![]const u8 {
@@ -95,13 +97,17 @@ pub fn synthesisPrompt(a: io.A, context: []const u8, results: []const core.Revie
 }
 
 pub fn overCapacity(a: io.A, results: []const core.ReviewerResult) !Synthesis {
+    return unverified(a, results, "The candidate findings exceeded the verification context limit. Their source claims remain unverified.");
+}
+
+pub fn unverified(a: io.A, results: []const core.ReviewerResult, summary: []const u8) !Synthesis {
     const checked = try a.dupe(core.ReviewerResult, results);
     for (checked) |*result| {
         result.complete_before_synthesis = result.review.complete;
         result.review.findings = &.{};
         result.review.complete = false;
     }
-    return .{ .results = checked, .summary = "The candidate findings exceeded the verification context limit. Their source claims remain unverified." };
+    return .{ .results = checked, .summary = summary };
 }
 
 fn validText(text: []const u8, max: usize) bool {

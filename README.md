@@ -1,6 +1,6 @@
 # Talos
 
-Talos reviews GitHub pull requests from your machine using Codex, Claude Code, or Kimi Code. It records the ready PRs that already exist, then picks up new ready PRs, drafts that become ready, and new heads. It also rereviews heads it has reviewed when the discussion or effective diff changes. Reviews stay local by default. Each repo can opt into comments and approvals separately.
+Talos reviews open GitHub pull requests, including drafts, from your machine using Codex, Claude Code, or Kimi Code. It baselines existing PRs and picks up new PRs and new heads. Existing drafts are baselined on upgrade and get reviewed on their next head or when marked ready. Talos can post findings on drafts. A clean draft gets a fresh approval decision when it is marked ready. Each repo can opt into comments and approvals separately.
 
 ## Use Talos
 
@@ -32,6 +32,7 @@ talos status                          # See scans, queue, errors, and cache size
 | Preview the next review in one repo | `talos run-once OWNER/REPO` |
 | Show or set the reviewer default for new repos | `talos defaults` or `talos defaults --engine claude` |
 | Queue a specific PR under the repo's publication policy | `talos queue OWNER/REPO 123` |
+| Queue every configured provider at maximum effort for one PR | `talos queue OWNER/REPO 123 --all-maxxing` |
 | Queue a review with a focus | `talos queue OWNER/REPO 123 --mode perf-maxxing --prompt 'Check allocations on the request path.' --publish` |
 | Read the latest local verdict, its evidence gaps, and recent verdict history | `talos result OWNER/REPO 123` |
 | Open a draft for a deferred finding | `talos followup THREAD_URL` |
@@ -68,6 +69,14 @@ After a review, Talos checks for substantive PR conversation, human replies to r
 
 Talos puts files with active review threads and risky code early in the bounded diff. It also reads pinned source around current right-side thread anchors. Incomplete current evidence and unassessed open threads prevent approval. Reviewers can still approve when the current head is fully covered and the only gap is a clipped historical delta.
 
+Scheduled reviews split large diffs on Git hunk boundaries. Each section runs through the selected reviewers, and Talos checkpoints completed sections and combines their verdicts before it publishes one review. Hunks outside the section limits keep coverage incomplete. During model runs, the watcher continues scanning due repos and accepts new queue requests.
+
+All-model reviews can run up to three source sections at once within the configured reviewer start budget. Each section keeps its own checkpoint and temporary reviewer directories.
+
+For a sectioned review on the same pinned source, new discussion leaves completed source work intact. New human discussion or edits to the PR description get a focused follow-up pass before publication. Automated threads can inform remaining passes. They do not require a new pass on their own.
+
+A new thread containing only automated replies does not invalidate an in-flight review. Edits to reviewed threads and new human threads still require current inputs.
+
 If a rereview finds an issue after an approval, its comment flags the earlier approval for a person to reassess. On upgrade, Talos uses newer human replies to catch up completed reviews. It tracks resolution changes from the first successful scan.
 
 Rereviews update the local verdict. Talos posts new actionable findings, an approval for a commit that does not already have one from the configured GitHub account, or a warning when an earlier approval needs reassessing. See summaries and coverage details in `talos result`. A custom review with `--publish` can post its requested summary.
@@ -96,7 +105,7 @@ With `--merge-when-ready`, Talos submits the current head for normal GitHub merg
 
 ### Review a PR stack
 
-When Talos scans ready PRs, it uses the number and member order GitHub recorded for each `gh stack`. It reads that metadata through the GitHub API. Stack detection keeps the baseline intact and groups existing per-head jobs.
+When Talos scans open PRs, it uses the number and member order GitHub recorded for each `gh stack`. When a member has pending review work, Talos queues the stack's other open members, including drafts. Idle native stacks stay baselined, and completed reviews for the current heads are retained.
 
 For PRs without a GitHub stack, Talos can infer a linear chain when each PR targets the previous PR's branch and exact head in the same repo. Ambiguous or branched relationships stay in the ordinary queue. You can also define a local stack with two to eight ready PRs in one repo, bottom to top.
 
@@ -108,7 +117,7 @@ talos run-once OWNER/REPO 124
 talos unstack OWNER/REPO feature
 ```
 
-Talos waits for queued ancestor reviews or merges before starting the next scheduled PR. A baselined ancestor can contribute its pinned diff and any available review without starting a new model run. Reviewers see excerpts from the nearest ancestors, and Talos rechecks the entire ordered prefix before publication. Each PR keeps its own diff anchors and publication receipt. Use `status` to see the stack number, order, and why a PR is blocked. `unstack` removes an explicit local definition and keeps its queued jobs. A later scan can detect the chain again. [GitHub stack APIs](https://docs.github.com/en/pull-requests/reference/stacked-pull-requests-apis-and-webhooks)
+Talos waits for queued ancestor reviews or merges before starting the next scheduled PR. In an inferred stack, a baselined ancestor can contribute its pinned diff and any available review without starting a new model run. Reviewers see excerpts from the nearest ancestors, and Talos rechecks the entire ordered prefix before publication. Each PR keeps its own diff anchors and publication receipt. Use `status` to see the stack number, order, and why a PR is blocked. `unstack` removes an explicit local definition and keeps its queued jobs. A later scan can detect the chain again. [GitHub stack APIs](https://docs.github.com/en/pull-requests/reference/stacked-pull-requests-apis-and-webhooks)
 
 ### Route reviews by risk
 
@@ -137,7 +146,11 @@ Adaptive routing uses four levels.
 
 Talos routes contract changes, ownership and signing changes, deployment permissions, and changes to access policy directly to multi-provider review. Other clear risks go to the relevant focused review. A configured lightweight model can recommend a stronger route for ambiguous changes. Manual modes and prompts take precedence. GitHub approvals require a full review.
 
-On scheduled reviews, the screening model can request up to six specific files or excerpts from the pinned commit. Talos fetches those itself before starting the full review. A multi review with findings may use one more reviewer start for synthesis. If the current tick has no starts left, Talos saves the completed passes and finishes on a later tick.
+In adaptive routing, changes to Hyperlane's production CCIP Read verification and commit/reveal authentication use the security, reliability, and performance lenses with every configured full reviewer at maximum effort. Dependent PRs inherit that route from a reviewed open ancestor at the same pinned revision. To request it for all current open members of a GitHub stack, run `talos stack OWNER/REPO STACK_NUMBER --all-maxxing`.
+
+Add `--rerun` after `--all-maxxing` to review completed members again at the same head. Pending all-model jobs keep their progress. The normal publication rules still suppress unchanged findings.
+
+On scheduled reviews, the screening model can request up to six specific files or excerpts from the pinned commit. Talos reads one excerpt per distinct file before repeats. Changes to Hyperlane Merkle snapshot and insertion projections also get pinned schema, writer, and database adapter excerpts. Multi review uses a synthesis pass to verify candidate claims. If that response is malformed, Talos retains the independent passes and tries an eligible provider, resuming on a later tick if needed.
 
 ### Configure provider fallback
 
@@ -152,7 +165,7 @@ List only providers approved to receive the repo’s source and discussions. Tal
 
 `talos usage` counts starts made by this Talos state directory. It includes screening, failed attempts, and previews. Daily caps reset at midnight UTC. A cap of `0` means unlimited. The count estimates local workload. It has no view of requests made by other tools or of the provider’s remaining subscription quota.
 
-Every model start also counts against the per-tick budget. Adaptive routing reserves enough starts for its strongest possible route and releases unused starts after the job returns. Routing reports and accumulated passes are private local state. Screens use standard speed and skip advisor calls.
+Every model start also counts against the per-tick budget. Adaptive routing reserves starts for the review and releases unused starts after the job returns. All-model review and synthesis can resume across ticks when the reservation runs out. Routing reports and accumulated passes are private local state. Screens use standard speed and skip advisor calls.
 
 ### Verify on-chain claims
 
@@ -169,6 +182,8 @@ When a PR in `hyperlane-xyz/hyperlane-monorepo` changes `.registryrc`, Talos rea
 ### Review relayer image pins
 
 For PRs targeting `hyperlane-xyz/hyperlane-monorepo` main, Talos recognizes relayer image tags of the form `abcdef0-20261124-185322` in `typescript/infra/config/docker.ts`. It reads the pinned deployment selectors, hashes the public GHCR manifests, and matches each tagged digest to a successful main build log for the exact source commit. Reviewers receive the changed build input inventory for each image pair and bounded patch excerpts, with bundled runtime configuration first. These read-only observations describe the tags at review time. Missing build records, an incomplete inventory, or a material gap identified by a reviewer withhold automatic approval.
+
+Scraper and scraper-proxy pins use the same digest verification with their respective Rust agent and Node services workflows. Talos supplies the pinned rollout configuration for assessing migration order.
 
 When the entire change advances only relayer pins to one verified build already in the PR merge base, Talos reviews the deployment promotion in a regular pass. It checks that the previous builds are ancestors and verifies the affected deployment selectors. The reviewer checks the rollout and any concrete compatibility concerns. Normal discussion and approval rules apply.
 
@@ -259,6 +274,10 @@ talos status --json
 ```
 
 The state directory is `~/.local/state/talos`. One process holds its lock at a time. Each tick admits up to three independent PRs per repo across five repos. Model reviews run in parallel. One coordinator collects source, updates state, and handles GitHub publication. PRs in a stack still wait for queued ancestors. `state.json` holds reviewer defaults, the baseline, queue, stacks, publication receipts, and recent errors. `repos/OWNER/REPO/results/` holds candidate reviews. Check `launchd.log` for scheduler errors.
+
+Adaptive multi reviews also run independent provider passes concurrently within their start budget. The providers share one pinned source snapshot. Each process uses its own scratch directory under the job's temporary directory. Talos removes that directory when the job exits. Evidence collection and synthesis run between the independent passes.
+
+Ordinary reviewer calls have a 15-minute timeout. Full calls in all-model reviews can run for up to 30 minutes per provider call.
 
 Talos rotates `launchd.log` on the next tick after a UTC day boundary or when it reaches 1 MiB. It keeps up to 30 days and 10 MiB across the active log and its archives, with newer diagnostics taking priority. The scheduler also reports the last 12 errors per repo through `talos status`. Log retention only applies to scheduler diagnostics.
 

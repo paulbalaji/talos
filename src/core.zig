@@ -3,10 +3,12 @@ const onchain = @import("onchain.zig");
 const io = @import("io.zig");
 const stack = @import("stack.zig");
 const routing = @import("routing.zig");
+const review_sections = @import("review_sections.zig");
 const A = io.A;
 const eq = io.eq;
 pub const schema = @embedFile("review-schema.json");
 pub const review_context_limit = 96 * 1024;
+pub const diff_byte_limit_reason = "The merge base diff exceeded the byte limit.";
 
 pub const Engine = enum { codex, claude, kimi };
 pub const engine_count = std.meta.fields(Engine).len;
@@ -162,6 +164,14 @@ pub const Discussion = struct {
         return !eq(u8, author.kind, "Bot") and !std.ascii.endsWithIgnoreCase(author.login, "[bot]");
     }
 
+    pub fn automatedThread(thread: Thread) bool {
+        if (thread.replies.len == 0) return false;
+        for (thread.replies) |reply| {
+            if (reply.author == null or human(reply, null)) return false;
+        }
+        return true;
+    }
+
     fn courtesy(reply: Reply) bool {
         if (reply.truncated) return false;
         const words = io.trim(u8, reply.body, " \t\r\n.!");
@@ -183,13 +193,15 @@ pub const Discussion = struct {
         hash.update(&.{0});
     }
 
-    fn fingerprint(self: Discussion, a: A, login: []const u8, legacy: bool) ![Sha256.digest_length]u8 {
+    fn fingerprint(self: Discussion, a: A, login: []const u8, mode: enum { legacy, material, section }) ![Sha256.digest_length]u8 {
+        const legacy = mode == .legacy;
         var hash = Sha256.init(.{});
         for (self.comments) |reply| {
             if (human(reply, if (legacy) login else null) and (legacy or !courtesy(reply)))
                 try hashPart(a, &hash, .{ reply.url, reply.author.?.login, reply.body, reply.updatedAt });
         }
         for (self.threads) |thread| {
+            if (mode == .section and automatedThread(thread)) continue;
             var included = thread.isResolved;
             if (included) try hashPart(a, &hash, .{ thread.id, thread.isResolved });
             for (thread.replies, 0..) |reply, index| {
@@ -228,6 +240,7 @@ pub const ReviewInput = struct {
     base: ReviewBase,
     merge_base: []const u8,
     discussion: [Sha256.digest_length]u8,
+    is_draft: bool = false,
     // Keep the old values for receipts and for the first scan of an older job.
     checks_passed: bool = false,
     material_discussion: ?[Sha256.digest_length]u8 = null,
@@ -236,8 +249,9 @@ pub const ReviewInput = struct {
         return .{
             .base = .fromPull(pr),
             .merge_base = merge_base,
-            .discussion = try discussion.fingerprint(a, repo.login, true),
-            .material_discussion = try discussion.fingerprint(a, repo.login, false),
+            .discussion = try discussion.fingerprint(a, repo.login, .legacy),
+            .is_draft = pr.isDraft,
+            .material_discussion = try discussion.fingerprint(a, repo.login, .material),
         };
     }
 
@@ -291,6 +305,9 @@ pub const Snapshot = struct {
     relayer_promotion: bool = false,
     optional_evidence_start: ?usize = null,
     onchain_reads: []const onchain.Request = &.{},
+    large_diff: ?struct { patch: []const u8, start: usize, end: usize } = null,
+    diff_priority: []const []const u8 = &.{},
+    thread_evidence: []const u8 = "",
 
     pub fn markLimited(self: *Snapshot, a: A, reason: []const u8) !void {
         self.limited = true;
@@ -315,13 +332,18 @@ pub const Review = struct {
     existing_open_findings: []const []const u8,
     non_blocking_threads: ?[]const ThreadAssessment = null,
 };
-pub const ReviewerResult = struct { engine: Engine, review: Review, complete_before_synthesis: ?bool = null };
+pub const ReviewerResult = struct {
+    engine: Engine,
+    review: Review,
+    lens_index: ?usize = null,
+    complete_before_synthesis: ?bool = null,
+};
 pub const Event = enum { COMMENT, APPROVE };
 
 pub const Inline = struct { path: []const u8, line: u32, side: []const u8 = "RIGHT", body: []const u8 };
 pub const Payload = struct { commit_id: []const u8, event: Event, body: []const u8, comments: []const Inline };
 
-const ApprovalBlocker = enum { focused_review, limited_coverage, new_findings, open_findings, unassessed_threads, light_review, approvals_disabled, own_pr, unknown_author };
+const ApprovalBlocker = enum { focused_review, limited_coverage, new_findings, open_findings, unassessed_threads, light_review, approvals_disabled, own_pr, unknown_author, draft };
 const ReviewerCoverage = struct { engine: Engine, complete: bool, gaps: []const []const u8 };
 const UnassessedThread = struct { engine: Engine, path: []const u8, line: ?u32 };
 const Coverage = struct {
@@ -404,6 +426,7 @@ pub const Job = struct {
     followup: bool = false,
     // Completed clean reviews that the old policy held for CI get one rereview.
     awaiting_checks: bool = false,
+    awaiting_ready: bool = false,
     followup_id: [16]u8 = @splat(0),
 
     pub fn schedulable(self: Job) bool {
@@ -427,7 +450,8 @@ pub const Job = struct {
     pub fn observeReviewInput(self: *Job, current: ReviewInput, legacy_changed: bool, approvals_enabled: bool) void {
         if (self.phase != .complete) return;
         const discussion_or_diff = if (self.review_input) |old| !old.same(current) else false;
-        const changed = discussion_or_diff or legacy_changed or (self.awaiting_checks and approvals_enabled);
+        const ready_for_approval = self.awaiting_ready and !current.is_draft;
+        const changed = discussion_or_diff or legacy_changed or ((self.awaiting_checks or ready_for_approval) and approvals_enabled);
         if (!changed) {
             if (self.review_input) |*recorded| {
                 recorded.base = current.base;
@@ -447,7 +471,7 @@ pub const Job = struct {
         self.options = .{};
     }
 };
-pub const Seen = struct { number: u32, head: []const u8 };
+pub const Seen = struct { number: u32, head: []const u8, is_draft: bool = false };
 pub const ReviewBase = struct {
     oid: []const u8,
     ref: []const u8,
@@ -463,6 +487,7 @@ pub const ReviewBase = struct {
 
 const Discovery = struct {
     observed: bool = false,
+    was_draft: bool = false,
     queued: bool = false,
     ready_base: ?ReviewBase = null,
 };
@@ -478,6 +503,7 @@ pub const SeenContext = struct {
 pub const Entry = struct {
     repo: Repo,
     seen: []Seen = &.{},
+    drafts_baselined: bool = false,
     jobs: []Job = &.{},
     last_scan: i64 = 0,
     next_scan: i64 = 0,
@@ -500,11 +526,34 @@ pub const Entry = struct {
     }
 
     pub fn queue(self: *Entry, a: A, pr: Pull, options: ?ReviewOptions) !void {
+        return self.queueReview(a, pr, options, false);
+    }
+
+    pub fn queueReview(self: *Entry, a: A, pr: Pull, options: ?ReviewOptions, rerun_completed: bool) !void {
+        const all_models = if (options) |requested| requested.all_models else false;
         for (self.jobs) |*job| {
             if (job.number != pr.number or !eq(u8, job.head, pr.headRefOid)) continue;
             if (job.phase == .uncertain) {
+                if (rerun_completed or (all_models and !job.options.all_models)) return error.PublicationUnconfirmed;
                 job.next = 0;
                 job.attempts = 0;
+            } else if (all_models) {
+                const rerun = rerun_completed and job.phase == .complete;
+                if (!rerun and (job.options.all_models or (job.route_report != null and job.route_report.?.all_models))) {
+                    if (job.phase != .failed) return;
+                }
+                job.options = options.?;
+                job.phase = .pending;
+                job.next = 0;
+                job.attempts = 0;
+                job.outcome = null;
+                job.analysis = null;
+                job.route_progress = null;
+                job.route_report = null;
+                job.review_input = null;
+                // Use a fresh receipt without republishing unchanged findings.
+                job.followup = job.receipt != null or job.last_review != null;
+                if (job.followup) std.crypto.random.bytes(&job.followup_id);
             } else if (job.followup and (job.phase == .pending or job.phase == .failed)) {
                 job.phase = .pending;
                 job.next = 0;
@@ -541,6 +590,7 @@ pub const Entry = struct {
             const slot = try index.getOrPut(a, seen);
             if (!slot.found_existing) slot.value_ptr.* = .{};
             slot.value_ptr.observed = true;
+            slot.value_ptr.was_draft = seen.is_draft;
         }
         for (self.jobs) |job| {
             const slot = try index.getOrPut(a, .{ .number = job.number, .head = job.head });
@@ -548,13 +598,13 @@ pub const Entry = struct {
             slot.value_ptr.queued = true;
         }
 
-        var ready: std.ArrayList(Seen) = .empty;
-        errdefer ready.deinit(a);
+        var open: std.ArrayList(Seen) = .empty;
+        errdefer open.deinit(a);
         for (pulls) |pr| {
-            if (!isReady(pr)) continue;
+            if (!isReviewable(pr)) continue;
             if (!validOid(pr.headRefOid)) return error.InvalidCommit;
-            const seen: Seen = .{ .number = pr.number, .head = pr.headRefOid };
-            try ready.append(a, seen);
+            const seen: Seen = .{ .number = pr.number, .head = pr.headRefOid, .is_draft = pr.isDraft };
+            try open.append(a, seen);
             const slot = try index.getOrPut(a, seen);
             if (!slot.found_existing) slot.value_ptr.* = .{};
             slot.value_ptr.ready_base = .fromPull(pr);
@@ -564,6 +614,8 @@ pub const Entry = struct {
         try retained.ensureTotalCapacity(a, self.jobs.len);
         var prior: std.AutoHashMapUnmanaged(u32, ReviewRecord) = .empty;
         defer prior.deinit(a);
+        var all_model_requests: std.AutoHashMapUnmanaged(u32, ReviewOptions) = .empty;
+        defer all_model_requests.deinit(a);
         for (self.jobs) |job| {
             var current = job;
             const base = index.get(.{ .number = job.number, .head = job.head }).?.ready_base;
@@ -578,19 +630,29 @@ pub const Entry = struct {
             if (job.phase != .uncertain) {
                 if (job.last_review) |record| try prior.put(a, job.number, record);
             }
+            if (base == null and job.options.all_models and (job.phase == .pending or job.phase == .failed)) {
+                try all_model_requests.put(a, job.number, job.options);
+            }
         }
         if (!baseline) {
-            for (ready.items) |seen| {
+            for (open.items) |seen| {
                 const flags = index.getPtr(seen).?;
-                if (flags.observed or flags.queued) continue;
-                try retained.append(a, .{ .number = seen.number, .head = seen.head, .last_review = prior.get(seen.number) });
+                if (flags.queued or (seen.is_draft and !self.drafts_baselined)) continue;
+                if (flags.observed and (!flags.was_draft or seen.is_draft)) continue;
+                try retained.append(a, .{
+                    .number = seen.number,
+                    .head = seen.head,
+                    .last_review = prior.get(seen.number),
+                    .options = all_model_requests.get(seen.number) orelse .{},
+                });
                 flags.queued = true;
             }
         }
-        const next_seen = try ready.toOwnedSlice(a);
+        const next_seen = try open.toOwnedSlice(a);
         errdefer a.free(next_seen);
         self.jobs = try retained.toOwnedSlice(a);
         self.seen = next_seen;
+        self.drafts_baselined = true;
     }
 
     pub fn due(self: *Entry, now: i64) ?*Job {
@@ -638,12 +700,12 @@ pub fn validOid(oid: []const u8) bool {
     return true;
 }
 
-pub fn isReady(pr: Pull) bool {
-    return eq(u8, pr.state, "OPEN") and !pr.isDraft;
+pub fn isReviewable(pr: Pull) bool {
+    return eq(u8, pr.state, "OPEN");
 }
 
 fn sameTarget(before: Pull, after: Pull) bool {
-    return isReady(after) and before.number == after.number and
+    return isReviewable(after) and before.number == after.number and before.isDraft == after.isDraft and
         eq(u8, before.headRefOid, after.headRefOid) and ReviewBase.fromPull(before).same(.fromPull(after));
 }
 
@@ -686,6 +748,7 @@ pub const ReviewOptions = struct {
     request: ?[]const u8 = null,
     publish_prompted: bool = false,
     explicit_mode: bool = false,
+    all_models: bool = false,
 
     pub fn allowRouting(self: ReviewOptions) bool {
         return !self.explicit_mode and self.general();
@@ -730,7 +793,10 @@ fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, discussion: Discussi
     }
     if (previous) |commit| {
         if (eq(u8, commit, pr.headRefOid)) {
-            try writer.writeAll("\n\nThis is a same-head rereview. Check what the conversation or base change means for the prior findings. Carry forward accepted or verified resolutions unless the current evidence specifically invalidates them.");
+            try writer.writeAll(if (options.all_models)
+                "\n\nReview the full current change independently. Use prior findings and replies to identify what has already been reported or resolved."
+            else
+                "\n\nThis is a same-head rereview. Check what the conversation or base change means for the prior findings. Carry forward accepted or verified resolutions unless the current evidence specifically invalidates them.");
         } else if (prior_delta.evidence.len != 0 and prior_delta.coverage_reasons.len == 0) {
             try writer.writeAll("\n\nStart with the previous-to-current delta and the latest replies. For an existing finding, check whether the changed source or dependencies could alter the prior verdict. Retain still-valid blockers by thread ID. Review new changes independently, including new entries in generated release metadata.");
         }
@@ -1072,7 +1138,8 @@ fn payload(a: A, adapter: anytype, pr: Pull, prepared: Prepared, results: []cons
     var truncated_open_threads: usize = 0;
     for (threads) |thread| {
         truncated_threads += @intFromBool(thread.truncated);
-        truncated_open_threads += @intFromBool(thread.truncated and !thread.isResolved);
+        truncated_open_threads += @intFromBool(thread.truncated and !thread.isResolved and
+            !(prepared.sections.len != 0 and Discussion.automatedThread(thread)));
     }
     complete = complete and truncated_open_threads == 0;
     const scope = switch (options.focus) {
@@ -1163,7 +1230,7 @@ fn payload(a: A, adapter: anytype, pr: Pull, prepared: Prepared, results: []cons
     if (clean) {
         var remaining: usize = 0;
         approval: for (threads) |thread| {
-            if (thread.isResolved) continue;
+            if (thread.isResolved or (prepared.sections.len != 0 and Discussion.automatedThread(thread))) continue;
             for (results) |result| {
                 if (assessmentReason(result, thread.id) != null) continue;
                 clean = false;
@@ -1179,7 +1246,7 @@ fn payload(a: A, adapter: anytype, pr: Pull, prepared: Prepared, results: []cons
             try fmt.print("\n\n{d} open thread{s} can stay open.", .{ remaining, if (remaining == 1) "" else "s" });
             var shown: usize = 0;
             for (threads) |thread| {
-                if (thread.isResolved) continue;
+                if (thread.isResolved or (prepared.sections.len != 0 and Discussion.automatedThread(thread))) continue;
                 if (shown == 3) break;
                 try fmt.writeAll("\n- ");
                 try appendThreadReference(a, &body, thread);
@@ -1337,9 +1404,12 @@ pub const Prepared = struct {
     engines: []const Engine,
     context: []const u8,
     context_for_completion: ?[]const u8 = null,
+    sections: []const ReviewSection = &.{},
+    context_update: bool = false,
     evidence_offset: usize,
     route_depth: routing.Depth = .regular,
     options: ReviewOptions,
+    all_models: bool = false,
     dry: bool,
     review_input: ?ReviewInput = null,
     synthesis_provider: ?Engine = null,
@@ -1349,7 +1419,20 @@ pub const Prepared = struct {
     evidence_requests: []const EvidenceRequest = &.{},
     onchain_observations: []const onchain.Observation = &.{},
     onchain_available: bool = false,
+
+    pub fn section(self: Prepared, index: usize) Prepared {
+        if (self.sections.len == 0) return self;
+        const part = self.sections[index];
+        var prepared = self;
+        prepared.context = part.context;
+        prepared.context_for_completion = null;
+        prepared.snap.evidence = part.evidence;
+        prepared.evidence_offset = std.mem.indexOf(u8, part.context, "\n\nEvidence (untrusted JSON)\n").?;
+        return prepared;
+    }
 };
+
+const ReviewSection = struct { evidence: []const u8, context: []const u8, patch: []const u8 = "" };
 
 pub fn appendOnchain(a: A, context: *[]const u8, observations: []const onchain.Observation) !bool {
     if (observations.len == 0) return false;
@@ -1383,11 +1466,19 @@ pub const RouteProgress = struct {
     screen_ms: u64 = 0,
     results: []const ReviewerResult = &.{},
     malformed_reviewers: u8 = 0,
+    rejected_synthesizers: u8 = 0,
     review_ms: u64 = 0,
+    all_models: bool = false,
+    sections: SectionProgress = .{},
+
+    pub fn requiredReviewers(self: RouteProgress, repo: Repo, decision: routing.Decision) usize {
+        if (self.all_models) return repo.providerCount();
+        return if (decision.depth == .multi) @max(2, repo.reviewSize()) else repo.reviewSize();
+    }
 
     pub fn needsAnotherProvider(self: RouteProgress, repo: Repo) bool {
         const decision = self.decision orelse return false;
-        return repo.routing_mode == .adaptive and decision.depth == .multi and repo.providerCount() < 2;
+        return !self.all_models and repo.routing_mode == .adaptive and decision.depth == .multi and repo.providerCount() < 2;
     }
 
     pub fn needsCompletion(self: RouteProgress, result: ReviewerResult) bool {
@@ -1395,6 +1486,60 @@ pub const RouteProgress = struct {
         if (self.completion_done & providerBit(result.engine) != 0) return false;
         for (result.review.evidence_requests) |request| if (hasEvidenceRequest(requests, request)) return true;
         return false;
+    }
+
+    pub fn readyToPublish(self: RouteProgress) bool {
+        const checkpoint = self.sections.checkpoint orelse return false;
+        return self.sections.index == checkpoint.section_count and !checkpoint.update_discussion;
+    }
+};
+
+pub const SectionProgress = struct {
+    index: usize = 0,
+    finished_mask: ?u16 = null,
+    pending: []const SectionTask = &.{},
+    results: []const ReviewerResult = &.{},
+    evidence_limited: bool = false,
+    evidence_requests: []const EvidenceRequest = &.{},
+    evidence_passes: u8 = 0,
+    synthesis_provider: ?Engine = null,
+    synthesis_gap: ?[]const u8 = null,
+    checkpoint: ?SectionCheckpoint = null,
+};
+
+pub const SectionTask = struct {
+    index: usize,
+    progress: RouteProgress,
+};
+
+pub const SectionCheckpoint = struct {
+    source: [32]u8,
+    discussion: [32]u8,
+    diff_priority: []const []const u8,
+    section_count: usize,
+    update_discussion: bool = false,
+
+    pub fn capture(a: A, repo: Repo, prepared: Prepared) !SectionCheckpoint {
+        var source_hash = Sha256.init(.{});
+        try Discussion.hashPart(a, &source_hash, .{
+            repo,                    prepared.options,         prepared.all_models,     prepared.pr.headRefOid, prepared.pr.baseRefOid,
+            prepared.pr.baseRefName, prepared.snap.merge_base, prepared.inherited.pins,
+        });
+        for (prepared.sections) |part| {
+            source_hash.update(part.patch);
+            source_hash.update(&.{0});
+        }
+        const current: Discussion = .{ .threads = prepared.threads, .comments = prepared.comments };
+        var discussion = Sha256.init(.{});
+        try Discussion.hashPart(a, &discussion, .{
+            try current.fingerprint(a, repo.login, .section), prepared.pr.title, prepared.pr.body,
+        });
+        return .{
+            .source = source_hash.finalResult(),
+            .discussion = discussion.finalResult(),
+            .diff_priority = prepared.snap.diff_priority,
+            .section_count = prepared.sections.len,
+        };
     }
 };
 
@@ -1415,6 +1560,8 @@ pub const RouteReport = struct {
     full_findings: ?usize = null,
     full_only_anchors: ?usize = null,
     evidence_passes: u8 = 0,
+    diff_sections: usize = 0,
+    all_models: bool = false,
     onchain_observations: []const onchain.Observation = &.{},
 };
 
@@ -1561,7 +1708,12 @@ pub const SavedAnalysis = struct {
         hash.update(&.{0});
         hash.update(try io.json(a, prepared.inherited.pins));
         hash.update(&.{0});
+        if (prepared.all_models) hash.update("all-model review\x00");
         hash.update(prepared.context);
+        for (prepared.sections) |part| {
+            hash.update(&.{0});
+            hash.update(part.context);
+        }
         return hash.finalResult();
     }
 
@@ -1592,8 +1744,74 @@ pub const SavedAnalysis = struct {
 // The same workflow runs against the CLI adapter and deterministic fakes.
 pub fn run(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?Result {
     const prepared = (try prepare(a, adapter, repo, job, mode)) orelse return null;
+    if (prepared.sections.len != 0) return error.SectionReviewRequiresScheduler;
     const results = try analyze(a, adapter, prepared.engines, prepared.context);
     return finish(a, adapter, repo, job, prepared, results[0..prepared.engines.len]);
+}
+
+fn prepareSections(a: A, repo: Repo, pr: Pull, snap: *Snapshot, discussion: Discussion, previous: ?[]const u8, last_review: ?ReviewRecord, prior_delta: PriorDelta, inherited: stack.Context, options: ReviewOptions) ![]const ReviewSection {
+    const large = snap.large_diff orelse return &.{};
+    const split = try review_sections.split(a, large.patch);
+    if (split.patches.len == 0) return &.{};
+
+    var scoped = snap.*;
+    var reasons: std.ArrayList([]const u8) = .empty;
+    for (snap.coverage_reasons) |reason| {
+        if (!eq(u8, reason, diff_byte_limit_reason)) try reasons.append(a, reason);
+    }
+    scoped.coverage_reasons = reasons.items;
+    scoped.limited = reasons.items.len != 0;
+    scoped.optional_evidence_start = null;
+    if (split.omitted) try scoped.markLimited(a, "Some merge-base diff hunks exceeded the section limits.");
+    var sections: std.ArrayList(ReviewSection) = .empty;
+    const historical: PriorDelta = .{ .coverage_reasons = prior_delta.coverage_reasons };
+    for (split.patches, 1..) |patch, ordinal| {
+        const briefing = try io.fmt(
+            a,
+            "Review diff section {d} of {d}. Assess all changed hunks supplied here, and report findings only on those hunks. " ++
+                "Assess an existing thread here if its evidence is present. Other sections are reviewed separately. " ++
+                "Request exact pinned source if a material dependency is missing. Judge completeness for this section.\n\n",
+            .{ ordinal, split.patches.len },
+        );
+        const diff = try std.mem.concat(a, u8, &.{ "Merge-base diff:\n", patch });
+        scoped.evidence = if (ordinal == 1)
+            try std.mem.concat(a, u8, &.{ snap.evidence[0..large.start], patch, snap.evidence[large.end..] })
+        else
+            diff;
+        const limit = review_context_limit - 20 * 1024;
+        var rendered = try reviewPrompt(a, repo, pr, scoped, discussion, previous, last_review, historical, inherited, options);
+        if (ordinal == 1 and briefing.len + rendered.len > limit) {
+            scoped.evidence = diff;
+            rendered = try reviewPrompt(a, repo, pr, scoped, discussion, previous, last_review, historical, inherited, options);
+        }
+        if (briefing.len + rendered.len > limit) {
+            try scoped.markLimited(a, "Some merge-base diff sections did not fit alongside the review context.");
+            continue;
+        }
+        try sections.append(a, .{ .evidence = scoped.evidence, .context = try std.mem.concat(a, u8, &.{ briefing, rendered }), .patch = patch });
+    }
+    if (sections.items.len == 0) return &.{};
+    scoped.evidence = sections.items[0].evidence;
+    snap.* = scoped;
+    return sections.items;
+}
+
+pub fn appendDiscussionUpdate(a: A, prepared: *Prepared, repo: Repo, prior: []const ReviewerResult) !bool {
+    var scoped = prepared.snap;
+    scoped.evidence = scoped.thread_evidence;
+    const previous = try recordReview(a, prepared.*, null, prior);
+    const context = try reviewPrompt(a, repo, prepared.pr, scoped, .{ .threads = prepared.threads, .comments = prepared.comments }, null, previous, .{}, .{}, prepared.options);
+    const briefing =
+        "Continue your review using the latest PR description and discussion and the prior review notes below. " ++
+        "The source sections are reviewed separately. Check new or updated claims and existing thread dispositions using the pinned excerpts. " ++
+        "Only return findings supported by current evidence and affected by the new context. Request exact pinned source for any unresolved material question.\n\n";
+    if (briefing.len + context.len > review_context_limit - 20 * 1024) return false;
+    prepared.sections = try std.mem.concat(a, ReviewSection, &.{ prepared.sections, &.{.{
+        .evidence = scoped.evidence,
+        .context = try std.mem.concat(a, u8, &.{ briefing, context }),
+    }} });
+    prepared.context_update = true;
+    return true;
 }
 
 pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?Prepared {
@@ -1617,7 +1835,7 @@ pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?P
         .scheduled => try adapter.pull(job.number),
         .preview => |preview| preview.pull orelse try adapter.pull(job.number),
     };
-    if (pr.number != job.number or !isReady(pr) or !eq(u8, pr.headRefOid, job.head)) return error.TargetChanged;
+    if (pr.number != job.number or !isReviewable(pr) or !eq(u8, pr.headRefOid, job.head)) return error.TargetChanged;
     if (!validOid(pr.headRefOid) or !validOid(pr.baseRefOid)) return error.InvalidCommit;
     const inherited: stack.Context = if (supports_stacks) try adapter.stackContext(pr, dry) else .{};
     var discussion = try adapter.reviewDiscussion(pr.number);
@@ -1629,7 +1847,7 @@ pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?P
     for (discussion.comments) |comment| {
         if (comment.truncated) try snap.markLimited(a, "A PR conversation comment was truncated");
     }
-    const retry_held_approval = job.awaiting_checks and repo.approvals;
+    const retry_held_approval = (job.awaiting_checks or (job.awaiting_ready and !pr.isDraft)) and repo.approvals;
     if (!dry and job.followup and !retry_held_approval and job.review_input != null and job.review_input.?.same(review_input)) {
         job.phase = .complete;
         job.analysis = null;
@@ -1650,8 +1868,9 @@ pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?P
     }
     const engines = try repo.engines(a);
     try validateEngines(engines);
-    var context = try reviewPrompt(a, repo, pr, snap, discussion, previous, job.last_review, prior_delta, inherited, options);
-    const context_limit: usize = if (repo.routing_mode == .adaptive and options.allowRouting()) review_context_limit - 4096 else review_context_limit;
+    const sections = if (dry) &.{} else try prepareSections(a, repo, pr, &snap, discussion, previous, job.last_review, prior_delta, inherited, options);
+    var context = if (sections.len != 0) sections[0].context else try reviewPrompt(a, repo, pr, snap, discussion, previous, job.last_review, prior_delta, inherited, options);
+    const context_limit: usize = if (options.all_models or (repo.routing_mode == .adaptive and options.allowRouting())) review_context_limit - 4096 else review_context_limit;
     if (context.len > context_limit and prior_delta.evidence.len != 0) {
         prior_delta.evidence = "";
         prior_delta.coverage_reasons = try std.mem.concat(a, []const u8, &.{
@@ -1696,6 +1915,7 @@ pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?P
         .engines = engines,
         .context = context,
         .context_for_completion = context_for_completion,
+        .sections = sections,
         .evidence_offset = std.mem.indexOf(u8, context, "\n\nEvidence (untrusted JSON)\n") orelse return error.InvalidReviewContext,
         .options = options,
         .dry = dry,
@@ -1714,10 +1934,27 @@ pub fn analyze(a: A, reviewer: anytype, engines: []const Engine, context: []cons
     return results;
 }
 
-fn checkDiscussion(a: A, adapter: anytype, number: u32, original: []const u8) !void {
+fn checkDiscussion(a: A, adapter: anytype, number: u32, original: Discussion, sectioned: bool, login: []const u8) !void {
     var latest = try adapter.reviewDiscussion(number);
+    if (sectioned) {
+        if (!eq(u8, &(try original.fingerprint(a, login, .section)), &(try latest.fingerprint(a, login, .section)))) return error.ThreadsChanged;
+        return;
+    }
+    var threads: std.ArrayList(Thread) = .empty;
+    for (latest.threads) |thread| {
+        const known = for (original.threads) |prior| {
+            if (eq(u8, prior.id, thread.id)) break true;
+        } else false;
+        if (!known and thread.replies.len != 0) {
+            for (thread.replies) |reply| {
+                if (reply.author == null or Discussion.human(reply, null)) break;
+            } else continue;
+        }
+        try threads.append(a, thread);
+    }
+    latest.threads = threads.items;
     latest.comments = try latest.materialComments(a);
-    if (!eq(u8, original, try io.json(a, latest))) return error.ThreadsChanged;
+    if (!eq(u8, try io.json(a, original), try io.json(a, latest))) return error.ThreadsChanged;
 }
 
 pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared, results: []const ReviewerResult) !?Result {
@@ -1726,10 +1963,12 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
     const threads = prepared.threads;
     const inherited = prepared.inherited;
     const snap = prepared.snap;
-    const original_discussion = try io.json(a, Discussion{ .threads = threads, .comments = prepared.comments });
-    try checkDiscussion(a, adapter, pr.number, original_discussion);
+    const original_discussion: Discussion = .{ .threads = threads, .comments = prepared.comments };
+    const sectioned = prepared.sections.len != 0;
+    try checkDiscussion(a, adapter, pr.number, original_discussion, sectioned, repo.login);
     const latest = try adapter.pull(job.number);
     if (!sameTarget(pr, latest)) return error.TargetChanged;
+    if (sectioned and (!eq(u8, pr.title, latest.title) or !eq(u8, pr.body, latest.body))) return error.ThreadsChanged;
     if (supports_stacks) try adapter.checkStack(inherited);
     var reviewed = job.*;
     reviewed.review_input = prepared.review_input;
@@ -1742,9 +1981,14 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
     }
     const own_pr = if (latest.author) |author| std.ascii.eqlIgnoreCase(author.login, repo.login) else true;
     reviewed.awaiting_checks = job.awaiting_checks and !repo.approvals and !own_pr and result.event == .APPROVE;
+    reviewed.awaiting_ready = latest.isDraft and repo.approvals and !own_pr and result.event == .APPROVE;
     if (!prepared.dry and result.event == .APPROVE and (!repo.approvals or own_pr)) {
         blockers.setPresent(.approvals_disabled, !repo.approvals);
         if (own_pr) blockers.insert(if (latest.author == null) .unknown_author else .own_pr);
+        result.event = .COMMENT;
+    }
+    if (latest.isDraft and result.event == .APPROVE) {
+        blockers.insert(.draft);
         result.event = .COMMENT;
     }
     reviewed.event = result.event;
@@ -1798,14 +2042,16 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
         try adapter.checkIdentity();
         const final = try adapter.pull(pr.number);
         if (!sameTarget(pr, final)) return error.TargetChanged;
+        if (sectioned and (!eq(u8, pr.title, final.title) or !eq(u8, pr.body, final.body))) return error.ThreadsChanged;
         if (supports_stacks) try adapter.checkStackBeforePost(inherited, final);
-        try checkDiscussion(a, adapter, pr.number, original_discussion);
+        try checkDiscussion(a, adapter, pr.number, original_discussion, sectioned, repo.login);
         if (warning) saved.body = try io.fmt(a, "{s}\n\n{s}", .{ saved.body, approval_warning });
     }
     try adapter.saveResult(job.number, saved);
     if (supports_stacks) try adapter.saveStackContext(pr, snap, result);
     job.review_input = reviewed.review_input;
     job.awaiting_checks = reviewed.awaiting_checks;
+    job.awaiting_ready = reviewed.awaiting_ready;
     job.last_review = try recordReview(a, prepared, job.last_review, results);
     if (permitted) {
         var public = result;

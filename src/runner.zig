@@ -50,7 +50,7 @@ pub const Runner = struct {
                 cmd.transport = @field(io.Transport, @tagName(engine));
                 if (self.meter) |meter| try meter.start(engine, std.time.timestamp());
                 if (self.starts) |count| count.* +|= 1;
-                const output = cmd.run(invocation.args, invocation.stdin, 900) catch |err| return switch (err) {
+                const output = cmd.run(invocation.args, invocation.stdin, self.profile.timeout_seconds) catch |err| return switch (err) {
                     error.SubprocessTimeout => error.ReviewerTimedOut,
                     error.CodexRateLimited, error.ClaudeRateLimited, error.KimiRateLimited => err,
                     else => reviewer.failure,

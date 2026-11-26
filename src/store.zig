@@ -51,7 +51,15 @@ pub const Store = struct {
     }
 
     pub fn lock(self: Store) !std.fs.File {
-        const file = try self.dir.createFile("watch.lock", .{ .truncate = false, .mode = 0o600 });
+        return self.exclusive("watch.lock");
+    }
+
+    pub fn batchLock(self: Store) !std.fs.File {
+        return self.exclusive("review-batch.lock");
+    }
+
+    fn exclusive(self: Store, name: []const u8) !std.fs.File {
+        const file = try self.dir.createFile(name, .{ .truncate = false, .mode = 0o600 });
         errdefer file.close();
         if (!try file.tryLock(.exclusive)) return error.AlreadyRunning;
         return file;
