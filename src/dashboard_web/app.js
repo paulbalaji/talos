@@ -41,6 +41,7 @@ let detailRequest = null;
 let displayChart = "calls";
 let chartObserver = null;
 let pollTimer = null;
+let refreshIndicatorTimer = null;
 let queueLookup = null;
 let queueSending = null;
 const renderKeys = new Map();
@@ -209,6 +210,13 @@ function setConnection(connected, message) {
   note(byId("connection-error"), message || "");
 }
 
+function syncRefreshIndicator() {
+  clearTimeout(refreshIndicatorTimer);
+  const indicator = byId("sync-state");
+  if (stateRequest || metricsRequest) indicator.dataset.refreshing = "true";
+  else refreshIndicatorTimer = setTimeout(() => { delete indicator.dataset.refreshing; }, 360);
+}
+
 function chooseStage(job, now) {
   const active = list(job.active_providers);
   const stage = humanize(job.stage);
@@ -251,13 +259,41 @@ function progressLabel(job) {
   if (percent == null && !sectionCount) labels.append(element("span", "minor", "—"));
   wrap.append(labels);
   if (percent != null) {
+    const track = element("div", "progress-track");
     const bar = element("progress");
     bar.value = percent;
     bar.max = 100;
     bar.setAttribute("aria-label", `Review progress for #${job.number}`);
-    wrap.append(bar);
+    track.append(bar);
+    if (percent > 0 && percent < 100 && list(job.active_providers).length > 0) {
+      const shimmer = element("span", "progress-shimmer");
+      shimmer.setAttribute("aria-hidden", "true");
+      shimmer.style.width = `${percent}%`;
+      track.append(shimmer);
+    }
+    wrap.append(track);
   }
   return wrap;
+}
+
+const providerMarks = new Set(["codex", "claude", "kimi"]);
+
+function providerLabel(engine, model, calls = 1) {
+  const label = element("span", "provider-label");
+  if (providerMarks.has(engine)) {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    const mark = document.createElementNS(svg.namespaceURI, "use");
+    svg.setAttribute("class", "provider-icon");
+    svg.setAttribute("aria-hidden", "true");
+    mark.setAttribute("href", `/providers.svg#${engine}`);
+    svg.append(mark);
+    label.append(svg);
+  }
+  const name = calls > 1 ? `${humanize(engine)} ×${calls}` : humanize(engine);
+  const text = element("span", "provider-name", name);
+  if (model) text.append(element("span", "provider-model", ` · ${model}`));
+  label.append(text);
+  return label;
 }
 
 function providersLabel(values, allModels) {
@@ -269,13 +305,7 @@ function providersLabel(values, allModels) {
     if (names.has(key)) names.get(key).count += 1;
     else names.set(key, { ...item, count: 1 });
   }
-  for (const item of names.values()) {
-    const text = item.count > 1 ? `${humanize(item.engine)} ×${item.count}` : humanize(item.engine);
-    const line = element("div");
-    line.append(element("span", "provider-name", text));
-    if (item.model) line.append(element("span", "provider-model", ` · ${item.model}`));
-    group.append(line);
-  }
+  for (const item of names.values()) group.append(providerLabel(item.engine, item.model, item.count));
   return group;
 }
 
@@ -290,7 +320,16 @@ function reviewKey(item, head = null, showDetails = true, stack = null) {
   if (showDetails && item.title) wrap.append(element("span", "review-title", item.title));
   if (showDetails) {
     const metadata = element("span", "review-repo", phrase([item.repo, item.draft && "Draft"]));
-    if (stack) metadata.append(element("span", "stack-label", ` · ${stack.label}`));
+    if (stack) {
+      const label = element("span", "stack-label", ` · ${stack.label}`);
+      if (stack.position) {
+        const badge = element("span", "stack-position", `${stack.position}/${stack.total}`);
+        badge.title = `PR ${stack.position} of ${stack.total}, bottom to top`;
+        badge.setAttribute("aria-hidden", "true");
+        label.append(badge, element("span", "sr-only", `, ${badge.title}`));
+      }
+      metadata.append(label);
+    }
     wrap.append(metadata);
   }
   return wrap;
@@ -343,15 +382,23 @@ function renderQueue() {
   for (const stack of list(snapshot?.stacks)) {
     const label = stack.number ? `Stack #${stack.number}` : `Stack ${stack.name}`;
     const accent = stackAccent(stack.repo, stack.number || stack.name);
-    for (const member of list(stack.members)) memberships.set(keyOf(stack.repo, member.number), { label, accent });
+    const members = list(stack.members);
+    for (const [index, member] of members.entries()) {
+      memberships.set(keyOf(stack.repo, member.number), { label, accent, position: index + 1, total: members.length });
+    }
   }
   const active = jobs.filter((job) => !["baseline", "complete"].includes(job.phase));
   const running = active.filter((job) => list(job.active_providers).length > 0);
   const pending = active.filter((job) => job.phase === "pending" && !list(job.active_providers).length).length;
-  byId("queue-summary").textContent = phrase([
-    plural(running.length, "running", "running"), plural(pending, "queued", "queued"),
-    plural(active.filter((job) => job.phase === "failed").length, "failed", "failed"),
-  ]);
+  const totals = [["Running", running.length], ["Queued", pending], ["Failed", active.filter((job) => job.phase === "failed").length]];
+  if (snapshot) update("queue-summary", totals, () => {
+    byId("queue-summary").replaceChildren(...totals.map(([label, amount]) => {
+      const field = element("span", "queue-stat");
+      if (amount > 0) field.dataset.tone = label.toLowerCase();
+      field.append(element("strong", "mono", count(amount)), element("span", null, label));
+      return field;
+    }));
+  });
   const rows = byId("queue-filter").value === "active" ? active : jobs;
   const selected = filterRows(rows, byId("queue-search").value);
   const now = snapshot?.at || 0;
@@ -608,7 +655,7 @@ function renderMetrics() {
       "Provider / model", ["Calls", "numeric"], ["Failures", "numeric"], ["Token reports", "numeric"],
       ["Input tokens", "numeric"], ["Output tokens", "numeric"], ["Mean duration", "numeric"],
     ], list(metrics.providers).map((item) => [
-      phrase([humanize(item.engine), item.model]), count(item.attempts), count(item.failures),
+      providerLabel(item.engine, item.model), count(item.attempts), count(item.failures),
       `${count(item.reported)} / ${count(item.attempts)}`,
       count(item.input_tokens), count(item.output_tokens), duration(item.mean_duration_ms),
     ]), "Provider calls will appear here as they finish.")));
@@ -622,7 +669,7 @@ function renderMetrics() {
       models.append(heading, tableBox(renderTable([
         "Provider / model", ["Calls involving model", "numeric"], ["Input tokens", "numeric"], ["Output tokens", "numeric"],
       ], modelUsage.map((model) => [
-        phrase([humanize(model.engine), model.model]), count(model.participations), count(model.input_tokens), count(model.output_tokens),
+        providerLabel(model.engine, model.model), count(model.participations), count(model.input_tokens), count(model.output_tokens),
       ]), "No model-specific counts.")));
       models.append(element("p", "chart-guide", "A CLI call can use more than one model."));
       content.append(models);
@@ -783,7 +830,7 @@ function renderDetail(data, target) {
     if (relevant.length > 0) {
       const table = tableBox(renderTable(["Provider / stage", ["Duration", "numeric"], ["Input", "numeric"], ["Output", "numeric"]], relevant.map((item) => {
         const info = element("div");
-        info.append(element("span", null, phrase([humanize(item.engine), item.model])));
+        info.append(providerLabel(item.engine, item.model));
         info.append(element("span", "phase-note", phrase([humanize(item.stage), item.section != null && `Section ${item.section}`, humanize(item.outcome)])));
         const models = list(item.model_usage);
         if (models.length > 1 || (models.length === 1 && models[0].model !== item.model)) {
@@ -1004,6 +1051,7 @@ function refreshState() {
   if (stateRequest?.history === wantsHistory) return stateRequest.promise;
   const flight = { history: wantsHistory, promise: null };
   stateRequest = flight;
+  syncRefreshIndicator();
   const path = wantsHistory ? "/api/state?history=1" : "/api/state";
   flight.promise = request(path).then((data) => {
     if (stateRequest !== flight) return;
@@ -1019,7 +1067,10 @@ function refreshState() {
     if (stateRequest !== flight) return;
     setConnection(false, snapshot ? "Connection lost. Showing the last saved dashboard state." : "Talos could not be reached. Retrying shortly.");
   }).finally(() => {
-    if (stateRequest === flight) stateRequest = null;
+    if (stateRequest === flight) {
+      stateRequest = null;
+      syncRefreshIndicator();
+    }
   });
   return flight.promise;
 }
@@ -1029,6 +1080,7 @@ function refreshMetrics() {
   if (metricsRequest?.days === days) return;
   const flight = { days };
   metricsRequest = flight;
+  syncRefreshIndicator();
   if (metricsSnapshot?.days !== days) note(byId("metrics-notice"), "Loading usage…");
   request(`/api/metrics?days=${days}`).then((data) => {
     if (metricsRequest !== flight || view !== "usage") return;
@@ -1040,7 +1092,10 @@ function refreshMetrics() {
     if (metricsRequest !== flight || view !== "usage") return;
     note(byId("metrics-notice"), error.message);
   }).finally(() => {
-    if (metricsRequest === flight) metricsRequest = null;
+    if (metricsRequest === flight) {
+      metricsRequest = null;
+      syncRefreshIndicator();
+    }
   });
 }
 
