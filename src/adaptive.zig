@@ -82,15 +82,15 @@ const completion_instructions =
     "Drop a prior finding only when the supplied evidence refutes it. Return coverage_gaps for any gap that remains and leave evidence_requests empty.\n\n";
 
 pub fn evidenceCapacity(prepared: core.Prepared) usize {
-    // Allow space for the lens brief and for JSON escaping of source text.
-    return (core.review_context_limit -| prepared.context.len -| 1400) / 2;
+    // The adapter fits excerpts against this encoded byte budget.
+    return core.review_context_limit -| prepared.context.len -| 1400;
 }
 
 pub fn completionCapacity(prepared: core.Prepared, screen_evidence: []const u8, observations: []const @import("onchain.zig").Observation, a: io.A) !usize {
     const context = prepared.context_for_completion orelse prepared.context;
     const screen_size = if (screen_evidence.len == 0) 0 else supplemental_heading.len + (try io.json(a, screen_evidence)).len;
     const onchain_size = if (observations.len == 0) 0 else 220 + (try io.json(a, observations)).len;
-    return (core.review_context_limit -| context.len -| screen_size -| onchain_size -| 2200) / 2;
+    return core.review_context_limit -| context.len -| screen_size -| onchain_size -| 2200;
 }
 
 pub fn completionRequests(a: io.A, results: []const core.ReviewerResult, screened: []const core.EvidenceRequest) ![]const core.EvidenceRequest {
@@ -119,6 +119,118 @@ fn appendEvidence(a: io.A, context: *[]const u8, evidence: []const u8) !bool {
 // A job has a fixed number of starts reserved for this tick. Successful passes
 // are carried forward by the coordinator when a later pass needs a new tick.
 pub fn run(a: io.A, reviewer: anytype, plan: Plan) !Outcome {
+    if (plan.prepared.sections.len == 0) return runSection(a, reviewer, plan);
+
+    var scoped = plan;
+    scoped.prepared = plan.prepared.section(plan.progress.sections.index);
+    var outcome = try runSection(a, reviewer, scoped);
+    const section_report = outcome.report orelse return outcome;
+    const progress = &outcome.progress;
+    const sections = &progress.sections;
+    const results = outcome.review_results orelse progress.results;
+    for (results) |result| {
+        if (!result.review.complete and result.complete_before_synthesis != null) {
+            sections.synthesis_gap = sections.synthesis_gap orelse outcome.synthesis_summary;
+            break;
+        }
+    }
+    sections.results = try combineSections(a, sections.results, results);
+    sections.evidence_limited = sections.evidence_limited or outcome.evidence_limited;
+    for ([_][]const core.EvidenceRequest{ progress.evidence_requests, progress.completion_requests orelse &.{} }) |requests| {
+        for (requests) |request| {
+            if (!core.hasEvidenceRequest(sections.evidence_requests, request)) {
+                sections.evidence_requests = try std.mem.concat(a, core.EvidenceRequest, &.{ sections.evidence_requests, &.{request} });
+            }
+        }
+    }
+    sections.evidence_passes +|= section_report.evidence_passes;
+    sections.synthesis_provider = section_report.synthesis_provider orelse sections.synthesis_provider;
+    sections.index += 1;
+    if (sections.index == plan.prepared.sections.len) {
+        progress.results = sections.results;
+        outcome.review_results = sections.results;
+        outcome.report = try report(a, plan, progress.*, section_report.applied);
+        outcome.report.?.diff_sections = sections.index;
+        outcome.report.?.evidence_passes = sections.evidence_passes;
+        outcome.report.?.synthesis_provider = sections.synthesis_provider;
+        outcome.synthesis_summary = sections.synthesis_gap;
+        outcome.evidence_limited = sections.evidence_limited;
+        return outcome;
+    }
+
+    // Keep only verified results and reset the section-local evidence state.
+    progress.results = &.{};
+    progress.evidence_requests = &.{};
+    progress.evidence_key = null;
+    progress.initial_evidence_limited = false;
+    progress.completion_requests = null;
+    progress.completion_attempted = 0;
+    progress.completion_done = 0;
+    progress.malformed_reviewers = 0;
+    progress.rejected_synthesizers = 0;
+    outcome.report = null;
+    outcome.review_results = null;
+    return outcome;
+}
+
+fn combineSections(a: io.A, earlier: []const core.ReviewerResult, current: []const core.ReviewerResult) ![]const core.ReviewerResult {
+    var results: std.ArrayList(core.ReviewerResult) = .empty;
+    try results.appendSlice(a, earlier);
+    for (current) |pass| {
+        const combined = for (results.items) |*result| {
+            if (result.engine == pass.engine) break result;
+        } else added: {
+            const result = try results.addOne(a);
+            result.* = .{
+                .engine = pass.engine,
+                .review = .{ .complete = true, .summary = "", .findings = &.{}, .existing_open_findings = &.{} },
+            };
+            break :added result;
+        };
+        const review = &combined.review;
+        combined.complete_before_synthesis =
+            (combined.complete_before_synthesis orelse review.complete) and (pass.complete_before_synthesis orelse pass.review.complete);
+        review.complete = review.complete and pass.review.complete;
+        if (review.existing_open_findings.len + pass.review.existing_open_findings.len > 100) review.complete = false;
+        review.coverage_gaps = try mergeUnique(a, []const u8, review.coverage_gaps, pass.review.coverage_gaps, 12);
+        review.existing_open_findings = try mergeUnique(a, []const u8, review.existing_open_findings, pass.review.existing_open_findings, 100);
+        review.non_blocking_threads = try mergeUnique(
+            a,
+            std.meta.Child(@TypeOf(review.non_blocking_threads.?)),
+            review.non_blocking_threads orelse &.{},
+            pass.review.non_blocking_threads orelse &.{},
+            100,
+        );
+        var findings: std.ArrayList(std.meta.Child(@TypeOf(review.findings))) = .empty;
+        try findings.appendSlice(a, review.findings);
+        for (pass.review.findings) |finding| {
+            if (findings.items.len == 32) {
+                review.complete = false;
+                combined.complete_before_synthesis = false;
+                review.coverage_gaps = try mergeUnique(a, []const u8, review.coverage_gaps, &.{"Additional findings exceeded the retained review limit."}, 13);
+                break;
+            }
+            try findings.append(a, finding);
+        }
+        review.findings = findings.items;
+    }
+    return results.items;
+}
+
+fn mergeUnique(a: io.A, comptime T: type, earlier: []const T, current: []const T, limit: usize) ![]const T {
+    var merged: std.ArrayList(T) = .empty;
+    try merged.appendSlice(a, earlier);
+    for (current) |item| {
+        if (merged.items.len >= limit) break;
+        const key = if (T == []const u8) item else item.id;
+        for (merged.items) |known| {
+            if (io.eq(u8, key, if (T == []const u8) known else known.id)) break;
+        } else try merged.append(a, item);
+    }
+    return merged.items;
+}
+
+fn runSection(a: io.A, reviewer: anytype, plan: Plan) !Outcome {
     var outcome: Outcome = .{ .progress = plan.progress };
     const progress = &outcome.progress;
     if (progress.screen_waiting) try screen(a, reviewer, plan, progress);
@@ -529,6 +641,47 @@ test "all-model review waits for every authorized provider and then verifies cla
     try t.expectEqualSlices(core.Engine, plan.providers, finished.report.?.providers);
     try t.expectEqual(routing.all_lenses, finished.report.?.applied);
     try t.expect(finished.report.?.synthesis_provider != null);
+}
+
+test "all-model sections checkpoint after every provider and verify late findings" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var plan = sample_plan;
+    plan.repo.fallback_engines = &.{ .claude, .kimi };
+    plan.providers = &.{ .codex, .claude, .kimi };
+    plan.progress.all_models = true;
+    plan.screen = .{ .floor = routing.all_lenses, .ask_model = false };
+    plan.start_limit = 4;
+    plan.prepared.sections = &.{
+        .{ .context = "First section\n\nEvidence (untrusted JSON)\n{}", .evidence = "first change" },
+        .{ .context = "Last section\n\nEvidence (untrusted JSON)\n{}", .evidence = "+return pending.pop();" },
+    };
+
+    var first: MockReviewer = .{ .unavailable_engine = .kimi };
+    const waiting = try run(a, &first, plan);
+    try t.expect(waiting.report == null);
+    try t.expectEqual(@as(usize, 0), waiting.progress.sections.index);
+    plan.progress = try io.parse(a, core.RouteProgress, try io.json(a, waiting.progress));
+
+    var resumed: MockReviewer = .{};
+    const checkpoint = try run(a, &resumed, plan);
+    try t.expectEqualSlices(core.Engine, &.{.kimi}, resumed.calls[0..resumed.count]);
+    try t.expect(checkpoint.report == null);
+    try t.expectEqual(@as(usize, 1), checkpoint.progress.sections.index);
+    plan.progress = try io.parse(a, core.RouteProgress, try io.json(a, checkpoint.progress));
+
+    var last: MockReviewer = .{ .singleton = true };
+    const finished = try run(a, &last, plan);
+    try t.expectEqualSlices(core.Engine, &.{ .codex, .claude, .kimi, .codex }, last.calls[0..last.count]);
+    for (last.prompts[0..3]) |prompt| {
+        try t.expect(std.mem.indexOf(u8, prompt, "Last section") != null);
+        try t.expect(std.mem.indexOf(u8, prompt, "First section") == null);
+    }
+    try t.expectEqual(@as(usize, 2), finished.report.?.diff_sections);
+    try t.expectEqual(@as(usize, 3), finished.review_results.?.len);
+    try t.expectEqual(@as(usize, 1), finished.review_results.?[0].review.findings.len);
 }
 
 test "an invalid full reviewer falls through to authorized providers across ticks" {

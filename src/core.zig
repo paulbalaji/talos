@@ -3,10 +3,12 @@ const onchain = @import("onchain.zig");
 const io = @import("io.zig");
 const stack = @import("stack.zig");
 const routing = @import("routing.zig");
+const review_sections = @import("review_sections.zig");
 const A = io.A;
 const eq = io.eq;
 pub const schema = @embedFile("review-schema.json");
 pub const review_context_limit = 96 * 1024;
+pub const diff_byte_limit_reason = "The merge base diff exceeded the byte limit.";
 
 pub const Engine = enum { codex, claude, kimi };
 pub const engine_count = std.meta.fields(Engine).len;
@@ -293,6 +295,7 @@ pub const Snapshot = struct {
     relayer_promotion: bool = false,
     optional_evidence_start: ?usize = null,
     onchain_reads: []const onchain.Request = &.{},
+    large_diff: ?struct { patch: []const u8, start: usize, end: usize } = null,
 
     pub fn markLimited(self: *Snapshot, a: A, reason: []const u8) !void {
         self.limited = true;
@@ -1378,6 +1381,7 @@ pub const Prepared = struct {
     engines: []const Engine,
     context: []const u8,
     context_for_completion: ?[]const u8 = null,
+    sections: []const ReviewSection = &.{},
     evidence_offset: usize,
     route_depth: routing.Depth = .regular,
     options: ReviewOptions,
@@ -1391,7 +1395,20 @@ pub const Prepared = struct {
     evidence_requests: []const EvidenceRequest = &.{},
     onchain_observations: []const onchain.Observation = &.{},
     onchain_available: bool = false,
+
+    pub fn section(self: Prepared, index: usize) Prepared {
+        if (self.sections.len == 0) return self;
+        const part = self.sections[index];
+        var prepared = self;
+        prepared.context = part.context;
+        prepared.context_for_completion = null;
+        prepared.snap.evidence = part.evidence;
+        prepared.evidence_offset = std.mem.indexOf(u8, part.context, "\n\nEvidence (untrusted JSON)\n").?;
+        return prepared;
+    }
 };
+
+const ReviewSection = struct { evidence: []const u8, context: []const u8 };
 
 pub fn appendOnchain(a: A, context: *[]const u8, observations: []const onchain.Observation) !bool {
     if (observations.len == 0) return false;
@@ -1428,6 +1445,7 @@ pub const RouteProgress = struct {
     rejected_synthesizers: u8 = 0,
     review_ms: u64 = 0,
     all_models: bool = false,
+    sections: SectionProgress = .{},
 
     pub fn requiredReviewers(self: RouteProgress, repo: Repo, decision: routing.Decision) usize {
         if (self.all_models) return repo.providerCount();
@@ -1447,6 +1465,16 @@ pub const RouteProgress = struct {
     }
 };
 
+pub const SectionProgress = struct {
+    index: usize = 0,
+    results: []const ReviewerResult = &.{},
+    evidence_limited: bool = false,
+    evidence_requests: []const EvidenceRequest = &.{},
+    evidence_passes: u8 = 0,
+    synthesis_provider: ?Engine = null,
+    synthesis_gap: ?[]const u8 = null,
+};
+
 pub fn providerBit(engine: Engine) u8 {
     return @as(u8, 1) << @intCast(@intFromEnum(engine));
 }
@@ -1464,6 +1492,7 @@ pub const RouteReport = struct {
     full_findings: ?usize = null,
     full_only_anchors: ?usize = null,
     evidence_passes: u8 = 0,
+    diff_sections: usize = 0,
     all_models: bool = false,
     onchain_observations: []const onchain.Observation = &.{},
 };
@@ -1613,6 +1642,10 @@ pub const SavedAnalysis = struct {
         hash.update(&.{0});
         if (prepared.all_models) hash.update("all-model review\x00");
         hash.update(prepared.context);
+        for (prepared.sections) |part| {
+            hash.update(&.{0});
+            hash.update(part.context);
+        }
         return hash.finalResult();
     }
 
@@ -1643,8 +1676,56 @@ pub const SavedAnalysis = struct {
 // The same workflow runs against the CLI adapter and deterministic fakes.
 pub fn run(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?Result {
     const prepared = (try prepare(a, adapter, repo, job, mode)) orelse return null;
+    if (prepared.sections.len != 0) return error.SectionReviewRequiresScheduler;
     const results = try analyze(a, adapter, prepared.engines, prepared.context);
     return finish(a, adapter, repo, job, prepared, results[0..prepared.engines.len]);
+}
+
+fn prepareSections(a: A, repo: Repo, pr: Pull, snap: *Snapshot, discussion: Discussion, previous: ?[]const u8, last_review: ?ReviewRecord, prior_delta: PriorDelta, inherited: stack.Context, options: ReviewOptions) ![]const ReviewSection {
+    const large = snap.large_diff orelse return &.{};
+    const split = try review_sections.split(a, large.patch);
+    if (split.patches.len == 0) return &.{};
+
+    var scoped = snap.*;
+    var reasons: std.ArrayList([]const u8) = .empty;
+    for (snap.coverage_reasons) |reason| {
+        if (!eq(u8, reason, diff_byte_limit_reason)) try reasons.append(a, reason);
+    }
+    scoped.coverage_reasons = reasons.items;
+    scoped.limited = reasons.items.len != 0;
+    scoped.optional_evidence_start = null;
+    if (split.omitted) try scoped.markLimited(a, "Some merge-base diff hunks exceeded the section limits.");
+    var sections: std.ArrayList(ReviewSection) = .empty;
+    const historical: PriorDelta = .{ .coverage_reasons = prior_delta.coverage_reasons };
+    for (split.patches, 1..) |patch, ordinal| {
+        const briefing = try io.fmt(
+            a,
+            "Review diff section {d} of {d}. Assess all changed hunks supplied here, and report findings only on those hunks. " ++
+                "Assess an existing thread here if its evidence is present. Other sections are reviewed separately. " ++
+                "Request exact pinned source if a material dependency is missing. Judge completeness for this section.\n\n",
+            .{ ordinal, split.patches.len },
+        );
+        const diff = try std.mem.concat(a, u8, &.{ "Merge-base diff:\n", patch });
+        scoped.evidence = if (ordinal == 1)
+            try std.mem.concat(a, u8, &.{ snap.evidence[0..large.start], patch, snap.evidence[large.end..] })
+        else
+            diff;
+        const limit = review_context_limit - 20 * 1024;
+        var rendered = try reviewPrompt(a, repo, pr, scoped, discussion, previous, last_review, historical, inherited, options);
+        if (ordinal == 1 and briefing.len + rendered.len > limit) {
+            scoped.evidence = diff;
+            rendered = try reviewPrompt(a, repo, pr, scoped, discussion, previous, last_review, historical, inherited, options);
+        }
+        if (briefing.len + rendered.len > limit) {
+            try scoped.markLimited(a, "Some merge-base diff sections did not fit alongside the review context.");
+            continue;
+        }
+        try sections.append(a, .{ .evidence = scoped.evidence, .context = try std.mem.concat(a, u8, &.{ briefing, rendered }) });
+    }
+    if (sections.items.len == 0) return &.{};
+    scoped.evidence = sections.items[0].evidence;
+    snap.* = scoped;
+    return sections.items;
 }
 
 pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?Prepared {
@@ -1701,7 +1782,8 @@ pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?P
     }
     const engines = try repo.engines(a);
     try validateEngines(engines);
-    var context = try reviewPrompt(a, repo, pr, snap, discussion, previous, job.last_review, prior_delta, inherited, options);
+    const sections = if (dry) &.{} else try prepareSections(a, repo, pr, &snap, discussion, previous, job.last_review, prior_delta, inherited, options);
+    var context = if (sections.len != 0) sections[0].context else try reviewPrompt(a, repo, pr, snap, discussion, previous, job.last_review, prior_delta, inherited, options);
     const context_limit: usize = if (options.all_models or (repo.routing_mode == .adaptive and options.allowRouting())) review_context_limit - 4096 else review_context_limit;
     if (context.len > context_limit and prior_delta.evidence.len != 0) {
         prior_delta.evidence = "";
@@ -1747,6 +1829,7 @@ pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?P
         .engines = engines,
         .context = context,
         .context_for_completion = context_for_completion,
+        .sections = sections,
         .evidence_offset = std.mem.indexOf(u8, context, "\n\nEvidence (untrusted JSON)\n") orelse return error.InvalidReviewContext,
         .options = options,
         .dry = dry,

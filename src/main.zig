@@ -171,18 +171,35 @@ const Adapter = struct {
 
     fn reviewEvidence(self: *Adapter, pr: core.Pull, requests: []const core.EvidenceRequest, capacity: usize) !adaptive.PinnedEvidence {
         if (capacity == 0) return .{ .limited = true };
-        const supplement_result = try self.supplement(pr, null, requests);
-        const clipped = capacity < supplement_result.evidence.len;
-        const prefix = supplement_result.evidence[0..core.safePrefix(supplement_result.evidence, capacity)];
-        const excerpt = if (clipped) prefix[0..(if (std.mem.lastIndexOfScalar(u8, prefix, '\n')) |index| index + 1 else 0)] else prefix;
+        return fitEvidence(self.db.a, try self.supplement(pr, null, requests), capacity);
+    }
+
+    fn fitEvidence(a: A, supplement_result: source.Supplement, capacity: usize) !adaptive.PinnedEvidence {
+        var remaining = capacity -| 2; // JSON string delimiters.
+        var limited = supplement_result.limited;
+        var excerpts: std.ArrayList(u8) = .empty;
         var provided: std.ArrayList(core.EvidenceRequest) = .empty;
         for (supplement_result.excerpts) |provided_excerpt| {
-            if (provided_excerpt.end_offset <= excerpt.len) try provided.append(self.db.a, provided_excerpt.request);
+            const excerpt = supplement_result.evidence[provided_excerpt.start_offset..provided_excerpt.end_offset];
+            const encoded = try io.json(a, excerpt);
+            defer a.free(encoded);
+            if (encoded.len - 2 > remaining) {
+                limited = true;
+                continue;
+            }
+            remaining -= encoded.len - 2;
+            try excerpts.appendSlice(a, excerpt);
+            try provided.append(a, provided_excerpt.request);
+        }
+        if (supplement_result.omissions.len != 0) {
+            const encoded = try io.json(a, supplement_result.omissions);
+            defer a.free(encoded);
+            if (encoded.len - 2 <= remaining) try excerpts.appendSlice(a, supplement_result.omissions);
         }
         return .{
-            .source = excerpt,
+            .source = excerpts.items,
             .provided = provided.items,
-            .limited = supplement_result.limited or clipped,
+            .limited = limited,
         };
     }
 
@@ -437,6 +454,7 @@ const ReviewWorker = struct {
     adapter: Adapter = undefined,
     gh_env: std.process.EnvMap = undefined,
     job: *core.Job,
+    job_key: [32]u8 = undefined,
     prepared: core.Prepared = undefined,
     batch: *ReviewBatch,
     arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
@@ -449,6 +467,28 @@ const ReviewWorker = struct {
     route_outcome: ?adaptive.Outcome = null,
     policy: queue.Budget = .{},
     rate_limits: u8 = 0,
+
+    fn jobKey(a: A, repo: core.Repo, job: core.Job) ![32]u8 {
+        const encoded = try io.json(a, .{ .repo = repo, .job = job });
+        defer a.free(encoded);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
+        return digest;
+    }
+
+    fn rebind(self: *ReviewWorker, a: A, state: *store.State) !bool {
+        const entry = state.find(self.adapter.repo.name) orelse return false;
+        for (entry.jobs) |*job| {
+            if (job.number != self.prepared.pr.number or !eq(u8, job.head, self.prepared.pr.headRefOid)) continue;
+            if (!eq(u8, &self.job_key, &(try jobKey(a, entry.repo, job.*)))) return false;
+            self.job = job;
+            self.adapter.entry = entry;
+            self.adapter.state = state;
+            self.adapter.db.a = a;
+            return true;
+        }
+        return false;
+    }
 
     pub fn available(self: *ReviewWorker, engine: core.Engine) bool {
         const now = std.time.timestamp();
@@ -883,10 +923,17 @@ const Main = struct {
         job.observeReviewInput(current, legacy_changed, repo.approvals);
     }
 
-    fn tick(self: Main, state: *store.State) !void {
+    fn tick(self: Main, state: *store.State, lock: std.fs.File) !void {
         var counts: queue.TickCounts = .{ .at = std.time.timestamp() };
         var worker = self;
         worker.counts = &counts;
+        try worker.scanDue(state, &counts);
+        if (state.entries.len == 0) return;
+        try worker.tickFollowup(state, &counts);
+        try worker.reviewBatch(state, &counts, lock);
+    }
+
+    fn scanDue(self: Main, state: *store.State, counts: *queue.TickCounts) !void {
         for (state.entries) |*entry| {
             const now = std.time.timestamp();
             var changed = false;
@@ -898,7 +945,7 @@ const Main = struct {
                 changed = true;
             }
             if (entry.next_scan <= now and state.queue_budget.canScan(now) and !try self.db.paused(entry.repo.name)) {
-                if (worker.scan(entry, state.followups)) |_| {
+                if (self.scan(entry, state.followups)) |_| {
                     entry.last_scan = std.time.timestamp();
                     entry.next_scan = entry.last_scan + entry.repo.interval;
                     entry.scan_attempts = 0;
@@ -911,16 +958,9 @@ const Main = struct {
                 changed = true;
             }
             if (changed) {
-                if (counts.github_commands != 0) state.queue_budget.last_tick = counts;
+                if (counts.github_commands != 0) state.queue_budget.last_tick = counts.*;
                 try self.db.save(state);
             }
-        }
-        if (state.entries.len == 0) return;
-        try worker.tickFollowup(state, &counts);
-        try worker.reviewBatch(state, &counts);
-        if (counts.jobs != 0) {
-            state.queue_budget.last_tick = counts;
-            try self.db.save(state);
         }
     }
 
@@ -1067,7 +1107,7 @@ const Main = struct {
         try self.showQueueBudget(state.queue_budget);
     }
 
-    fn reviewBatch(self: Main, state: *store.State, counts: *queue.TickCounts) !void {
+    fn reviewBatch(self: Main, state: *store.State, counts: *queue.TickCounts, lock: std.fs.File) !void {
         const limit = state.queue_budget.limit;
         var batch: ReviewBatch = .{ .starts_left = limit -| counts.reviewer_starts, .receipts_left = limit, .meter = self.meter };
         defer batch.deinit();
@@ -1087,10 +1127,31 @@ const Main = struct {
             for (repos[0..active]) |*lane| _ = try self.admit(state, counts, &batch, lane, true);
         }
         if (batch.deferred_repo) |index| state.queue_budget.next_repo = index;
+        if (counts.jobs != 0) {
+            state.queue_budget.last_tick = counts.*;
+            try self.db.save(state);
+        }
 
         while (batch.pending != 0) {
-            batch.completed.wait();
-            try self.finishReady(state, counts, &batch);
+            // launchd runs one tick at a time. Keep scanning on its normal
+            // cadence, and leave the state lock open to operator commands.
+            lock.unlock();
+            batch.completed.timedWait(15 * std.time.ns_per_s) catch {};
+            try lock.lock(.exclusive);
+
+            var cycle = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer cycle.deinit();
+            var fresh = self;
+            fresh.a = cycle.allocator();
+            fresh.db.a = fresh.a;
+            var current = try fresh.db.load();
+            const pending = batch.pending;
+            try fresh.finishReady(&current, counts, &batch);
+            try fresh.scanDue(&current, counts);
+            if (pending != batch.pending) {
+                current.queue_budget.last_tick = counts.*;
+                try fresh.db.save(&current);
+            }
         }
     }
 
@@ -1103,6 +1164,16 @@ const Main = struct {
             batch.pending -= 1;
             counts.reviewer_starts += work.counts.reviewer_starts;
             if (work.plan) |plan| batch.starts_left += plan.start_limit - work.counts.reviewer_starts;
+            for (std.meta.tags(core.Engine)) |engine| {
+                if (work.rate_limits & queue.engineBit(engine) == 0) continue;
+                const err = switch (engine) {
+                    .codex => error.CodexRateLimited,
+                    .claude => error.ClaudeRateLimited,
+                    .kimi => error.KimiRateLimited,
+                };
+                state.queue_budget.noteFailure(std.time.timestamp(), err);
+            }
+            if (!try work.rebind(self.a, state)) continue;
             self.finishJob(state, work) catch |err| switch (err) {
                 error.ReviewerCoolingDown, error.ProviderBudgetReached => {
                     if (work.plan == null) batch.starts_left += queue.reviewerCost(work.adapter.repo) - work.counts.reviewer_starts;
@@ -1200,13 +1271,15 @@ const Main = struct {
                 progress.all_models = true;
                 screen.floor = routing.all_lenses;
             }
+            if (work.prepared.sections.len != 0 and !work.prepared.onchain_available) screen.ask_model = false;
+            const section = work.prepared.section(progress.sections.index);
             if (progress.onchain_reads.len != 0 and progress.onchain_observations == null) {
                 progress.onchain_observations = try work.adapter.onchainReads(work.prepared.pr, progress.onchain_reads);
             }
             var evidence: ?[]const u8 = null;
             var evidence_limited = false;
             if (progress.evidence_requests.len != 0) {
-                const pinned = try work.adapter.reviewEvidence(work.prepared.pr, progress.evidence_requests, adaptive.evidenceCapacity(work.prepared));
+                const pinned = try work.adapter.reviewEvidence(work.prepared.pr, progress.evidence_requests, adaptive.evidenceCapacity(section));
                 evidence = pinned.source;
                 evidence_limited = pinned.limited;
                 var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -1230,7 +1303,7 @@ const Main = struct {
             var completion_evidence: ?adaptive.PinnedEvidence = null;
             if (progress.completion_requests) |requests| {
                 if (requests.len != 0) {
-                    const capacity = try adaptive.completionCapacity(work.prepared, evidence orelse "", progress.onchain_observations orelse &.{}, self.a);
+                    const capacity = try adaptive.completionCapacity(section, evidence orelse "", progress.onchain_observations orelse &.{}, self.a);
                     completion_evidence = try work.adapter.reviewEvidence(work.prepared.pr, requests, capacity);
                 }
             }
@@ -1248,6 +1321,7 @@ const Main = struct {
         }
         if (!state.queue_budget.canReview(entry.repo, job.route_progress, std.time.timestamp(), batch.limited.load(.monotonic), batch.usageSnapshot()))
             return error.ReviewerCoolingDown;
+        work.job_key = try ReviewWorker.jobKey(self.a, entry.repo, job.*);
         work.thread = try std.Thread.spawn(.{}, ReviewWorker.analyze, .{work});
         batch.pending += 1;
         batch.workers[batch.len] = work;
@@ -1257,24 +1331,17 @@ const Main = struct {
     fn finishJob(self: Main, state: *store.State, work: *ReviewWorker) !void {
         const results = try work.result;
         if (work.route_outcome) |outcome| {
-            for (std.meta.tags(core.Engine)) |engine| {
-                if (work.rate_limits & queue.engineBit(engine) != 0) {
-                    const err = switch (engine) {
-                        .codex => error.CodexRateLimited,
-                        .claude => error.ClaudeRateLimited,
-                        .kimi => error.KimiRateLimited,
-                    };
-                    state.queue_budget.noteFailure(std.time.timestamp(), err);
-                }
-            }
             if (outcome.report) |report| {
                 work.prepared.route_depth = report.applied.depth;
                 work.prepared.synthesis_provider = report.synthesis_provider;
                 work.prepared.synthesis_summary = outcome.synthesis_summary;
                 work.prepared.additional_evidence_limited = outcome.evidence_limited;
-                work.prepared.evidence_requests = try std.mem.concat(self.a, core.EvidenceRequest, &.{
-                    outcome.progress.evidence_requests, outcome.progress.completion_requests orelse &.{},
-                });
+                work.prepared.evidence_requests = if (report.diff_sections != 0)
+                    outcome.progress.sections.evidence_requests
+                else
+                    try std.mem.concat(self.a, core.EvidenceRequest, &.{
+                        outcome.progress.evidence_requests, outcome.progress.completion_requests orelse &.{},
+                    });
                 work.prepared.onchain_observations = report.onchain_observations;
                 work.job.route_report = report;
                 work.job.route_report.?.providers = try self.a.dupe(core.Engine, report.providers);
@@ -1491,7 +1558,7 @@ const Main = struct {
                 // Show pins and scheduling separately without echoing stored PR text.
                 summary.stacks = &.{};
                 summary.jobs = try self.a.dupe(core.Job, entry.jobs);
-                const PendingRoute = struct { number: u32, head: []const u8, decision: ?routing.Decision, completed_passes: usize, all_models: bool };
+                const PendingRoute = struct { number: u32, head: []const u8, decision: ?routing.Decision, completed_passes: usize, completed_sections: usize, all_models: bool };
                 var pending: std.ArrayList(PendingRoute) = .empty;
                 for (summary.jobs) |*job| {
                     if (job.route_progress) |progress| try pending.append(self.a, .{
@@ -1499,6 +1566,7 @@ const Main = struct {
                         .head = job.head,
                         .decision = progress.decision,
                         .completed_passes = progress.results.len,
+                        .completed_sections = progress.sections.index,
                         .all_models = progress.all_models,
                     });
                     job.analysis = null;
@@ -1610,7 +1678,7 @@ const Main = struct {
         }
     }
 
-    fn withUsage(self: Main, state: *store.State, preview_args: ?[]const []const u8) !void {
+    fn withUsage(self: Main, state: *store.State, lock: std.fs.File, preview_args: ?[]const []const u8) !void {
         var metered = self;
         var ledger: usage_meter.Ledger = .{
             .dir = self.db.dir,
@@ -1618,17 +1686,17 @@ const Main = struct {
         };
         metered.meter = &ledger;
         if (preview_args) |args| return metered.dry(state, args);
-        return metered.tick(state);
+        return metered.tick(state, lock);
     }
 
-    fn scheduledTick(self: Main) !void {
+    fn scheduledTick(self: Main, lock: std.fs.File) !void {
         log_retention.maintain(self.a, self.db.dir, std.time.nanoTimestamp()) catch |err|
             std.log.warn("diagnostic log maintenance failed ({s})", .{@errorName(err)});
         defer log_retention.maintain(self.a, self.db.dir, std.time.nanoTimestamp()) catch |err|
             std.log.warn("diagnostic log maintenance failed ({s})", .{@errorName(err)});
         const result: anyerror!void = tick: {
             var state = self.db.load() catch |err| break :tick err;
-            break :tick self.withUsage(&state, null);
+            break :tick self.withUsage(&state, lock, null);
         };
         result catch |err| {
             std.log.err("{s}", .{@errorName(err)});
@@ -1677,12 +1745,20 @@ const Main = struct {
             const env = try pick(self.a, self.env, &common_env);
             return launchd.manage(self.local(null).command(&env), self.home, self.env.get("PATH") orelse "/usr/bin:/bin", self.db.path, label, eq(u8, cmd, "install"));
         }
+        const is_tick = eq(u8, cmd, "tick") and params.len == 0;
+        const followup_preview = eq(u8, cmd, "followup") and params.len == 2 and eq(u8, params[1], "--dry-run");
+        const uses_providers = is_tick or followup_preview or eq(u8, cmd, "run-once") or eq(u8, cmd, "usage");
+        const batch_lock = if (uses_providers) self.db.batchLock() catch |err| {
+            if (err == error.AlreadyRunning and is_tick) return;
+            return err;
+        } else null;
+        defer if (batch_lock) |file| file.close();
         const lock = self.db.lock() catch |err| {
-            if (err == error.AlreadyRunning and eq(u8, cmd, "tick")) return;
+            if (err == error.AlreadyRunning and is_tick) return;
             return err;
         };
         defer lock.close();
-        if (eq(u8, cmd, "tick") and params.len == 0) return self.scheduledTick();
+        if (is_tick) return self.scheduledTick(lock);
         var state = try self.db.load();
         if (eq(u8, cmd, "add")) return self.add(&state, params);
         if (eq(u8, cmd, "followup")) return self.followupCommand(&state, params);
@@ -1695,7 +1771,7 @@ const Main = struct {
             try usage_meter.save(self.db.dir, current);
             return self.showUsage(&state, current);
         }
-        if (eq(u8, cmd, "run-once")) return self.withUsage(&state, params);
+        if (eq(u8, cmd, "run-once")) return self.withUsage(&state, lock, params);
         if (eq(u8, cmd, "stack")) return self.registerStack(&state, params);
         if (eq(u8, cmd, "unstack") and params.len == 2) {
             const entry = state.find(params[0]) orelse return error.UnknownRepository;
@@ -1979,6 +2055,48 @@ test "numbered preview accepts each mode and one operator prompt" {
     try t.expectError(error.Usage, Main.reviewOptions(&.{ "--prompt", "Check retries.", "--publish" }, false));
     try t.expectError(error.Usage, Main.reviewOptions(&.{"--publish"}, true));
     try t.expect((try Main.reviewOptions(&.{ "--publish", "--prompt", "Check retries." }, true)).publish_prompted);
+}
+
+test "completion fits encoded excerpts and leaves room for later small requests" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const large = "\t\t\t\t\t\t\t\t";
+    const small = "\nkeep();";
+    const fitted = try Adapter.fitEvidence(a, .{
+        .evidence = large ++ small,
+        .excerpts = &.{
+            .{ .request = .{ .path = "large.zig", .start_line = null, .end_line = null }, .start_offset = 0, .end_offset = large.len },
+            .{ .request = .{ .path = "small.zig", .start_line = null, .end_line = null }, .start_offset = large.len, .end_offset = large.len + small.len },
+        },
+    }, 11);
+    try t.expect(fitted.limited);
+    try t.expectEqualStrings(small, fitted.source);
+    try t.expectEqual(@as(usize, 1), fitted.provided.len);
+    try t.expectEqualStrings("small.zig", fitted.provided[0].path);
+}
+
+test "an in-flight review binds to the reloaded job and discards a superseded job" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const head = "a" ** 40;
+    const repo: core.Repo = .{ .name = "example/review", .login = "reviewer" };
+    var original: core.Job = .{ .number = 42, .head = head };
+    var work: ReviewWorker = .{ .job = &original, .batch = undefined };
+    work.adapter.repo = repo;
+    work.prepared.pr = .{ .number = 42, .headRefOid = head, .isDraft = true };
+    work.job_key = try ReviewWorker.jobKey(a, repo, original);
+
+    var reloaded = [_]core.Job{ original, .{ .number = 43, .head = head } };
+    var entries = [_]core.Entry{.{ .repo = repo, .jobs = &reloaded }};
+    var state: store.State = .{ .entries = &entries };
+    try t.expect(try work.rebind(a, &state));
+    try t.expect(work.job == &reloaded[0]);
+    reloaded[0].options.focus = .simplicity;
+    try t.expect(!try work.rebind(a, &state));
 }
 
 test "review workers overlap and use separate scratch directories" {

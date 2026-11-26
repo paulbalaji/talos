@@ -19,7 +19,7 @@ const thread_context_limit = 12 * 1024;
 const thread_excerpt_limit = 2 * 1024;
 const max_thread_excerpts = 12;
 pub const max_requests = core.max_evidence_requests;
-const supplement_limit = 16 * 1024;
+const supplement_limit = 32 * 1024;
 const scraper_context_limit = 10 * 1024;
 const delta_limit = 12 * 1024;
 const excerpt_blob_limit = 128 * 1024;
@@ -47,7 +47,8 @@ pub const Supplement = struct {
     evidence: []const u8 = "",
     limited: bool = false,
     coverage_reasons: []const []const u8 = &.{},
-    excerpts: []const struct { request: core.EvidenceRequest, end_offset: usize } = &.{},
+    excerpts: []const struct { request: core.EvidenceRequest, start_offset: usize, end_offset: usize } = &.{},
+    omissions: []const u8 = "",
 };
 
 const diff_flags = [_][]const u8{
@@ -231,9 +232,12 @@ pub const Git = struct {
         const missing_threads = try self.appendThreadExcerpts(path, pr.headRefOid, files, threads, prefix.len == patch.len, &evidence, &remaining);
         const writer = evidence.writer(a);
         if (evidence.items.len != 0) try writer.writeAll("\n\n");
-        try writer.print("Merge-base diff:\n{s}", .{prefix});
+        try writer.writeAll("Merge-base diff:\n");
+        const diff_start = evidence.items.len;
+        try writer.writeAll(prefix);
+        const diff_end = evidence.items.len;
         var coverage: std.ArrayList([]const u8) = .empty;
-        if (prefix.len != patch.len) try coverage.append(a, "The merge base diff exceeded the byte limit.");
+        if (prefix.len != patch.len) try coverage.append(a, core.diff_byte_limit_reason);
         if (missing_threads != 0) try coverage.append(a, try io.fmt(a, "Current source excerpts were unavailable for {d} active review thread anchors.", .{missing_threads}));
         if (files.len >= 3000) try coverage.append(a, "GitHub reached its changed file limit.");
         var sensitive_count: usize = 0;
@@ -317,7 +321,17 @@ pub const Git = struct {
                 }
             }
         }
-        return .{ .merge_base = merge_base, .evidence = evidence.items, .limited = coverage.items.len != 0, .coverage_reasons = coverage.items, .registry_logo_only = logo_only, .relayer_promotion = image.promotion, .optional_evidence_start = image.optional_start, .onchain_reads = onchain_reads };
+        return .{
+            .merge_base = merge_base,
+            .evidence = evidence.items,
+            .limited = coverage.items.len != 0,
+            .coverage_reasons = coverage.items,
+            .registry_logo_only = logo_only,
+            .relayer_promotion = image.promotion,
+            .optional_evidence_start = image.optional_start,
+            .onchain_reads = onchain_reads,
+            .large_diff = if (prefix.len == patch.len) null else .{ .patch = patch, .start = diff_start, .end = diff_end },
+        };
     }
 
     fn warpCapacityRequests(self: Git, path: []const u8, pr: core.Pull, merge_base: []const u8, files: []const github.File) ![]const onchain.Request {
@@ -782,6 +796,7 @@ pub const Git = struct {
         const a = self.cmd.a;
         if (!core.validOid(pr.headRefOid) or !core.validOid(pr.baseRefOid)) return error.InvalidCommit;
         try self.prepare(repo_dir, path);
+        if (try self.cachedPinsMatch(path, pr)) return;
         const head_ref = "refs/talos/head";
         const base_ref = "refs/talos/base";
         const args = fetch_flags ++ [_][]const u8{
@@ -962,21 +977,30 @@ pub const Git = struct {
         var remaining: usize = supplement_limit;
         var requests_incomplete = requests.len > max_requests;
         var excerpts: std.ArrayList(std.meta.Child(@FieldType(Supplement, "excerpts"))) = .empty;
+        var omissions: std.ArrayList(u8) = .empty;
         for (requests[0..@min(requests.len, max_requests)], 1..) |request, index| {
+            const start_offset = evidence.items.len;
             if (self.appendExcerpt(cache_path, head, request, null, &evidence, &remaining)) |complete| {
                 requests_incomplete = requests_incomplete or !complete;
-                try excerpts.append(a, .{ .request = request, .end_offset = evidence.items.len });
+                try excerpts.append(a, .{ .request = request, .start_offset = start_offset, .end_offset = evidence.items.len });
             } else |err| {
                 if (err == error.OutOfMemory) return err;
-                try writer.print("Evidence request {d} omitted ({s}).\n", .{ index, excerptOmission(err) });
+                try omissions.writer(a).print("Evidence request {d} omitted ({s}).\n", .{ index, excerptOmission(err) });
                 requests_incomplete = true;
             }
         }
         if (requests.len > max_requests) {
-            try writer.writeAll("Remaining evidence requests omitted (request budget).\n");
+            try omissions.appendSlice(a, "Remaining evidence requests omitted (request budget).\n");
         }
+        try writer.writeAll(omissions.items);
         if (requests_incomplete) try coverage.append(a, "Some requested pinned source excerpts were omitted or clipped.");
-        return .{ .evidence = evidence.items, .limited = coverage.items.len != 0, .coverage_reasons = coverage.items, .excerpts = excerpts.items };
+        return .{
+            .evidence = evidence.items,
+            .limited = coverage.items.len != 0,
+            .coverage_reasons = coverage.items,
+            .excerpts = excerpts.items,
+            .omissions = omissions.items,
+        };
     }
 
     fn appendExcerpt(self: Git, cache_path: []const u8, head: []const u8, request: core.EvidenceRequest, anchor_line: ?u32, evidence: *std.ArrayList(u8), remaining: *usize) !bool {
@@ -989,11 +1013,19 @@ pub const Git = struct {
         if (anchor_line) |line| {
             if (excerpt.end < line) return error.ExcerptPastEnd;
         }
-        const prefix = excerpt.text[0..core.safePrefix(excerpt.text, remaining.* - request.path.len - 160)];
+        const bytes = remaining.* - request.path.len - 160;
+        const prefix = if (excerpt.text.len <= bytes) excerpt.text else trimmed: {
+            const newline = std.mem.lastIndexOfScalar(u8, excerpt.text[0..bytes], '\n') orelse return error.ExcerptBudget;
+            break :trimmed excerpt.text[0 .. newline + 1];
+        };
+        const end = if (prefix.len == excerpt.text.len) excerpt.end else lines.start + @as(u32, @intCast(std.mem.count(u8, prefix, "\n"))) - 1;
+        if (anchor_line) |line| {
+            if (end < line) return error.ExcerptBudget;
+        }
         const complete = !(excerpt.more and (lines.clipped or (request.end_line == null and request.line_contains == null))) and prefix.len == excerpt.text.len;
         const start = evidence.items.len;
         try evidence.writer(a).print("\nPinned head file {s}, lines {d}-{d}{s}:\n{s}\n", .{
-            request.path, lines.start, excerpt.end, if (complete) "" else " (excerpt clipped by budget)", prefix,
+            request.path, lines.start, end, if (complete) "" else " (excerpt clipped by budget)", prefix,
         });
         remaining.* -= evidence.items.len - start;
         return complete;

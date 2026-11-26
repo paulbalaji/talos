@@ -68,6 +68,8 @@ After a review, Talos checks for substantive PR conversation, human replies to r
 
 Talos puts files with active review threads and risky code early in the bounded diff. It also reads pinned source around current right-side thread anchors. Incomplete current evidence and unassessed open threads prevent approval. Reviewers can still approve when the current head is fully covered and the only gap is a clipped historical delta.
 
+Scheduled reviews split large diffs on Git hunk boundaries. Each section runs through the selected reviewers, and Talos checkpoints completed sections and combines their verdicts before it publishes one review. Hunks outside the section limits keep coverage incomplete. During model runs, the watcher continues scanning due repos and accepts new queue requests.
+
 A new thread containing only automated replies does not invalidate an in-flight review. Edits to reviewed threads and new human threads still require current inputs.
 
 If a rereview finds an issue after an approval, its comment flags the earlier approval for a person to reassess. On upgrade, Talos uses newer human replies to catch up completed reviews. It tracks resolution changes from the first successful scan.
