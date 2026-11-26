@@ -317,7 +317,12 @@ pub const Review = struct {
     existing_open_findings: []const []const u8,
     non_blocking_threads: ?[]const ThreadAssessment = null,
 };
-pub const ReviewerResult = struct { engine: Engine, review: Review, complete_before_synthesis: ?bool = null };
+pub const ReviewerResult = struct {
+    engine: Engine,
+    review: Review,
+    lens_index: ?usize = null,
+    complete_before_synthesis: ?bool = null,
+};
 pub const Event = enum { COMMENT, APPROVE };
 
 pub const Inline = struct { path: []const u8, line: u32, side: []const u8 = "RIGHT", body: []const u8 };

@@ -394,6 +394,43 @@ const PreviewReviewer = struct {
     }
 };
 
+fn limitedEngine(err: anyerror) ?core.Engine {
+    return switch (err) {
+        error.CodexRateLimited => .codex,
+        error.ClaudeRateLimited => .claude,
+        error.KimiRateLimited => .kimi,
+        else => null,
+    };
+}
+
+const ParallelPass = struct {
+    worker: *const ReviewWorker,
+    request: adaptive.FullPass,
+    arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+    counts: queue.TickCounts = .{},
+    output: anyerror![]const u8 = undefined,
+
+    fn run(self: *ParallelPass) void {
+        self.output = self.runInScratch();
+        if (self.output) |_| {} else |err| {
+            if (limitedEngine(err)) |engine| _ = self.worker.batch.limited.fetchOr(queue.engineBit(engine), .monotonic);
+        }
+    }
+
+    fn runInScratch(self: *ParallelPass) ![]const u8 {
+        var tools = self.worker.tools;
+        tools.a = self.arena.allocator();
+        tools.counts = &self.counts;
+        const name = @tagName(self.request.engine);
+        tools.scratch = try std.fs.path.joinZ(tools.a, &.{ tools.scratch, name });
+        const parent = tools.scratch_dir;
+        tools.scratch_dir = try parent.makeOpenPath(name, .{});
+        defer parent.deleteTree(name) catch {};
+        defer tools.scratch_dir.close();
+        return invokeReviewer(tools, self.request.engine, self.worker.fullProfile(self.request.engine), core.schema, self.request.prompt);
+    }
+};
+
 const ReviewWorker = struct {
     // Only the coordinator uses adapter, gh_env and job. The worker borrows
     // immutable context and uses its own arena, processes and scratch directory.
@@ -423,27 +460,50 @@ const ReviewWorker = struct {
         return self.counts.reviewer_starts;
     }
 
+    fn fullProfile(self: *const ReviewWorker, engine: core.Engine) runner.Profile {
+        var profile = reviewerProfile(self.adapter.repo, engine);
+        if (self.prepared.all_models) profile.effort = .max;
+        return profile;
+    }
+
     pub fn routeReview(self: *ReviewWorker, engine: core.Engine, model: ?[]const u8, schema: []const u8, prompt: []const u8) ![]const u8 {
-        var profile = if (model) |light|
+        const profile = if (model) |light|
             runner.Profile{ .model = light, .effort = .default }
         else
-            reviewerProfile(self.adapter.repo, engine);
-        if (model == null and self.prepared.all_models) profile.effort = .max;
+            self.fullProfile(engine);
         return invokeReviewer(self.tools, engine, profile, schema, prompt) catch |err| {
             self.noteRateLimit(engine, err);
             return err;
         };
     }
 
-    fn noteRateLimit(self: *ReviewWorker, engine: core.Engine, err: anyerror) void {
-        switch (err) {
-            error.CodexRateLimited, error.ClaudeRateLimited, error.KimiRateLimited => {
-                const bit = queue.engineBit(engine);
-                self.rate_limits |= bit;
-                _ = self.batch.limited.fetchOr(bit, .monotonic);
-            },
-            else => {},
+    pub fn routeParallel(self: *ReviewWorker, requests: []const adaptive.FullPass, outputs: []anyerror![]const u8) !void {
+        var tasks: [core.engine_count]ParallelPass = undefined;
+        var threads: [core.engine_count]?std.Thread = @splat(null);
+        const running = tasks[0..requests.len];
+        for (running, requests, threads[0..running.len]) |*task, request, *thread| {
+            task.* = .{ .worker = self, .request = request };
+            thread.* = std.Thread.spawn(.{}, ParallelPass.run, .{task}) catch fallback: {
+                task.run();
+                break :fallback null;
+            };
         }
+        for (threads[0..running.len]) |thread| if (thread) |active| active.join();
+        defer for (running) |*task| task.arena.deinit();
+        for (running) |task| {
+            self.counts.reviewer_starts += task.counts.reviewer_starts;
+            if (task.output) |_| {} else |err| self.noteRateLimit(task.request.engine, err);
+        }
+        for (running, outputs) |task, *output| {
+            output.* = if (task.output) |raw| try self.tools.a.dupe(u8, raw) else |err| err;
+        }
+    }
+
+    fn noteRateLimit(self: *ReviewWorker, engine: core.Engine, err: anyerror) void {
+        if (limitedEngine(err) == null) return;
+        const bit = queue.engineBit(engine);
+        self.rate_limits |= bit;
+        _ = self.batch.limited.fetchOr(bit, .monotonic);
     }
 
     fn remainingLimited(engines: []const core.Engine, current: core.Engine, limited: u8) bool {
@@ -1971,6 +2031,61 @@ test "review workers overlap and use separate scratch directories" {
     try t.expect(!eq(u8, one, two));
     try t.expectError(error.FileNotFound, std.fs.accessAbsolute(one, .{}));
     try t.expectError(error.FileNotFound, std.fs.accessAbsolute(two, .{}));
+}
+
+test "providers in one review overlap and clean up their own scratch" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try io.temp(a);
+    defer std.fs.deleteTreeAbsolute(path) catch {};
+    var dir = try std.fs.openDirAbsolute(path, .{});
+    defer dir.close();
+    const program =
+        \\#!/bin/sh
+        \\set -eu
+        \\cd -P .
+        \\printf '%s' "$PWD" > "$HOME/${0##*/}.cwd"
+        \\i=0
+        \\while [ ! -s "$HOME/fake-codex.cwd" ] || [ ! -s "$HOME/fake-claude.cwd" ]; do
+        \\    [ "$i" -lt 100 ] || exit 1
+        \\    i=$((i + 1))
+        \\    sleep 0.05
+        \\done
+        \\review='{"complete":true,"summary":"Fixture","findings":[],"existing_open_findings":[],"non_blocking_threads":[]}'
+        \\case "${0##*/}" in
+        \\  fake-codex)
+        \\    while [ "$1" != "--output-last-message" ]; do shift; done
+        \\    printf '%s' "$review" > "$2" ;;
+        \\  fake-claude) printf '{"is_error":false,"structured_output":%s}' "$review" ;;
+        \\esac
+    ;
+    try writeExecutable(dir, "fake-codex", program);
+    try writeExecutable(dir, "fake-claude", program);
+    var env = std.process.EnvMap.init(a);
+    try env.put("HOME", path);
+    try env.put("PATH", "/usr/bin:/bin");
+    const repo: core.Repo = .{
+        .name = "test/repo",
+        .login = "test",
+        .codex = try dir.realpathAlloc(a, "fake-codex"),
+        .claude = try dir.realpathAlloc(a, "fake-claude"),
+    };
+    var batch: ReviewBatch = .{ .starts_left = 2, .receipts_left = 0 };
+    var worker: ReviewWorker = .{ .job = undefined, .batch = &batch };
+    worker.adapter.repo = repo;
+    worker.prepared.all_models = true;
+    worker.tools = .{ .a = a, .env = &env, .scratch = path, .scratch_dir = dir, .programs = Programs.fromRepo(repo) };
+    var results: [2]anyerror![]const u8 = undefined;
+    try worker.routeParallel(&.{
+        .{ .engine = .codex, .prompt = "One", .lens_index = 0 },
+        .{ .engine = .claude, .prompt = "Two", .lens_index = 1 },
+    }, &results);
+    for (results) |result| try t.expectEqualStrings("Fixture", (try core.parseReview(a, try result)).summary);
+    try t.expectEqual(@as(u32, 2), worker.counts.reviewer_starts);
+    try t.expectError(error.FileNotFound, dir.access("codex", .{}));
+    try t.expectError(error.FileNotFound, dir.access("claude", .{}));
 }
 
 test "reviewer cooldown applies to the remaining ensemble" {
