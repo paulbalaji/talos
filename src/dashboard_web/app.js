@@ -42,6 +42,8 @@ let displayChart = "calls";
 let chartObserver = null;
 let pollTimer = null;
 let refreshIndicatorTimer = null;
+let tooltipAnchor = null;
+let tooltipTimer = null;
 let queueLookup = null;
 let queueSending = null;
 const renderKeys = new Map();
@@ -187,6 +189,7 @@ function update(key, value, render) {
 }
 
 function replace(container, content) {
+  if (tooltipAnchor && container.contains(tooltipAnchor)) hideTooltip();
   const focus = document.activeElement;
   const key = container.contains(focus) ? focus?.dataset?.reviewKey : null;
   container.replaceChildren(content);
@@ -194,6 +197,50 @@ function replace(container, content) {
     const next = Array.from(container.querySelectorAll("[data-review-key]")).find((node) => node.dataset.reviewKey === key);
     next?.focus({ preventScroll: true });
   }
+}
+
+function hideTooltip() {
+  clearTimeout(tooltipTimer);
+  tooltipAnchor?.removeAttribute("aria-describedby");
+  tooltipAnchor = null;
+  byId("dashboard-tooltip").hidden = true;
+}
+
+function revealTooltip(anchor, title, rows, point = null) {
+  hideTooltip();
+  const tip = byId("dashboard-tooltip");
+  const grid = element("dl");
+  for (const [name, value] of rows) {
+    if (value) grid.append(element("dt", null, name), element("dd", null, value));
+  }
+  tip.replaceChildren(element("strong", null, title), grid);
+  tip.hidden = false;
+  const rect = anchor.getBoundingClientRect();
+  const edge = 8;
+  const left = Math.max(edge, Math.min(point?.x ?? rect.left, document.documentElement.clientWidth - tip.offsetWidth - edge));
+  const below = (point?.y ?? rect.bottom) + edge;
+  const top = below + tip.offsetHeight <= window.innerHeight - edge ? below : (point?.y ?? rect.top) - tip.offsetHeight - edge;
+  tip.style.left = `${left}px`;
+  tip.style.top = `${Math.max(edge, top)}px`;
+  tooltipAnchor = anchor;
+  anchor.setAttribute("aria-describedby", tip.id);
+}
+
+function delayTooltipHide(anchor) {
+  clearTimeout(tooltipTimer);
+  tooltipTimer = setTimeout(() => {
+    if (tooltipAnchor === anchor) hideTooltip();
+  }, 130);
+}
+
+function tooltipFor(anchor, title, rows) {
+  anchor.tabIndex = 0;
+  const show = () => revealTooltip(anchor, title, rows);
+  anchor.addEventListener("pointerenter", show);
+  anchor.addEventListener("focus", show);
+  anchor.addEventListener("pointerleave", () => delayTooltipHide(anchor));
+  anchor.addEventListener("blur", () => delayTooltipHide(anchor));
+  return anchor;
 }
 
 function note(container, message, tone = "") {
@@ -248,7 +295,7 @@ function phaseLabel(status) {
   return output;
 }
 
-function progressLabel(job) {
+function progressLabel(job, inspect = true) {
   const wrap = element("div", "job-progress");
   const percent = Number.isFinite(job.percent) ? Math.max(0, Math.min(100, Math.round(job.percent))) : null;
   const completed = job.completed_sections || 0;
@@ -272,6 +319,17 @@ function progressLabel(job) {
       track.append(shimmer);
     }
     wrap.append(track);
+  }
+  const active = list(job.active_providers);
+  if (inspect && (sectionCount || active.length || job.blocked_by)) {
+    wrap.dataset.reviewKey = `${keyOf(job.repo, job.number)}:${job.head}:progress`;
+    return tooltipFor(wrap, `PR #${job.number}`, [
+      ["Sections reviewed", sectionCount ? `${completed} of ${job.total_sections}` : ""],
+      ["Sections left", sectionCount ? count(Math.max(0, job.total_sections - completed)) : ""],
+      ["Waiting for", job.blocked_by ? `#${job.blocked_by}` : ""],
+      ...active.map((item) => [phrase([humanize(item.engine), item.model]),
+        phrase([humanize(item.stage), item.section != null && `Section ${item.section}`, item.at && `Started ${date(item.at)}`])]),
+    ]);
   }
   return wrap;
 }
@@ -316,8 +374,11 @@ function reviewKey(item, head = null, showDetails = true, stack = null) {
   label.setAttribute("aria-label", `Review details for ${item.repo} #${item.number}`);
   label.dataset.reviewKey = phrase([keyOf(item.repo, item.number), head, item.at]);
   label.addEventListener("click", () => openReview(item.repo, item.number, head, item.at ?? null, item.review_id ?? null));
-  wrap.append(label);
-  if (showDetails && item.title) wrap.append(element("span", "review-title", item.title));
+  if (showDetails && item.title) {
+    const line = element("div", "review-keyline");
+    line.append(label, element("span", "review-title", item.title));
+    wrap.append(line);
+  } else wrap.append(label);
   if (showDetails) {
     const metadata = element("span", "review-repo", phrase([item.repo, item.draft && "Draft"]));
     if (stack) {
@@ -488,6 +549,16 @@ function historyStatus(row) {
   return phrase([result, publication]);
 }
 
+function historyVerdict(row) {
+  const verdict = element("span", "inspectable", historyStatus(row));
+  verdict.dataset.reviewKey = `${keyOf(row.repo, row.number)}:${row.head}:${row.at}:verdict`;
+  return tooltipFor(verdict, `Verdict for #${row.number}`, [
+    ["Head", row.head?.slice(0, 12)], ["Depth", humanize(row.route)],
+    ["Coverage", row.complete === true ? "Complete" : row.complete === false ? "Limited" : "Unknown"],
+    ["Publication", humanize(row.publication)], ["GitHub review", row.review_id ? `#${row.review_id}` : ""], ["Saved", date(row.at)],
+  ]);
+}
+
 function renderHistory() {
   const history = list(historySnapshot);
   const desired = byId("history-filter").value;
@@ -499,7 +570,7 @@ function renderHistory() {
   byId("history-summary").textContent = history.length ? plural(history.length, "saved verdict") : "Saved verdicts";
   update("history", ordered, () => {
     replace(byId("history-results"), renderTable(["Pull request", "Verdict", "Depth", "Coverage", ["Saved", "time-cell"]], ordered.map((item) => [
-      reviewKey(item, item.head), historyStatus(item), humanize(item.route) || "—",
+      reviewKey(item, item.head), historyVerdict(item), humanize(item.route) || "—",
       item.complete === true ? "Complete" : item.complete === false ? "Limited" : "—", date(item.at),
     ]), historySnapshot ? "No matching saved verdicts." : "Loading saved verdicts…"));
   });
@@ -588,12 +659,14 @@ function drawChart(canvas, series) {
     context.textAlign = "center";
     context.fillText(chartDay(series[Math.floor(series.length / 2)].day), left + plot / 2, height - 3);
   }
+  return { left, step, top, bottom };
 }
 
 function renderMetrics() {
   const metrics = metricsSnapshot;
   if (!metrics) return;
-  update("metrics", metrics, () => {
+  const { through, ledger, ...display } = metrics;
+  update("metrics", display, () => {
     chartObserver?.disconnect();
     const content = document.createDocumentFragment();
     const totals = element("div", "metric-grid");
@@ -622,16 +695,51 @@ function renderMetrics() {
     daily.append(title);
     const chart = element("canvas", "chart-canvas");
     chart.setAttribute("role", "img");
+    chart.tabIndex = 0;
+    chart.dataset.reviewKey = "usage-chart";
+    let geometry = null;
+    let activeDay = -1;
+    const showDay = (index) => {
+      const point = series[index];
+      if (!point || !geometry) return;
+      const rect = chart.getBoundingClientRect();
+      activeDay = index;
+      revealTooltip(chart, `${chartDay(point.day)} UTC`, [
+        ["Model calls", count(point.attempts)], ["Token reports", `${count(point.reported)} / ${count(point.attempts)}`],
+        ["Input tokens", count(point.input_tokens)], ["Output tokens", count(point.output_tokens)],
+      ], { x: rect.left + geometry.left + geometry.step * (index + .5), y: rect.top + geometry.top });
+    };
+    chart.addEventListener("pointermove", (event) => {
+      if (!geometry) return;
+      const rect = chart.getBoundingClientRect();
+      const index = Math.floor((event.clientX - rect.left - geometry.left) / geometry.step);
+      const y = event.clientY - rect.top;
+      if (index < 0 || index >= series.length || y < geometry.top || y > geometry.bottom) {
+        if (tooltipAnchor === chart) hideTooltip();
+        return;
+      }
+      if (index !== activeDay || tooltipAnchor !== chart) showDay(index);
+    });
+    chart.addEventListener("pointerleave", () => delayTooltipHide(chart));
+    chart.addEventListener("focus", () => showDay(activeDay < 0 ? series.length - 1 : activeDay));
+    chart.addEventListener("blur", () => delayTooltipHide(chart));
+    chart.addEventListener("keydown", (event) => {
+      const steps = { ArrowLeft: -1, ArrowRight: 1 };
+      if (!Object.hasOwn(steps, event.key)) return;
+      event.preventDefault();
+      showDay(Math.max(0, Math.min(series.length - 1, activeDay + steps[event.key])));
+    });
     const explanation = element("p", "chart-guide");
     const refreshChart = () => {
       const tokens = displayChart === "tokens";
       const empty = tokens ? !series.some((point) => point.input_tokens > 0 || point.output_tokens > 0) : !series.some((point) => point.attempts > 0);
-      chart.setAttribute("aria-label", tokens ? "Reported input and output tokens by UTC day" : "Model calls and token reports by UTC day");
+      chart.setAttribute("aria-label", `${tokens ? "Reported input and output tokens" : "Model calls and token reports"} by UTC day. Use the arrow keys to inspect days.`);
       explanation.textContent = empty ? (tokens ? "No reported token totals in this period." : "No model calls in this period.") :
         tokens ? "Light bars show input tokens. Dark sections show output tokens. Days are UTC." :
           "Bars show calls. Light sections show calls with token counts. Days are UTC.";
       chart.hidden = empty;
-      if (!empty) drawChart(chart, series);
+      geometry = empty ? null : drawChart(chart, series);
+      if (document.activeElement === chart) showDay(activeDay < 0 ? series.length - 1 : activeDay);
     };
     chooser.addEventListener("change", () => {
       displayChart = chooser.value;
@@ -701,7 +809,7 @@ function renderMetrics() {
       group.append(panel);
     }
     if (group.childElementCount) content.append(group);
-    byId("metrics-results").replaceChildren(content);
+    replace(byId("metrics-results"), content);
     refreshChart();
     chartObserver = new ResizeObserver(refreshChart);
     chartObserver.observe(chart);
@@ -770,7 +878,7 @@ function renderDetail(data, target) {
     if (job.all_models) details.append(element("span", null, "All models"));
     if (job.attempts > 0) details.append(element("span", null, plural(job.attempts, "retry", "retries")));
     holder.append(details);
-    if (Number.isFinite(job.percent) || job.total_sections > 0) holder.append(progressLabel(job));
+    if (Number.isFinite(job.percent) || job.total_sections > 0) holder.append(progressLabel(job, false));
     const active = list(job.active_providers);
     if (active.length) holder.append(providersLabel(active, job.all_models));
   }
@@ -1110,6 +1218,7 @@ function poll() {
 }
 
 function navigate() {
+  if (tooltipAnchor) hideTooltip();
   const hash = window.location.hash.slice(1);
   if (views.has(hash)) view = hash;
   for (const name of views) byId(`${name}-view`).hidden = view !== name;
@@ -1152,5 +1261,10 @@ byId("review-dialog").addEventListener("close", () => {
   renderKeys.delete("detail");
 });
 window.addEventListener("hashchange", navigate);
+window.addEventListener("scroll", () => { if (tooltipAnchor) hideTooltip(); }, true);
+window.addEventListener("resize", () => { if (tooltipAnchor) hideTooltip(); });
+document.addEventListener("keydown", (event) => { if (event.key === "Escape" && tooltipAnchor) hideTooltip(); });
+byId("dashboard-tooltip").addEventListener("pointerenter", () => clearTimeout(tooltipTimer));
+byId("dashboard-tooltip").addEventListener("pointerleave", hideTooltip);
 document.addEventListener("visibilitychange", poll);
 navigate();
