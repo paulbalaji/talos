@@ -20,6 +20,7 @@ const Attempt = struct {
     section: ?usize,
     section_count: ?usize,
     at: i64,
+    finished_at: ?i64,
     duration_ms: ?u64,
     outcome: []const u8,
     tokens: ?telemetry.Tokens,
@@ -68,6 +69,7 @@ fn pairAttempts(a: A, events: []const telemetry.Event, now: i64) ![]Attempt {
             .section = latest.scope.section,
             .section_count = latest.scope.section_count,
             .at = started.at,
+            .finished_at = if (pair.finish) |finish| finish.at else null,
             .duration_ms = latest.duration_ms,
             .outcome = if (latest.outcome) |outcome| @tagName(outcome) else if (pair.start != null and running(started, now)) "running" else "interrupted",
             .tokens = latest.tokens,
@@ -90,6 +92,15 @@ fn pairAttempts(a: A, events: []const telemetry.Event, now: i64) ![]Attempt {
 }
 
 const ActiveProvider = struct { engine: core.Engine, model: []const u8, stage: telemetry.Stage, section: ?usize, at: i64 };
+const FinishedPass = struct {
+    engine: core.Engine,
+    model: []const u8,
+    stage: telemetry.Stage,
+    section: ?usize,
+    finished_at: i64,
+    duration_ms: ?u64,
+    outcome: []const u8,
+};
 const JobRow = struct {
     repo: []const u8,
     number: u32,
@@ -102,6 +113,7 @@ const JobRow = struct {
     completed_sections: usize,
     total_sections: ?usize,
     active_providers: []const ActiveProvider,
+    last_pass: ?FinishedPass,
     next_at: i64,
     attempts: u8,
     last_error: ?[]const u8,
@@ -143,12 +155,26 @@ fn buildJobRow(a: A, entry: core.Entry, job: ?core.Job, seen_: ?core.Seen, attem
         total = checkpoint.section_count;
     };
     var active: std.ArrayList(ActiveProvider) = .empty;
+    var last_pass: ?FinishedPass = null;
     if (job != null and job.?.phase == .pending) {
         const review_key = try core.followupId(a, job.?);
         for (attempts) |attempt| {
-            if (!io.eq(u8, attempt.outcome, "running") or attempt.mode != .scheduled or
+            if (attempt.mode != .scheduled or
                 !io.eq(u8, attempt.repo, entry.repo.name) or attempt.number != seen.number or !io.eq(u8, attempt.head, head)) continue;
             if (!io.eq(u8, attempt.review_key orelse "", review_key orelse "")) continue;
+            if (attempt.finished_at) |finished_at| {
+                if (last_pass == null or finished_at > last_pass.?.finished_at) last_pass = .{
+                    .engine = attempt.engine,
+                    .model = attempt.model,
+                    .stage = attempt.stage,
+                    .section = attempt.section,
+                    .finished_at = finished_at,
+                    .duration_ms = attempt.duration_ms,
+                    .outcome = attempt.outcome,
+                };
+                continue;
+            }
+            if (!io.eq(u8, attempt.outcome, "running")) continue;
             if (total == null) total = attempt.section_count;
             try active.append(a, .{ .engine = attempt.engine, .model = attempt.model, .stage = attempt.stage, .section = attempt.section, .at = attempt.at });
         }
@@ -204,6 +230,7 @@ fn buildJobRow(a: A, entry: core.Entry, job: ?core.Job, seen_: ?core.Seen, attem
         .completed_sections = complete,
         .total_sections = total,
         .active_providers = active.items,
+        .last_pass = last_pass,
         .next_at = if (job) |current| current.next else 0,
         .attempts = if (job) |current| current.attempts else 0,
         .last_error = last_error,
@@ -608,6 +635,53 @@ pub fn reviewJson(a: A, db: store.Store, name: []const u8, number: u32, now: i64
         .usage = totals,
         .review_usage = groups.items[0..@min(groups.items.len, 40)],
     });
+}
+
+test "pending rows surface the most recently finished pass for the current scheduled head" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const repo: core.Repo = .{ .name = "example/repo", .login = "reviewer" };
+    const job: core.Job = .{ .number = 42, .head = "b" ** 40 };
+    const entry: core.Entry = .{ .repo = repo };
+    const slow: telemetry.Event = .{
+        .id = "slow",
+        .at = 900,
+        .kind = .started,
+        .scope = .{ .repo = repo.name, .pr = job.number, .head = job.head, .section = 4, .stage = .completion },
+        .engine = .codex,
+        .model = "example-model",
+        .effort = .high,
+    };
+    var fast = slow;
+    fast.id = "fast";
+    fast.at = 940;
+    fast.scope.section = 3;
+    var fast_finished = fast;
+    fast_finished.kind = .finished;
+    fast_finished.at = 980;
+    fast_finished.outcome = .success;
+    var slow_finished = slow;
+    slow_finished.kind = .finished;
+    slow_finished.at = 990;
+    slow_finished.duration_ms = 90_000;
+    slow_finished.outcome = .timed_out;
+    var preview = slow_finished;
+    preview.id = "preview";
+    preview.at = 995;
+    preview.scope.mode = .preview;
+    var previous_head = slow_finished;
+    previous_head.id = "old";
+    previous_head.at = 999;
+    previous_head.scope.head = "a" ** 40;
+    const attempts = try pairAttempts(a, &.{ slow, fast, fast_finished, slow_finished, preview, previous_head }, 1000);
+    const result = try buildJobRow(a, entry, job, null, attempts, 1000, false);
+    const latest = result.last_pass.?;
+    try t.expectEqual(@as(i64, 990), latest.finished_at);
+    try t.expectEqual(@as(?usize, 4), latest.section);
+    try t.expectEqual(@as(?u64, 90_000), latest.duration_ms);
+    try t.expectEqualStrings("timed_out", latest.outcome);
 }
 
 test "metrics pair starts and finishes and account for advisor models separately" {

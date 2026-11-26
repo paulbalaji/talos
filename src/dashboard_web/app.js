@@ -209,6 +209,7 @@ function hideTooltip() {
 function revealTooltip(anchor, title, rows, point = null) {
   hideTooltip();
   const tip = byId("dashboard-tooltip");
+  tip.classList.toggle("progress-tooltip", anchor.classList.contains("job-progress"));
   const grid = element("dl");
   for (const [name, value] of rows) {
     if (value) grid.append(element("dt", null, name), element("dd", null, value));
@@ -235,7 +236,7 @@ function delayTooltipHide(anchor) {
 
 function tooltipFor(anchor, title, rows) {
   anchor.tabIndex = 0;
-  const show = () => revealTooltip(anchor, title, rows);
+  const show = () => revealTooltip(anchor, title, typeof rows === "function" ? rows() : rows);
   anchor.addEventListener("pointerenter", show);
   anchor.addEventListener("focus", show);
   anchor.addEventListener("pointerleave", () => delayTooltipHide(anchor));
@@ -321,24 +322,28 @@ function progressLabel(job, inspect = true) {
     wrap.append(track);
   }
   const active = list(job.active_providers);
-  if (inspect && (sectionCount || active.length || job.blocked_by)) {
+  const recent = job.last_pass;
+  if (inspect && (active.length || recent)) {
+    const stage = (item) => phrase([item.section != null && `Section ${item.section}`, humanize(item.stage)]);
     wrap.dataset.reviewKey = `${keyOf(job.repo, job.number)}:${job.head}:progress`;
-    return tooltipFor(wrap, `PR #${job.number}`, [
-      ["Sections reviewed", sectionCount ? `${completed} of ${job.total_sections}` : ""],
-      ["Sections left", sectionCount ? count(Math.max(0, job.total_sections - completed)) : ""],
-      ["Waiting for", job.blocked_by ? `#${job.blocked_by}` : ""],
-      ...active.map((item) => [phrase([humanize(item.engine), item.model]),
-        phrase([humanize(item.stage), item.section != null && `Section ${item.section}`, item.at && `Started ${date(item.at)}`])]),
-    ]);
+    return tooltipFor(wrap, `PR #${job.number}`, () => active.length ? active.map((item) => [
+      item.model || humanize(item.engine),
+      phrase([stage(item), item.at > 0 && `${duration(Math.max(0, Date.now() - item.at * 1000))} elapsed`]),
+    ]) : [[
+      `Last pass · ${recent.model || humanize(recent.engine)}`,
+      phrase([stage(recent), Number.isFinite(recent.duration_ms) && duration(recent.duration_ms), humanize(recent.outcome)]),
+    ]]);
   }
   return wrap;
 }
 
 const providerMarks = new Set(["codex", "claude", "kimi"]);
 
-function providerLabel(engine, model, calls = 1) {
-  const label = element("span", "provider-label");
-  if (providerMarks.has(engine)) {
+function providerLabel(engine, model, calls = 1, compact = false) {
+  const hasIcon = providerMarks.has(engine);
+  const name = humanize(engine);
+  const label = element("span", compact ? "provider-label provider-compact" : "provider-label");
+  if (hasIcon) {
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     const mark = document.createElementNS(svg.namespaceURI, "use");
     svg.setAttribute("class", "provider-icon");
@@ -347,9 +352,15 @@ function providerLabel(engine, model, calls = 1) {
     svg.append(mark);
     label.append(svg);
   }
-  const name = calls > 1 ? `${humanize(engine)} ×${calls}` : humanize(engine);
-  const text = element("span", "provider-name", name);
-  if (model) text.append(element("span", "provider-model", ` · ${model}`));
+  const quantity = calls > 1 ? ` ×${calls}` : "";
+  const text = element("span", "provider-name");
+  if (compact) label.title = phrase([name, model]);
+  if (compact && hasIcon && model) {
+    text.append(element("span", "sr-only", `${name} `), document.createTextNode(`${model}${quantity}`));
+  } else {
+    text.textContent = name + quantity;
+    if (model) text.append(element("span", "provider-model", ` · ${model}`));
+  }
   label.append(text);
   return label;
 }
@@ -363,7 +374,7 @@ function providersLabel(values, allModels) {
     if (names.has(key)) names.get(key).count += 1;
     else names.set(key, { ...item, count: 1 });
   }
-  for (const item of names.values()) group.append(providerLabel(item.engine, item.model, item.count));
+  for (const item of names.values()) group.append(providerLabel(item.engine, item.model, item.count, true));
   return group;
 }
 
