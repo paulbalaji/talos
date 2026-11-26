@@ -4,6 +4,7 @@ const io = @import("io.zig");
 const log_retention = @import("log_retention.zig");
 
 pub const default_label = "dev.talos.watcher";
+pub const dashboard_label = "dev.talos.dashboard";
 
 fn xml(a: io.A, input: []const u8) ![]const u8 {
     var result: std.ArrayList(u8) = .empty;
@@ -27,6 +28,14 @@ fn xml(a: io.A, input: []const u8) ![]const u8 {
 }
 
 pub fn manage(cmd: io.Command, home: []const u8, path_env: []const u8, root: []const u8, label: []const u8, install: bool) !void {
+    return manageService(cmd, home, path_env, root, label, install, null);
+}
+
+pub fn manageDashboard(cmd: io.Command, home: []const u8, path_env: []const u8, root: []const u8, install: bool, port: u16) !void {
+    return manageService(cmd, home, path_env, root, dashboard_label, install, port);
+}
+
+fn manageService(cmd: io.Command, home: []const u8, path_env: []const u8, root: []const u8, label: []const u8, install: bool, dashboard_port: ?u16) !void {
     if (builtin.os.tag != .macos) return error.LaunchdRequiresMacOS;
     if (!std.mem.startsWith(u8, label, "dev.talos.") or label.len > 120) return error.InvalidSchedulerLabel;
     for (label) |byte| {
@@ -52,20 +61,28 @@ pub fn manage(cmd: io.Command, home: []const u8, path_env: []const u8, root: []c
     if (install) {
         if (existing != null) return error.SchedulerAlreadyInstalled;
         const self = try std.fs.selfExePathAlloc(a);
+        const args = if (dashboard_port) |port|
+            try io.fmt(a, "<string>dashboard</string><string>--port</string><string>{d}</string>", .{port})
+        else
+            "<string>tick</string>";
+        const schedule = if (dashboard_port != null)
+            "<key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>30</integer>"
+        else
+            "<key>StartInterval</key><integer>15</integer>";
         const body = try io.fmt(a,
             \\<?xml version="1.0" encoding="UTF-8"?>
             \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
             \\<plist version="1.0"><dict>
             \\<key>Label</key><string>{s}</string>
-            \\<key>ProgramArguments</key><array><string>{s}</string><string>--home</string><string>{s}</string><string>tick</string></array>
+            \\<key>ProgramArguments</key><array><string>{s}</string><string>--home</string><string>{s}</string>{s}</array>
             \\{s}
             \\<key>RunAtLoad</key><true/>
-            \\<key>StartInterval</key><integer>15</integer>
+            \\{s}
             \\<key>EnvironmentVariables</key><dict><key>PATH</key><string>{s}</string></dict>
             \\<key>StandardErrorPath</key><string>{s}/{s}</string>
             \\</dict></plist>
             \\
-        , .{ label, try xml(a, self), try xml(a, root), owner, try xml(a, path_env), try xml(a, root), log_retention.filename });
+        , .{ label, try xml(a, self), try xml(a, root), args, owner, schedule, try xml(a, path_env), try xml(a, root), log_retention.filename });
         try io.write(dir, name, body);
         errdefer dir.deleteFile(name) catch {};
         _ = cmd.run(&.{ "/bin/launchctl", "bootstrap", domain, full_path }, "", 15) catch

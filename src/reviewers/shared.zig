@@ -1,5 +1,6 @@
 const std = @import("std");
 const core = @import("../core.zig");
+const telemetry = @import("../telemetry.zig");
 
 pub const Profile = struct {
     model: ?[]const u8 = null,
@@ -12,6 +13,22 @@ pub const Invocation = struct {
     args: []const []const u8,
     stdin: []const u8,
 };
+
+pub const Report = struct {
+    tokens: ?telemetry.Tokens = null,
+    model_usage: []const telemetry.ModelUsage = &.{},
+};
+
+pub fn modelLabel(model: []const u8) []const u8 {
+    if (model.len == 0 or model.len > 100) return "unknown";
+    for (model) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and std.mem.indexOfScalar(u8, "._-/:[]", byte) == null) return "unknown";
+    }
+    for ([_][]const u8{ "sk-", "sk_", "ghp_", "gho_", "github_pat_" }) |prefix| {
+        if (std.ascii.startsWithIgnoreCase(model, prefix)) return "unknown";
+    }
+    return model;
+}
 
 pub fn requireStandardModel(model: []const u8) !void {
     const id = std.fs.path.basename(model);

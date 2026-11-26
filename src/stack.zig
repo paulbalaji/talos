@@ -545,7 +545,13 @@ pub fn queueNative(entry: *core.Entry, a: io.A, group: NativeGroup, options: ?co
     }
     try syncNative(entry, a, groups.items);
     for (group.pins) |pin| {
-        if (pin.reviewable()) try entry.queueReview(a, pin.pull(), options, rerun_completed);
+        if (!pin.reviewable()) continue;
+        if (options == null and !rerun_completed) {
+            if (matchingJob(entry.jobs, pin)) |job| {
+                if (job.phase == .complete or (job.phase == .pending and job.attempts == 0)) continue;
+            }
+        }
+        try entry.queueReview(a, pin.pull(), options, rerun_completed);
     }
     return count;
 }

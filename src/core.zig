@@ -471,7 +471,7 @@ pub const Job = struct {
         self.options = .{};
     }
 };
-pub const Seen = struct { number: u32, head: []const u8, is_draft: bool = false };
+pub const Seen = struct { number: u32, head: []const u8, is_draft: bool = false, title: []const u8 = "" };
 pub const ReviewBase = struct {
     oid: []const u8,
     ref: []const u8,
@@ -603,7 +603,7 @@ pub const Entry = struct {
         for (pulls) |pr| {
             if (!isReviewable(pr)) continue;
             if (!validOid(pr.headRefOid)) return error.InvalidCommit;
-            const seen: Seen = .{ .number = pr.number, .head = pr.headRefOid, .is_draft = pr.isDraft };
+            const seen: Seen = .{ .number = pr.number, .head = pr.headRefOid, .is_draft = pr.isDraft, .title = pr.title[0..safePrefix(pr.title, 300)] };
             try open.append(a, seen);
             const slot = try index.getOrPut(a, seen);
             if (!slot.found_existing) slot.value_ptr.* = .{};
@@ -1365,7 +1365,7 @@ fn postedBody(reviews: []const Prior, login: []const u8, head: []const u8, text:
     return false;
 }
 
-fn followupId(a: A, job: Job) !?[]const u8 {
+pub fn followupId(a: A, job: Job) !?[]const u8 {
     if (!job.followup) return null;
     return try a.dupe(u8, &std.fmt.bytesToHex(job.followup_id, .lower));
 }
