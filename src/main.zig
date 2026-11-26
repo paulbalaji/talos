@@ -142,6 +142,7 @@ const Adapter = struct {
     git_source: source.Git,
     tools: Local,
     files: []const github.File = &.{},
+    diff_priority: ?[]const []const u8 = null,
 
     pub fn checkIdentity(self: *Adapter) !void {
         if (try self.db.paused(self.repo.name)) return error.RepoPaused;
@@ -162,7 +163,9 @@ const Adapter = struct {
 
     pub fn snapshot(self: *Adapter, pr: core.Pull, threads: []const core.Thread) !core.Snapshot {
         self.files = try self.github_client.files(pr.number);
-        return self.git_source.snapshot(pr, self.files, threads);
+        var git = self.git_source;
+        git.diff_priority = self.diff_priority;
+        return git.snapshot(pr, self.files, threads);
     }
 
     pub fn supplement(self: *Adapter, pr: core.Pull, previous: ?[]const u8, requests: []const core.EvidenceRequest) !source.Supplement {
@@ -1219,6 +1222,9 @@ const Main = struct {
         const work = try self.a.create(ReviewWorker);
         work.* = .{ .job = job, .batch = batch };
         work.adapter = try self.adapter(entry, state, &work.gh_env);
+        if (job.route_progress) |saved| {
+            if (saved.sections.checkpoint) |checkpoint| work.adapter.diff_priority = checkpoint.diff_priority;
+        }
         work.prepared = (try core.prepare(self.a, &work.adapter, entry.repo, job, .scheduled)) orelse return;
         work.prepared.all_models = work.prepared.options.all_models or
             (entry.repo.routing_mode == .adaptive and work.prepared.options.allowRouting() and
@@ -1242,14 +1248,7 @@ const Main = struct {
         }
         work.policy = state.queue_budget;
         {
-            const fingerprint = try core.SavedAnalysis.key(self.a, entry.repo, work.prepared);
-            var progress: core.RouteProgress = .{ .fingerprint = fingerprint, .base = .fromPull(work.prepared.pr) };
-            if (job.route_progress) |saved| {
-                if (eq(u8, &saved.fingerprint, &fingerprint)) {
-                    progress = saved;
-                    progress.base = .fromPull(work.prepared.pr);
-                } else job.route_progress = null;
-            }
+            var progress = try self.resumeReview(entry.repo, job, &work.prepared);
             if (work.prepared.onchain_available and work.prepared.snap.onchain_reads.len != 0) progress.onchain_reads = work.prepared.snap.onchain_reads;
             const automatically_routed = entry.repo.routing_mode != .fixed and work.prepared.options.allowRouting();
             const scoped_review = (work.prepared.snap.registry_logo_only or work.prepared.snap.relayer_promotion or
@@ -1272,7 +1271,8 @@ const Main = struct {
                 screen.floor = routing.all_lenses;
             }
             if (work.prepared.sections.len != 0 and !work.prepared.onchain_available) screen.ask_model = false;
-            const section = work.prepared.section(progress.sections.index);
+            const has_section = work.prepared.sections.len == 0 or progress.sections.index < work.prepared.sections.len;
+            const section = if (has_section) work.prepared.section(progress.sections.index) else work.prepared;
             if (progress.onchain_reads.len != 0 and progress.onchain_observations == null) {
                 progress.onchain_observations = try work.adapter.onchainReads(work.prepared.pr, progress.onchain_reads);
             }
@@ -1328,6 +1328,36 @@ const Main = struct {
         batch.len += 1;
     }
 
+    fn resumeReview(self: Main, repo: core.Repo, job: *core.Job, prepared: *core.Prepared) !core.RouteProgress {
+        const saved = job.route_progress;
+        const prior_checkpoint = if (saved) |prior| prior.sections.checkpoint else null;
+        var checkpoint: ?core.SectionCheckpoint = if (prepared.sections.len != 0) try .capture(self.a, repo, prepared.*) else null;
+        const same_source = if (prior_checkpoint) |prior|
+            if (checkpoint) |current| eq(u8, &prior.source, &current.source) else false
+        else
+            false;
+        const fingerprint = if (same_source) saved.?.fingerprint else try core.SavedAnalysis.key(self.a, repo, prepared.*);
+        var progress: core.RouteProgress = .{ .fingerprint = fingerprint };
+        if (saved) |prior| {
+            if (same_source or (prior_checkpoint == null and eq(u8, &prior.fingerprint, &fingerprint))) {
+                progress = prior;
+            } else job.route_progress = null;
+        }
+        progress.base = .fromPull(prepared.pr);
+        if (same_source) {
+            const changed = !eq(u8, &checkpoint.?.discussion, &prior_checkpoint.?.discussion);
+            checkpoint.?.update_discussion = changed or prior_checkpoint.?.update_discussion;
+            if (progress.sections.index == prepared.sections.len and checkpoint.?.update_discussion) {
+                if (changed) adaptive.resetSection(&progress);
+                if (!try core.appendDiscussionUpdate(self.a, prepared, repo, progress.sections.results)) {
+                    progress.sections.evidence_limited = true;
+                }
+            }
+        }
+        progress.sections.checkpoint = checkpoint;
+        return progress;
+    }
+
     fn finishJob(self: Main, state: *store.State, work: *ReviewWorker) !void {
         const results = try work.result;
         if (work.route_outcome) |outcome| {
@@ -1346,7 +1376,18 @@ const Main = struct {
                 work.job.route_report = report;
                 work.job.route_report.?.providers = try self.a.dupe(core.Engine, report.providers);
                 work.job.route_progress = null;
-                return self.finishReviews(state, work, outcome.review_results orelse outcome.progress.results);
+                if (report.diff_sections != 0 and !state.queue_budget.canScan(std.time.timestamp())) {
+                    return self.keepSectionReview(state, work, outcome.progress, report.diff_sections);
+                }
+                return self.finishReviews(state, work, outcome.review_results orelse outcome.progress.results) catch |err| {
+                    if (report.diff_sections != 0 and work.job.phase == .pending) {
+                        if (err == error.ThreadsChanged or err == error.GitHubRateLimited) {
+                            try self.keepSectionReview(state, work, outcome.progress, report.diff_sections);
+                            if (err == error.ThreadsChanged) return;
+                        }
+                    }
+                    return err;
+                };
             }
             work.job.route_progress = try io.parse(self.a, core.RouteProgress, try io.json(self.a, outcome.progress));
             if (outcome.failure) |err| return err;
@@ -1354,6 +1395,17 @@ const Main = struct {
             return;
         }
         return self.finishReviews(state, work, results[0..work.prepared.engines.len]);
+    }
+
+    fn keepSectionReview(self: Main, state: *store.State, work: *ReviewWorker, finished: core.RouteProgress, count: usize) !void {
+        var progress = finished;
+        progress.sections.index = count;
+        if (progress.sections.checkpoint) |*checkpoint| checkpoint.update_discussion = false;
+        adaptive.resetSection(&progress);
+        work.job.analysis = null;
+        work.job.route_report = null;
+        work.job.route_progress = try io.parse(self.a, core.RouteProgress, try io.json(self.a, progress));
+        try self.db.save(state);
     }
 
     fn finishReviews(self: Main, state: *store.State, work: *ReviewWorker, reviews: []const core.ReviewerResult) !void {
@@ -2104,6 +2156,75 @@ test "an in-flight review binds to the reloaded job and discards a superseded jo
     try t.expect(work.job == &reloaded[0]);
     reloaded[0].options.focus = .simplicity;
     try t.expect(!try work.rebind(a, &state));
+}
+
+test "same-source review keeps checkpoints after bot threads and queues a focused pass for human input" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const app: Main = .{ .a = a, .env = undefined, .home = undefined, .db = undefined, .scratch = undefined, .scratch_dir = undefined };
+    const repo: core.Repo = .{ .name = "example/review", .login = "reviewer" };
+    const pr: core.Pull = .{ .number = 42, .headRefOid = "a" ** 40, .baseRefOid = "b" ** 40, .isDraft = false };
+    const thread: core.Thread = .{
+        .id = "new-thread",
+        .isResolved = false,
+        .isOutdated = false,
+        .path = "work.zig",
+        .line = 17,
+        .replies = &.{.{ .author = .{ .login = "coderabbitai", .kind = "Bot" }, .body = "Bot suggestion", .url = "bot" }},
+    };
+    const bot: core.Discussion = .{ .threads = &.{thread} };
+    const review: core.ReviewerResult = .{
+        .engine = .codex,
+        .review = .{ .complete = true, .summary = "Previous scoped review", .findings = &.{}, .existing_open_findings = &.{} },
+    };
+    var prepared: core.Prepared = .{
+        .pr = pr,
+        .snap = .{ .merge_base = pr.baseRefOid, .evidence = "Pinned diff", .diff_priority = &.{"work.zig"}, .thread_evidence = "Latest pinned excerpt" },
+        .threads = &.{},
+        .inherited = .{},
+        .engines = &.{.codex},
+        .context = "Original prompt",
+        .options = .{},
+        .evidence_offset = 0,
+        .dry = false,
+        .review_input = try core.ReviewInput.init(a, repo, pr, pr.baseRefOid, .{}),
+        .sections = &.{.{ .context = "Section", .evidence = "Pinned diff", .patch = "Pinned diff" }},
+    };
+    var job: core.Job = .{
+        .number = 42,
+        .head = pr.headRefOid,
+        .route_progress = .{
+            .fingerprint = try core.SavedAnalysis.key(a, repo, prepared),
+            .sections = .{ .index = 1, .results = &.{review} },
+        },
+    };
+    job.route_progress = try app.resumeReview(repo, &job, &prepared);
+    try t.expect(job.route_progress.?.readyToPublish());
+
+    prepared.context = "New prompt with bot suggestion";
+    prepared.threads = bot.threads;
+    prepared.review_input = try core.ReviewInput.init(a, repo, pr, pr.baseRefOid, bot);
+    const unchanged = try app.resumeReview(repo, &job, &prepared);
+    try t.expect(unchanged.readyToPublish());
+    try t.expectEqual(@as(usize, 1), unchanged.sections.results.len);
+
+    var changed_source = prepared;
+    changed_source.sections = &.{.{ .context = "Same prompt", .evidence = "Other source", .patch = "Other source" }};
+    var other_job = job;
+    try t.expectEqual(@as(usize, 0), (try app.resumeReview(repo, &other_job, &changed_source)).sections.index);
+
+    prepared.comments = &.{.{ .author = .{ .login = "author", .kind = "User" }, .body = "Please verify the startup case.", .url = "human" }};
+    prepared.review_input = try core.ReviewInput.init(a, repo, pr, pr.baseRefOid, .{ .comments = prepared.comments, .threads = bot.threads });
+    const resumed = try app.resumeReview(repo, &job, &prepared);
+    try t.expect(resumed.sections.checkpoint.?.update_discussion);
+    try t.expectEqual(@as(usize, 1), resumed.sections.index);
+    try t.expectEqual(@as(usize, 1), resumed.sections.results.len);
+    try t.expect(prepared.context_update);
+    try t.expectEqual(@as(usize, 2), prepared.sections.len);
+    try t.expect(std.mem.indexOf(u8, prepared.sections[1].context, "Please verify the startup case.") != null);
+    try t.expect(std.mem.indexOf(u8, prepared.sections[1].context, "Latest pinned excerpt") != null);
 }
 
 test "review workers overlap and use separate scratch directories" {

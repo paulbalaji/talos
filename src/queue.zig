@@ -99,6 +99,7 @@ pub const Budget = struct {
     }
 
     fn reviewAt(self: Budget, repo: core.Repo, progress: ?core.RouteProgress, now: i64, limited: u8, current: usage.Snapshot) ?i64 {
+        if (progress) |partial| if (partial.readyToPublish()) return 0;
         const can_make_progress = repo.routing_mode != .fixed or repo.fallback_engines.len != 0 or progress != null;
         const synthesizing = if (progress) |partial| workflow.waitsForSynthesis(repo, partial) else false;
         const completed = if (synthesizing) &.{} else if (progress) |partial| partial.results else &.{};

@@ -164,6 +164,14 @@ pub const Discussion = struct {
         return !eq(u8, author.kind, "Bot") and !std.ascii.endsWithIgnoreCase(author.login, "[bot]");
     }
 
+    pub fn automatedThread(thread: Thread) bool {
+        if (thread.replies.len == 0) return false;
+        for (thread.replies) |reply| {
+            if (reply.author == null or human(reply, null)) return false;
+        }
+        return true;
+    }
+
     fn courtesy(reply: Reply) bool {
         if (reply.truncated) return false;
         const words = io.trim(u8, reply.body, " \t\r\n.!");
@@ -185,13 +193,15 @@ pub const Discussion = struct {
         hash.update(&.{0});
     }
 
-    fn fingerprint(self: Discussion, a: A, login: []const u8, legacy: bool) ![Sha256.digest_length]u8 {
+    fn fingerprint(self: Discussion, a: A, login: []const u8, mode: enum { legacy, material, section }) ![Sha256.digest_length]u8 {
+        const legacy = mode == .legacy;
         var hash = Sha256.init(.{});
         for (self.comments) |reply| {
             if (human(reply, if (legacy) login else null) and (legacy or !courtesy(reply)))
                 try hashPart(a, &hash, .{ reply.url, reply.author.?.login, reply.body, reply.updatedAt });
         }
         for (self.threads) |thread| {
+            if (mode == .section and automatedThread(thread)) continue;
             var included = thread.isResolved;
             if (included) try hashPart(a, &hash, .{ thread.id, thread.isResolved });
             for (thread.replies, 0..) |reply, index| {
@@ -239,9 +249,9 @@ pub const ReviewInput = struct {
         return .{
             .base = .fromPull(pr),
             .merge_base = merge_base,
-            .discussion = try discussion.fingerprint(a, repo.login, true),
+            .discussion = try discussion.fingerprint(a, repo.login, .legacy),
             .is_draft = pr.isDraft,
-            .material_discussion = try discussion.fingerprint(a, repo.login, false),
+            .material_discussion = try discussion.fingerprint(a, repo.login, .material),
         };
     }
 
@@ -296,6 +306,8 @@ pub const Snapshot = struct {
     optional_evidence_start: ?usize = null,
     onchain_reads: []const onchain.Request = &.{},
     large_diff: ?struct { patch: []const u8, start: usize, end: usize } = null,
+    diff_priority: []const []const u8 = &.{},
+    thread_evidence: []const u8 = "",
 
     pub fn markLimited(self: *Snapshot, a: A, reason: []const u8) !void {
         self.limited = true;
@@ -1116,7 +1128,8 @@ fn payload(a: A, adapter: anytype, pr: Pull, prepared: Prepared, results: []cons
     var truncated_open_threads: usize = 0;
     for (threads) |thread| {
         truncated_threads += @intFromBool(thread.truncated);
-        truncated_open_threads += @intFromBool(thread.truncated and !thread.isResolved);
+        truncated_open_threads += @intFromBool(thread.truncated and !thread.isResolved and
+            !(prepared.sections.len != 0 and Discussion.automatedThread(thread)));
     }
     complete = complete and truncated_open_threads == 0;
     const scope = switch (options.focus) {
@@ -1207,7 +1220,7 @@ fn payload(a: A, adapter: anytype, pr: Pull, prepared: Prepared, results: []cons
     if (clean) {
         var remaining: usize = 0;
         approval: for (threads) |thread| {
-            if (thread.isResolved) continue;
+            if (thread.isResolved or (prepared.sections.len != 0 and Discussion.automatedThread(thread))) continue;
             for (results) |result| {
                 if (assessmentReason(result, thread.id) != null) continue;
                 clean = false;
@@ -1223,7 +1236,7 @@ fn payload(a: A, adapter: anytype, pr: Pull, prepared: Prepared, results: []cons
             try fmt.print("\n\n{d} open thread{s} can stay open.", .{ remaining, if (remaining == 1) "" else "s" });
             var shown: usize = 0;
             for (threads) |thread| {
-                if (thread.isResolved) continue;
+                if (thread.isResolved or (prepared.sections.len != 0 and Discussion.automatedThread(thread))) continue;
                 if (shown == 3) break;
                 try fmt.writeAll("\n- ");
                 try appendThreadReference(a, &body, thread);
@@ -1382,6 +1395,7 @@ pub const Prepared = struct {
     context: []const u8,
     context_for_completion: ?[]const u8 = null,
     sections: []const ReviewSection = &.{},
+    context_update: bool = false,
     evidence_offset: usize,
     route_depth: routing.Depth = .regular,
     options: ReviewOptions,
@@ -1408,7 +1422,7 @@ pub const Prepared = struct {
     }
 };
 
-const ReviewSection = struct { evidence: []const u8, context: []const u8 };
+const ReviewSection = struct { evidence: []const u8, context: []const u8, patch: []const u8 = "" };
 
 pub fn appendOnchain(a: A, context: *[]const u8, observations: []const onchain.Observation) !bool {
     if (observations.len == 0) return false;
@@ -1463,6 +1477,11 @@ pub const RouteProgress = struct {
         for (result.review.evidence_requests) |request| if (hasEvidenceRequest(requests, request)) return true;
         return false;
     }
+
+    pub fn readyToPublish(self: RouteProgress) bool {
+        const checkpoint = self.sections.checkpoint orelse return false;
+        return self.sections.index == checkpoint.section_count and !checkpoint.update_discussion;
+    }
 };
 
 pub const SectionProgress = struct {
@@ -1473,6 +1492,38 @@ pub const SectionProgress = struct {
     evidence_passes: u8 = 0,
     synthesis_provider: ?Engine = null,
     synthesis_gap: ?[]const u8 = null,
+    checkpoint: ?SectionCheckpoint = null,
+};
+
+pub const SectionCheckpoint = struct {
+    source: [32]u8,
+    discussion: [32]u8,
+    diff_priority: []const []const u8,
+    section_count: usize,
+    update_discussion: bool = false,
+
+    pub fn capture(a: A, repo: Repo, prepared: Prepared) !SectionCheckpoint {
+        var source_hash = Sha256.init(.{});
+        try Discussion.hashPart(a, &source_hash, .{
+            repo,                    prepared.options,         prepared.all_models,     prepared.pr.headRefOid, prepared.pr.baseRefOid,
+            prepared.pr.baseRefName, prepared.snap.merge_base, prepared.inherited.pins,
+        });
+        for (prepared.sections) |part| {
+            source_hash.update(part.patch);
+            source_hash.update(&.{0});
+        }
+        const current: Discussion = .{ .threads = prepared.threads, .comments = prepared.comments };
+        var discussion = Sha256.init(.{});
+        try Discussion.hashPart(a, &discussion, .{
+            try current.fingerprint(a, repo.login, .section), prepared.pr.title, prepared.pr.body,
+        });
+        return .{
+            .source = source_hash.finalResult(),
+            .discussion = discussion.finalResult(),
+            .diff_priority = prepared.snap.diff_priority,
+            .section_count = prepared.sections.len,
+        };
+    }
 };
 
 pub fn providerBit(engine: Engine) u8 {
@@ -1720,12 +1771,30 @@ fn prepareSections(a: A, repo: Repo, pr: Pull, snap: *Snapshot, discussion: Disc
             try scoped.markLimited(a, "Some merge-base diff sections did not fit alongside the review context.");
             continue;
         }
-        try sections.append(a, .{ .evidence = scoped.evidence, .context = try std.mem.concat(a, u8, &.{ briefing, rendered }) });
+        try sections.append(a, .{ .evidence = scoped.evidence, .context = try std.mem.concat(a, u8, &.{ briefing, rendered }), .patch = patch });
     }
     if (sections.items.len == 0) return &.{};
     scoped.evidence = sections.items[0].evidence;
     snap.* = scoped;
     return sections.items;
+}
+
+pub fn appendDiscussionUpdate(a: A, prepared: *Prepared, repo: Repo, prior: []const ReviewerResult) !bool {
+    var scoped = prepared.snap;
+    scoped.evidence = scoped.thread_evidence;
+    const previous = try recordReview(a, prepared.*, null, prior);
+    const context = try reviewPrompt(a, repo, prepared.pr, scoped, .{ .threads = prepared.threads, .comments = prepared.comments }, null, previous, .{}, .{}, prepared.options);
+    const briefing =
+        "Continue your review using the latest PR description and discussion and the prior review notes below. " ++
+        "The source sections are reviewed separately. Check new or updated claims and existing thread dispositions using the pinned excerpts. " ++
+        "Only return findings supported by current evidence and affected by the new context. Request exact pinned source for any unresolved material question.\n\n";
+    if (briefing.len + context.len > review_context_limit - 20 * 1024) return false;
+    prepared.sections = try std.mem.concat(a, ReviewSection, &.{ prepared.sections, &.{.{
+        .evidence = scoped.evidence,
+        .context = try std.mem.concat(a, u8, &.{ briefing, context }),
+    }} });
+    prepared.context_update = true;
+    return true;
 }
 
 pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?Prepared {
@@ -1848,8 +1917,12 @@ pub fn analyze(a: A, reviewer: anytype, engines: []const Engine, context: []cons
     return results;
 }
 
-fn checkDiscussion(a: A, adapter: anytype, number: u32, original: Discussion) !void {
+fn checkDiscussion(a: A, adapter: anytype, number: u32, original: Discussion, sectioned: bool, login: []const u8) !void {
     var latest = try adapter.reviewDiscussion(number);
+    if (sectioned) {
+        if (!eq(u8, &(try original.fingerprint(a, login, .section)), &(try latest.fingerprint(a, login, .section)))) return error.ThreadsChanged;
+        return;
+    }
     var threads: std.ArrayList(Thread) = .empty;
     for (latest.threads) |thread| {
         const known = for (original.threads) |prior| {
@@ -1874,9 +1947,11 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
     const inherited = prepared.inherited;
     const snap = prepared.snap;
     const original_discussion: Discussion = .{ .threads = threads, .comments = prepared.comments };
-    try checkDiscussion(a, adapter, pr.number, original_discussion);
+    const sectioned = prepared.sections.len != 0;
+    try checkDiscussion(a, adapter, pr.number, original_discussion, sectioned, repo.login);
     const latest = try adapter.pull(job.number);
     if (!sameTarget(pr, latest)) return error.TargetChanged;
+    if (sectioned and (!eq(u8, pr.title, latest.title) or !eq(u8, pr.body, latest.body))) return error.ThreadsChanged;
     if (supports_stacks) try adapter.checkStack(inherited);
     var reviewed = job.*;
     reviewed.review_input = prepared.review_input;
@@ -1950,8 +2025,9 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
         try adapter.checkIdentity();
         const final = try adapter.pull(pr.number);
         if (!sameTarget(pr, final)) return error.TargetChanged;
+        if (sectioned and (!eq(u8, pr.title, final.title) or !eq(u8, pr.body, final.body))) return error.ThreadsChanged;
         if (supports_stacks) try adapter.checkStackBeforePost(inherited, final);
-        try checkDiscussion(a, adapter, pr.number, original_discussion);
+        try checkDiscussion(a, adapter, pr.number, original_discussion, sectioned, repo.login);
         if (warning) saved.body = try io.fmt(a, "{s}\n\n{s}", .{ saved.body, approval_warning });
     }
     try adapter.saveResult(job.number, saved);

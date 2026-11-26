@@ -71,6 +71,8 @@ Talos puts files with active review threads and risky code early in the bounded 
 
 Scheduled reviews split large diffs on Git hunk boundaries. Each section runs through the selected reviewers, and Talos checkpoints completed sections and combines their verdicts before it publishes one review. Hunks outside the section limits keep coverage incomplete. During model runs, the watcher continues scanning due repos and accepts new queue requests.
 
+For a sectioned review on the same pinned source, new discussion leaves completed source work intact. New human discussion or edits to the PR description get a focused follow-up pass before publication. Automated threads can inform remaining passes. They do not require a new pass on their own.
+
 A new thread containing only automated replies does not invalidate an in-flight review. Edits to reviewed threads and new human threads still require current inputs.
 
 If a rereview finds an issue after an approval, its comment flags the earlier approval for a person to reassess. On upgrade, Talos uses newer human replies to catch up completed reviews. It tracks resolution changes from the first successful scan.

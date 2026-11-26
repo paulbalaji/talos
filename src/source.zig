@@ -112,12 +112,21 @@ fn shellQuote(a: A, value: []const u8) ![]const u8 {
 const DiffPriority = enum { thread, risk, source, supporting };
 const PrioritizedFile = struct { file: github.File, priority: DiffPriority };
 
-fn prioritizeFiles(a: A, files: []const github.File, threads: []const core.Thread) ![]const PrioritizedFile {
+fn priorityPaths(a: A, threads: []const core.Thread) ![]const []const u8 {
+    var paths: std.ArrayList([]const u8) = .empty;
+    for (threads) |thread| {
+        if (thread.isResolved or thread.isOutdated) continue;
+        for (paths.items) |path| {
+            if (eq(u8, path, thread.path)) break;
+        } else try paths.append(a, thread.path);
+    }
+    return paths.items;
+}
+
+fn prioritizeFiles(a: A, files: []const github.File, paths: []const []const u8) ![]const PrioritizedFile {
     var open_paths: std.StringHashMapUnmanaged(void) = .empty;
     defer open_paths.deinit(a);
-    for (threads) |thread| {
-        if (!thread.isResolved and !thread.isOutdated) try open_paths.put(a, thread.path, {});
-    }
+    for (paths) |path| try open_paths.put(a, path, {});
     var ordered: std.ArrayList(PrioritizedFile) = .empty;
     for (files) |file| {
         if (!core.validPath(file.filename) or sensitive(file.filename)) continue;
@@ -152,6 +161,7 @@ pub const Git = struct {
     gh: []const u8,
     object_cache: cache.Cache,
     github_calls: ?*u32 = null,
+    diff_priority: ?[]const []const u8 = null,
 
     pub fn git(self: Git, path: []const u8, args: []const []const u8, input: []const u8) ![]const u8 {
         return self.gitWithin(path, args, input, 180);
@@ -223,7 +233,8 @@ pub const Git = struct {
         const merge_base = io.trim(u8, try self.git(path, &.{ "merge-base", pr.baseRefOid, pr.headRefOid }, ""), "\r\n");
         if (!core.validOid(merge_base)) return error.InvalidMergeBase;
 
-        const ordered = try prioritizeFiles(a, files, threads);
+        const priorities = self.diff_priority orelse try priorityPaths(a, threads);
+        const ordered = try prioritizeFiles(a, files, priorities);
         const patch = try self.orderedDiff(path, merge_base, pr.headRefOid, ordered);
         const prefix = patch[0..core.safePrefix(patch, diff_limit)];
         if (!std.unicode.utf8ValidateSlice(prefix)) return error.NonUtf8Diff;
@@ -331,6 +342,8 @@ pub const Git = struct {
             .optional_evidence_start = image.optional_start,
             .onchain_reads = onchain_reads,
             .large_diff = if (prefix.len == patch.len) null else .{ .patch = patch, .start = diff_start, .end = diff_end },
+            .diff_priority = priorities,
+            .thread_evidence = try a.dupe(u8, evidence.items[0 .. diff_start - "Merge-base diff:\n".len]),
         };
     }
 
@@ -870,7 +883,8 @@ pub const Git = struct {
                 remaining.* -= budget - left;
                 if (complete) continue;
             }
-            if (!diff_complete or !anchor(files, thread.path, line)) missing += 1;
+            if ((!diff_complete or !anchor(files, thread.path, line)) and
+                !(!diff_complete and core.Discussion.automatedThread(thread))) missing += 1;
         }
         return missing;
     }
@@ -1606,7 +1620,7 @@ test "pinned source reads exact trees and prioritizes active review anchors in a
     const new_head = io.trim(u8, try git.git(path, &.{ "commit-tree", tree_oid, "-p", commits[0], "-m", "review" }, ""), "\n");
     const full = try git.diff(path, commits[0], new_head);
     try t.expect(std.mem.indexOf(u8, full[0..diff_limit], "+active anchor") == null);
-    const ordered = try prioritizeFiles(a, &files, threads);
+    const ordered = try prioritizeFiles(a, &files, try priorityPaths(a, threads));
     try t.expectEqualStrings(active_path, ordered[0].file.filename);
     try t.expectEqualStrings(risky_path, ordered[1].file.filename);
     try t.expectEqualStrings(docs, ordered[2].file.filename);

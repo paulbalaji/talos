@@ -120,6 +120,11 @@ fn appendEvidence(a: io.A, context: *[]const u8, evidence: []const u8) !bool {
 // are carried forward by the coordinator when a later pass needs a new tick.
 pub fn run(a: io.A, reviewer: anytype, plan: Plan) !Outcome {
     if (plan.prepared.sections.len == 0) return runSection(a, reviewer, plan);
+    if (plan.progress.sections.index == plan.prepared.sections.len) {
+        var outcome: Outcome = .{ .progress = plan.progress };
+        try finishSections(a, plan, &outcome);
+        return outcome;
+    }
 
     var scoped = plan;
     scoped.prepared = plan.prepared.section(plan.progress.sections.index);
@@ -134,7 +139,7 @@ pub fn run(a: io.A, reviewer: anytype, plan: Plan) !Outcome {
             break;
         }
     }
-    sections.results = try combineSections(a, sections.results, results);
+    sections.results = try combineSections(a, sections.results, results, plan.prepared.context_update);
     sections.evidence_limited = sections.evidence_limited or outcome.evidence_limited;
     for ([_][]const core.EvidenceRequest{ progress.evidence_requests, progress.completion_requests orelse &.{} }) |requests| {
         for (requests) |request| {
@@ -146,19 +151,32 @@ pub fn run(a: io.A, reviewer: anytype, plan: Plan) !Outcome {
     sections.evidence_passes +|= section_report.evidence_passes;
     sections.synthesis_provider = section_report.synthesis_provider orelse sections.synthesis_provider;
     sections.index += 1;
-    if (sections.index == plan.prepared.sections.len) {
-        progress.results = sections.results;
-        outcome.review_results = sections.results;
-        outcome.report = try report(a, plan, progress.*, section_report.applied);
-        outcome.report.?.diff_sections = sections.index;
-        outcome.report.?.evidence_passes = sections.evidence_passes;
-        outcome.report.?.synthesis_provider = sections.synthesis_provider;
-        outcome.synthesis_summary = sections.synthesis_gap;
-        outcome.evidence_limited = sections.evidence_limited;
+    const update_requested = if (sections.checkpoint) |checkpoint| checkpoint.update_discussion else false;
+    if (sections.index == plan.prepared.sections.len and (plan.prepared.context_update or !update_requested)) {
+        try finishSections(a, plan, &outcome);
         return outcome;
     }
 
-    // Keep only verified results and reset the section-local evidence state.
+    resetSection(progress);
+    outcome.report = null;
+    outcome.review_results = null;
+    return outcome;
+}
+
+fn finishSections(a: io.A, plan: Plan, outcome: *Outcome) !void {
+    const progress = &outcome.progress;
+    const sections = progress.sections;
+    progress.results = sections.results;
+    outcome.review_results = sections.results;
+    outcome.report = try report(a, plan, progress.*, appliedDecision(plan, progress.*));
+    outcome.report.?.diff_sections = plan.prepared.sections.len - @intFromBool(plan.prepared.context_update);
+    outcome.report.?.evidence_passes = sections.evidence_passes;
+    outcome.report.?.synthesis_provider = sections.synthesis_provider;
+    outcome.synthesis_summary = sections.synthesis_gap;
+    outcome.evidence_limited = sections.evidence_limited;
+}
+
+pub fn resetSection(progress: *core.RouteProgress) void {
     progress.results = &.{};
     progress.evidence_requests = &.{};
     progress.evidence_key = null;
@@ -168,12 +186,9 @@ pub fn run(a: io.A, reviewer: anytype, plan: Plan) !Outcome {
     progress.completion_done = 0;
     progress.malformed_reviewers = 0;
     progress.rejected_synthesizers = 0;
-    outcome.report = null;
-    outcome.review_results = null;
-    return outcome;
 }
 
-fn combineSections(a: io.A, earlier: []const core.ReviewerResult, current: []const core.ReviewerResult) ![]const core.ReviewerResult {
+fn combineSections(a: io.A, earlier: []const core.ReviewerResult, current: []const core.ReviewerResult, context_update: bool) ![]const core.ReviewerResult {
     var results: std.ArrayList(core.ReviewerResult) = .empty;
     try results.appendSlice(a, earlier);
     for (current) |pass| {
@@ -188,19 +203,26 @@ fn combineSections(a: io.A, earlier: []const core.ReviewerResult, current: []con
             break :added result;
         };
         const review = &combined.review;
+        const fresh_assessment = context_update and pass.review.complete;
+        if (fresh_assessment) {
+            var still_open: std.ArrayList([]const u8) = .empty;
+            for (review.existing_open_findings) |id| {
+                for (pass.review.non_blocking_threads orelse &.{}) |assessment| {
+                    if (io.eq(u8, assessment.id, id)) break;
+                } else try still_open.append(a, id);
+            }
+            review.existing_open_findings = still_open.items;
+        }
         combined.complete_before_synthesis =
             (combined.complete_before_synthesis orelse review.complete) and (pass.complete_before_synthesis orelse pass.review.complete);
         review.complete = review.complete and pass.review.complete;
         if (review.existing_open_findings.len + pass.review.existing_open_findings.len > 100) review.complete = false;
         review.coverage_gaps = try mergeUnique(a, []const u8, review.coverage_gaps, pass.review.coverage_gaps, 12);
         review.existing_open_findings = try mergeUnique(a, []const u8, review.existing_open_findings, pass.review.existing_open_findings, 100);
-        review.non_blocking_threads = try mergeUnique(
-            a,
-            std.meta.Child(@TypeOf(review.non_blocking_threads.?)),
-            review.non_blocking_threads orelse &.{},
-            pass.review.non_blocking_threads orelse &.{},
-            100,
-        );
+        var prior = review.non_blocking_threads orelse &.{};
+        var updated = pass.review.non_blocking_threads orelse &.{};
+        if (fresh_assessment) std.mem.swap(@TypeOf(prior), &prior, &updated);
+        review.non_blocking_threads = try mergeUnique(a, std.meta.Child(@TypeOf(prior)), prior, updated, 100);
         var findings: std.ArrayList(std.meta.Child(@TypeOf(review.findings))) = .empty;
         try findings.appendSlice(a, review.findings);
         for (pass.review.findings) |finding| {
