@@ -441,11 +441,16 @@ fn isoDay(a: A, timestamp: i64) ![]const u8 {
     return io.fmt(a, "{d}-{d:0>2}-{d:0>2}", .{ year.year, month.month.numeric(), month.day_index + 1 });
 }
 
-pub fn metricsJson(a: A, db: store.Store, days: u32, now: i64) ![]const u8 {
-    const first = @max(0, @divFloor(now, day_seconds) - days + 1) * day_seconds;
-    const events = try telemetry.read(a, db.dir, .{ .since = first, .limit = telemetry.max_query_events, .now = now });
-    const attempts = try pairAttempts(a, events, now);
-    const per_day = try a.alloc(Totals, days);
+pub fn metricsJson(a: A, db: store.Store, days: u32, offset: u32, now: i64) ![]const u8 {
+    const last_day = @divFloor(now, day_seconds) - offset;
+    if (last_day < 0) return error.InvalidMetricsOffset;
+    const end = if (offset == 0) now else (last_day + 1) * day_seconds - 1;
+    const first_day = @max(0, last_day - days + 1);
+    const first = first_day * day_seconds;
+    const day_count: usize = @intCast(last_day - first_day + 1);
+    const events = try telemetry.read(a, db.dir, .{ .since = first, .limit = telemetry.max_query_events, .now = end });
+    const attempts = try pairAttempts(a, events, end);
+    const per_day = try a.alloc(Totals, day_count);
     @memset(per_day, .{});
     var totals: Totals = .{};
     var buckets: std.ArrayList(Bucket) = .empty;
@@ -454,7 +459,7 @@ pub fn metricsJson(a: A, db: store.Store, days: u32, now: i64) ![]const u8 {
     const Mode = @FieldType(telemetry.Scope, "mode");
     var modes: std.EnumArray(Mode, usize) = .initFill(0);
     for (attempts) |attempt| {
-        if (attempt.at < first or attempt.at > now) continue;
+        if (attempt.at < first or attempt.at > end) continue;
         totals.add(attempt);
         per_day[@intCast(@divFloor(attempt.at - first, day_seconds))].add(attempt);
         stages.getPtr(attempt.stage).* += 1;
@@ -478,7 +483,7 @@ pub fn metricsJson(a: A, db: store.Store, days: u32, now: i64) ![]const u8 {
             bucket.duration_ms +|= duration;
         }
     }
-    const series = try a.alloc(DayRow, days);
+    const series = try a.alloc(DayRow, day_count);
     for (series, per_day, 0..) |*row, day_totals, index| row.* = .{
         .day = try isoDay(a, first + @as(i64, @intCast(index)) * day_seconds),
         .attempts = day_totals.attempts,
@@ -520,11 +525,12 @@ pub fn metricsJson(a: A, db: store.Store, days: u32, now: i64) ![]const u8 {
         if (count != 0) try mode_rows.append(a, .{ .mode = mode, .attempts = count });
     }
     const state = try db.load();
-    const history = try getHistory(a, db, state.entries, first, now);
+    const history = try getHistory(a, db, state.entries, first, end);
     const Depth = @FieldType(core.Explanation, "route");
     var routes: std.EnumArray(Depth, usize) = .initFill(0);
     var verdict_count: usize = 0;
     for (history.rows) |item| {
+        if (item.at > end) continue;
         if (io.eq(u8, item.publication, "pending") or io.eq(u8, item.publication, "preview")) continue;
         verdict_count += 1;
         if (item.route) |route| {
@@ -540,6 +546,7 @@ pub fn metricsJson(a: A, db: store.Store, days: u32, now: i64) ![]const u8 {
     return io.json(a, .{
         .days = days,
         .since = first,
+        .through = end,
         .attempts = totals.attempts,
         .reported = totals.reported,
         .input_tokens = totals.input_tokens,
@@ -658,7 +665,7 @@ test "metrics pair starts and finishes and account for advisor models separately
         models: []const ModelRow,
         providers: []const ProviderRow,
     };
-    const result = try io.parse(a, Summary, try metricsJson(a, db, 7, now));
+    const result = try io.parse(a, Summary, try metricsJson(a, db, 7, 0, now));
     try t.expectEqual(@as(usize, 2), result.attempts);
     try t.expectEqual(@as(usize, 1), result.reported);
     try t.expectEqual(@as(usize, 1), result.review_count);
@@ -714,8 +721,10 @@ test "extended usage includes attempts and verdicts older than 90 days" {
     try telemetry.recordVerdict(db.dir, verdict);
 
     const Summary = struct { attempts: usize, review_count: usize, input_tokens: ?u64 };
-    const recent = try io.parse(a, Summary, try metricsJson(a, db, 30, now));
+    const recent = try io.parse(a, Summary, try metricsJson(a, db, 30, 0, now));
     try t.expectEqual(Summary{ .attempts = 1, .review_count = 1, .input_tokens = 100 }, recent);
-    const extended = try io.parse(a, Summary, try metricsJson(a, db, 365, now));
+    const extended = try io.parse(a, Summary, try metricsJson(a, db, 365, 0, now));
     try t.expectEqual(Summary{ .attempts = 2, .review_count = 2, .input_tokens = 1300 }, extended);
+    const older = try io.parse(a, Summary, try metricsJson(a, db, 30, 105, now));
+    try t.expectEqual(Summary{ .attempts = 1, .review_count = 1, .input_tokens = 1200 }, older);
 }

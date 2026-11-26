@@ -919,7 +919,7 @@ function refreshMetrics() {
   request(`/api/metrics?days=${days}`).then((data) => {
     if (metricsRequest !== flight || view !== "usage") return;
     metricsSnapshot = data;
-    if (data.truncated) note(byId("metrics-notice"), "This range exceeds the history query limit. Choose a shorter range for complete totals.");
+    if (data.truncated) note(byId("metrics-notice"), "This range exceeds the history query limit. Choose a shorter range or use the Talos CLI to query an older period.");
     else note(byId("metrics-notice"), "");
     renderMetrics();
   }).catch((error) => {

@@ -33,7 +33,7 @@ const usage =
     \\talos [--home DIR] result OWNER/REPO PR
     \\talos [--home DIR] queue-budget [STARTS]
     \\talos [--home DIR] usage [ENGINE DAILY_STARTS]
-    \\talos [--home DIR] metrics [--days DAYS]
+    \\talos [--home DIR] metrics [--days DAYS] [--offset DAYS]
     \\talos [--home DIR] dashboard [install|remove] [--port PORT]
     \\talos [--home DIR] queue OWNER/REPO PR [--all-maxxing] [--mode MODE] [--prompt TEXT [--publish]]
     \\talos [--home DIR] followup THREAD_URL [--dry-run | --merge-when-ready]
@@ -2031,7 +2031,7 @@ const Main = struct {
             },
             .metrics => {
                 if (query.repo != null or query.number != null or query.history != null) return error.InvalidDashboardQuery;
-                return dashboard_data.metricsJson(self.a, self.db, query.days orelse 30, now);
+                return dashboard_data.metricsJson(self.a, self.db, query.days orelse 30, 0, now);
             },
             .review => {
                 if (query.days != null or query.history != null) return error.InvalidDashboardQuery;
@@ -2102,8 +2102,18 @@ const Main = struct {
         const cmd = args[0];
         const params = args[1..];
         if (eq(u8, cmd, "metrics")) {
-            const days = if (params.len == 0) 30 else if (params.len == 2 and eq(u8, params[0], "--days")) try metricsDays(params[1]) else return error.Usage;
-            return self.out("{s}\n", .{try dashboard_data.metricsJson(self.a, self.db, days, std.time.timestamp())});
+            var days: ?u32 = null;
+            var offset: ?u32 = null;
+            if (params.len % 2 != 0) return error.Usage;
+            var i: usize = 0;
+            while (i < params.len) : (i += 2) {
+                if (eq(u8, params[i], "--days") and days == null) {
+                    days = try metricsDays(params[i + 1]);
+                } else if (eq(u8, params[i], "--offset") and offset == null) {
+                    offset = std.fmt.parseUnsigned(u32, params[i + 1], 10) catch return error.Usage;
+                } else return error.Usage;
+            }
+            return self.out("{s}\n", .{try dashboard_data.metricsJson(self.a, self.db, days orelse 30, offset orelse 0, std.time.timestamp())});
         }
         if (eq(u8, cmd, "followup") and params.len > 0 and eq(u8, params[0], "status"))
             return self.followupStatus(try self.db.load(), params[1..]);
