@@ -1,6 +1,10 @@
 # Talos
 
-Talos reviews open GitHub pull requests, including drafts, from your machine using Codex, Claude Code, or Kimi Code. It baselines existing PRs and picks up new PRs and new heads. Existing drafts are baselined on upgrade and get reviewed on their next head or when marked ready. Talos can post findings on drafts. A clean draft gets a fresh approval decision when it is marked ready. Each repo can opt into comments and approvals separately.
+Talos reviews open GitHub pull requests, including drafts, from your machine using Codex, Claude Code, or Kimi Code.
+
+[![Talos dashboard with simulated PRs, stack colors, and review progress](docs/dashboard-queue.png)](#monitor-reviews-locally)
+
+Talos baselines existing PRs and picks up new PRs and new heads. Existing drafts are baselined on upgrade and get reviewed on their next head or when marked ready. Talos can post findings on drafts. A clean draft gets a fresh approval decision when it is marked ready. Each repo can opt into comments and approvals separately.
 
 ## Use Talos
 
@@ -58,11 +62,11 @@ talos status                          # See scans, queue, errors, and cache size
 
 ### Monitor reviews locally
 
-Open [the local dashboard](http://127.0.0.1:8749) after starting it. The queue shows tracked jobs, active reviewers, and completed source sections. The displayed percentage counts completed sections. Reviewers working on a section can still require additional evidence or synthesis, so the percentage is a coverage milestone and does not estimate time remaining. Look up a PR by URL or repository and number. You can also queue a PR or GitHub stack and select all-model review. The dashboard uses the same queue and publication policy as the CLI.
+The local dashboard shows tracked jobs, active reviewers, and completed source sections. The displayed percentage counts completed sections. Reviewers working on a section can still require additional evidence or synthesis. [Open the local dashboard](http://127.0.0.1:8749).
 
-These screenshots use simulated repositories and review activity.
+Paste a GitHub PR or stack link to queue it. If the PR belongs to a GitHub stack, Talos offers a separate action to queue all open members. You can select a focus and enable all-model review for either action. The dashboard uses the same queue and publication policy as the CLI.
 
-![Talos queue with active reviews, section progress, stack dependencies, and queue controls](docs/dashboard-queue.png)
+The README screenshots use simulated repositories and review activity.
 
 ![Talos usage with daily calls, token coverage, CLI profiles, and reported model usage](docs/dashboard-usage.png)
 

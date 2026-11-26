@@ -6,6 +6,7 @@ const stack = @import("stack.zig");
 const agent_image = @import("agent_image.zig");
 const A = io.A;
 const eq = io.eq;
+const command_timeout_seconds = 90;
 
 const User = struct { login: []const u8 };
 const Page = struct { hasNextPage: bool, endCursor: ?[]const u8 };
@@ -53,7 +54,7 @@ pub const Client = struct {
     calls: ?*u32 = null,
 
     fn invoke(self: Client, args: []const []const u8, input: []const u8) ![]const u8 {
-        return self.invokeWithin(args, input, 90);
+        return self.invokeWithin(args, input, command_timeout_seconds);
     }
 
     fn invokeWithin(self: Client, args: []const []const u8, input: []const u8, seconds: u32) ![]const u8 {
@@ -68,10 +69,14 @@ pub const Client = struct {
     }
 
     fn api(self: Client, endpoint_path: []const u8, extra: []const []const u8, input: []const u8) ![]const u8 {
+        return self.apiWithin(endpoint_path, extra, input, command_timeout_seconds);
+    }
+
+    fn apiWithin(self: Client, endpoint_path: []const u8, extra: []const []const u8, input: []const u8, seconds: u32) ![]const u8 {
         var args: std.ArrayList([]const u8) = .empty;
         try args.appendSlice(self.cmd.a, &.{ self.gh, "api", "--hostname", "github.com", endpoint_path });
         try args.appendSlice(self.cmd.a, extra);
-        return self.invoke(args.items, input);
+        return self.invokeWithin(args.items, input, seconds);
     }
 
     pub fn identity(self: Client) ![]const u8 {
@@ -198,6 +203,15 @@ pub const Client = struct {
     }
 
     pub fn stackPulls(self: Client, numbers: []const u32) ![]stack.Pin {
+        return self.stackPullsWithin(numbers, command_timeout_seconds);
+    }
+
+    pub fn stackPullSuggestion(self: Client, number: u32) !stack.Pin {
+        const pins = try self.stackPullsWithin(&.{number}, 8);
+        return pins[0];
+    }
+
+    fn stackPullsWithin(self: Client, numbers: []const u32, seconds: u32) ![]stack.Pin {
         if (numbers.len == 0) return &.{};
         const a = self.cmd.a;
         var query: std.ArrayList(u8) = .empty;
@@ -208,7 +222,7 @@ pub const Client = struct {
         }
         try writer.writeAll("}}");
         const args = [_][]const u8{ "-f", try io.fmt(a, "query={s}", .{query.items}) } ++ try self.repoFields();
-        const input = self.api("graphql", &args, "") catch |err| return transportFailure(err, error.GitHubStackFailed);
+        const input = self.apiWithin("graphql", &args, "", seconds) catch |err| return transportFailure(err, error.GitHubStackFailed);
         const response = try io.parse(a, GraphResponse(struct { repository: std.json.Value }), input);
         try checkGraphErrors(response.errors, error.GitHubStackFailed);
         const data = response.data orelse return error.GitHubStackFailed;
@@ -216,6 +230,7 @@ pub const Client = struct {
         const pins = try a.alloc(stack.Pin, numbers.len);
         for (numbers, pins) |number, *pin| {
             const node = data.repository.object.get(try io.fmt(a, "p{d}", .{number})) orelse return error.GitHubStackFailed;
+            if (node == .null) return error.GitHubStackFailed;
             pin.* = try std.json.parseFromValueLeaky(stack.Pin, a, node, .{});
             if (pin.number != number or !pin.valid()) return error.GitHubTargetMismatch;
         }

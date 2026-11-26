@@ -654,6 +654,42 @@ test "explicit all-model requeue preserves same-head receipt safety and is idemp
     try t.expectEqual(@as(?u64, 42), job.receipt);
 }
 
+test "switching focus on a reviewed stack preserves receipts and identical requests keep progress" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var entry: core.Entry = .{ .repo = fixture_repo };
+    const ref: NativeRef = .{ .id = "native-stack", .number = 89 };
+    var pins = [_]Pin{ fixture_parent, fixture_child };
+    for (&pins) |*pin| pin.nativeStack = ref;
+    const group: NativeGroup = .{ .ref = ref, .pins = &pins };
+    const security: core.ReviewOptions = .{ .focus = .@"security-maxxing", .explicit_mode = true, .all_models = true };
+    const perf: core.ReviewOptions = .{ .focus = .@"perf-maxxing", .explicit_mode = true };
+    try t.expectEqual(@as(usize, 2), try queueNative(&entry, a, group, security, false));
+    const job = &entry.jobs[0];
+    job.phase = .complete;
+    job.receipt = 42;
+    try entry.queue(a, pins[0].pull(), security);
+    try t.expectEqual(core.Phase.complete, job.phase);
+
+    try t.expectEqual(@as(usize, 2), try queueNative(&entry, a, group, perf, false));
+    try t.expectEqual(core.Phase.pending, job.phase);
+    try t.expectEqual(perf, job.options);
+    try t.expectEqual(perf, entry.jobs[1].options);
+    try t.expect(job.followup);
+    try t.expectEqual(@as(?u64, 42), job.receipt);
+    const id = job.followup_id;
+    job.route_progress = .{ .fingerprint = @splat(1) };
+    _ = try queueNative(&entry, a, group, perf, false);
+    try t.expectEqual(id, job.followup_id);
+    try t.expect(job.route_progress != null);
+
+    job.phase = .uncertain;
+    try t.expectError(error.PublicationUnconfirmed, queueNative(&entry, a, group, security, false));
+    try t.expectEqual(@as(?u64, 42), job.receipt);
+}
+
 test "stack registration checks order and blocks the child on a failed parent across restart" {
     const t = std.testing;
     var arena = std.heap.ArenaAllocator.init(t.allocator);

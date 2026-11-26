@@ -60,24 +60,39 @@
           <section class="panel queue-panel" aria-labelledby="new-title">
             <h2 id="new-title">Queue a review</h2>
             <form id="queue-form">
-              <fieldset class="segmented">
+              <label class="field">
+                <span>Pull request or stack</span>
+                <input id="queue-target" name="target" required type="text" placeholder="GitHub link or owner/repo#123" autocomplete="off" spellcheck="false" maxlength="360" aria-describedby="queue-target-status">
+              </label>
+              <label class="field" id="queue-repo-field" hidden>
+                <span>Repository</span>
+                <select id="queue-repo" name="repo"><option value="">Select a repository</option></select>
+              </label>
+              <fieldset class="segmented" id="queue-kind-field" hidden>
                 <legend class="sr-only">Review target kind</legend>
                 <label><input type="radio" name="kind" value="pr" checked><span>Pull request</span></label>
                 <label><input type="radio" name="kind" value="stack"><span>Stack</span></label>
               </fieldset>
+              <p id="queue-target-status" class="queue-target-status" role="status" hidden></p>
               <label class="field">
-                <span>GitHub link or number</span>
-                <input id="queue-target" name="target" required type="text" placeholder="With or without a repo" autocomplete="off" spellcheck="false" maxlength="360">
-              </label>
-              <label class="field">
-                <span>Repository</span>
-                <select id="queue-repo" name="repo"><option value="">Select a repository</option></select>
+                <span>Review mode</span>
+                <select name="mode">
+                  <option value="">Automatic</option>
+                  <option value="general">General</option>
+                  <option value="perf-maxxing">Performance</option>
+                  <option value="reliability-maxxing">Reliability</option>
+                  <option value="security-maxxing">Security</option>
+                  <option value="simplicity">Simplicity</option>
+                </select>
               </label>
               <label class="checkbox-field">
                 <input type="checkbox" name="all_models">
                 <span>All-model review</span>
               </label>
-              <button type="submit" class="button button-primary" id="queue-submit">Queue review</button>
+              <div class="queue-actions">
+                <button type="submit" class="button button-primary" id="queue-submit">Queue review</button>
+                <button type="submit" class="button button-secondary" id="queue-stack-submit" hidden>Queue whole stack</button>
+              </div>
               <p id="queue-message" role="status" hidden></p>
             </form>
           </section>

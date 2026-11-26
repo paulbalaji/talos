@@ -2005,13 +2005,15 @@ const Main = struct {
             const failure: struct { status: std.http.Status, message: []const u8 } = switch (err) {
                 error.InvalidDashboardQuery => .{ .status = .bad_request, .message = "Invalid or repeated query parameter." },
                 error.BadQueueRequest => .{ .status = .bad_request, .message = "Select a repository and a valid PR or stack number." },
+                error.InvalidReviewMode => .{ .status = .bad_request, .message = "Choose a valid review mode." },
                 error.InvalidMetricsDays => .{ .status = .bad_request, .message = std.fmt.comptimePrint("Choose a range from 1 to {d} days.", .{max_metrics_days}) },
                 error.UnknownRepository => .{ .status = .not_found, .message = "Talos does not track that repository." },
                 error.AlreadyRunning => .{ .status = .conflict, .message = "Talos is saving queue changes. Try again in a moment." },
                 error.DashboardTargetChanged => .{ .status = .conflict, .message = "The repository or PR changed during lookup. Try again." },
+                error.DashboardStackMemberChanged, error.GitHubStackChanged => .{ .status = .conflict, .message = "The stack changed during lookup. Check the PR again." },
                 error.PublicationUnconfirmed => .{ .status = .conflict, .message = "Talos is confirming an existing GitHub review." },
                 error.PullRequestNotReady, error.NoOpenStackMembers => .{ .status = .unprocessable_entity, .message = "There are no open PR heads to queue." },
-                error.GitHubPullFailed, error.GitHubStackFailed => .{ .status = .bad_gateway, .message = "GitHub could not load that PR or stack." },
+                error.GitHubPullFailed, error.GitHubStackFailed, error.GitHubTargetMismatch => .{ .status = .bad_gateway, .message = "GitHub could not load that PR or stack." },
                 error.GitHubIdentityChanged => .{ .status = .conflict, .message = "The GitHub account differs from the one configured for this repository." },
                 error.GitHubRateLimited => .{ .status = .too_many_requests, .message = "GitHub is rate limiting requests. Try again later." },
                 else => return err,
@@ -2039,6 +2041,12 @@ const Main = struct {
                 if (!core.validRepoName(name)) return error.InvalidDashboardQuery;
                 return dashboard_data.reviewJson(self.a, self.db, name, query.number orelse return error.InvalidDashboardQuery, now);
             },
+            .queue_target => {
+                if (query.days != null or query.history != null) return error.InvalidDashboardQuery;
+                const name = query.repo orelse return error.InvalidDashboardQuery;
+                if (!core.validRepoName(name)) return error.InvalidDashboardQuery;
+                return self.dashboardQueueTarget(name, query.number orelse return error.InvalidDashboardQuery);
+            },
             .queue => {
                 if (request.query.len != 0) return error.InvalidDashboardQuery;
                 return self.dashboardQueue(request.body);
@@ -2046,16 +2054,39 @@ const Main = struct {
         }
     }
 
-    fn dashboardQueue(self: Main, body: []const u8) ![]const u8 {
-        const QueueRequest = struct { repo: []const u8, number: u32, kind: enum { pr, stack }, all_models: bool = false };
-        const input = std.json.parseFromSliceLeaky(QueueRequest, self.a, body, .{ .allocate = .alloc_always }) catch return error.BadQueueRequest;
-        if (!core.validRepoName(input.repo) or input.number == 0 or input.number > std.math.maxInt(i32)) return error.BadQueueRequest;
-        var observed = try self.db.load();
-        const earlier = observed.find(input.repo) orelse return error.UnknownRepository;
+    fn dashboardQueueTarget(self: Main, name: []const u8, number: u32) ![]const u8 {
+        var state = try self.db.load();
+        const entry = state.find(name) orelse return error.UnknownRepository;
+        var request_app = try self.dashboardLookup();
+        defer std.fs.deleteTreeAbsolute(request_app.scratch) catch {};
+        defer request_app.scratch_dir.close();
+        const tools = request_app.local(entry.repo);
+        const env = try tools.githubEnv();
+        const client = try tools.gh(&env, entry.repo.name);
+        const pin = try client.stackPullSuggestion(number);
+        if (!pin.reviewable()) return error.PullRequestNotReady;
+        const stack_number: ?u32 = if (pin.nativeStack) |native| result: {
+            if (!validPrNumber(native.number)) return error.GitHubTargetMismatch;
+            break :result native.number;
+        } else null;
+        return io.json(self.a, .{ .stack_number = stack_number });
+    }
+
+    fn dashboardLookup(self: Main) !Main {
         var request_app = self;
         request_app.scratch = try io.temp(self.a);
-        defer std.fs.deleteTreeAbsolute(request_app.scratch) catch {};
+        errdefer std.fs.deleteTreeAbsolute(request_app.scratch) catch {};
         request_app.scratch_dir = try std.fs.openDirAbsolute(request_app.scratch, .{});
+        return request_app;
+    }
+
+    fn dashboardQueue(self: Main, body: []const u8) ![]const u8 {
+        const input = try DashboardQueueRequest.parse(self.a, body);
+        const options = try input.reviewOptions();
+        var observed = try self.db.load();
+        const earlier = observed.find(input.repo) orelse return error.UnknownRepository;
+        var request_app = try self.dashboardLookup();
+        defer std.fs.deleteTreeAbsolute(request_app.scratch) catch {};
         defer request_app.scratch_dir.close();
         const target: union(enum) { pr: core.Pull, stack: stack.NativeGroup } = switch (input.kind) {
             .pr => .{ .pr = try request_app.choose(earlier, input.number) },
@@ -2069,7 +2100,6 @@ const Main = struct {
         const entry = state.find(input.repo) orelse return error.UnknownRepository;
         if (!eq(u8, try io.json(self.a, earlier.repo), try io.json(self.a, entry.repo))) return error.DashboardTargetChanged;
         const rescanned = entry.last_scan != earlier.last_scan;
-        const options: ?core.ReviewOptions = if (input.all_models) .{ .all_models = true } else null;
         switch (target) {
             .pr => |pull| {
                 if (rescanned and dashboardHeadChanged(entry.*, pull.number, pull.headRefOid)) return error.DashboardTargetChanged;
@@ -2082,6 +2112,11 @@ const Main = struct {
                 return io.json(self.a, .{ .repo = entry.repo.name, .number = input.number, .kind = input.kind, .head = job.head, .message = message });
             },
             .stack => |group| {
+                if (input.member) |number| {
+                    for (group.pins) |pin| {
+                        if (pin.number == number and pin.reviewable()) break;
+                    } else return error.DashboardStackMemberChanged;
+                }
                 if (rescanned) for (group.pins) |pin| {
                     if (pin.reviewable() and dashboardHeadChanged(entry.*, pin.number, pin.headRefOid)) return error.DashboardTargetChanged;
                 };
@@ -2204,6 +2239,33 @@ const Main = struct {
 
 const DashboardQuery = struct { repo: ?[]const u8 = null, number: ?u32 = null, days: ?u32 = null, history: ?bool = null };
 
+const DashboardQueueRequest = struct {
+    repo: []const u8,
+    number: u32,
+    kind: enum { pr, stack },
+    all_models: bool = false,
+    mode: ?[]const u8 = null,
+    member: ?u32 = null,
+
+    fn parse(a: A, body: []const u8) !DashboardQueueRequest {
+        const input = std.json.parseFromSliceLeaky(DashboardQueueRequest, a, body, .{ .allocate = .alloc_always }) catch return error.BadQueueRequest;
+        if (!core.validRepoName(input.repo) or !validPrNumber(input.number)) return error.BadQueueRequest;
+        if (input.member) |member| {
+            if (input.kind != .stack or !validPrNumber(member)) return error.BadQueueRequest;
+        }
+        return input;
+    }
+
+    fn reviewOptions(self: DashboardQueueRequest) !?core.ReviewOptions {
+        if (self.mode == null and !self.all_models) return null;
+        return .{
+            .focus = if (self.mode) |mode| std.meta.stringToEnum(core.ReviewFocus, mode) orelse return error.InvalidReviewMode else .general,
+            .explicit_mode = self.mode != null,
+            .all_models = self.all_models,
+        };
+    }
+};
+
 fn dashboardHeadChanged(entry: core.Entry, number: u32, head: []const u8) bool {
     for (entry.seen) |pull| {
         if (pull.number == number) return !eq(u8, pull.head, head);
@@ -2292,8 +2354,12 @@ fn repoName(a: A, name: []const u8) ![]const u8 {
 
 fn prNumber(arg: []const u8) !u32 {
     const number = std.fmt.parseUnsigned(u32, arg, 10) catch return error.InvalidPullRequest;
-    if (number == 0 or number > std.math.maxInt(i32)) return error.InvalidPullRequest;
+    if (!validPrNumber(number)) return error.InvalidPullRequest;
     return number;
+}
+
+fn validPrNumber(number: u32) bool {
+    return number != 0 and number <= std.math.maxInt(i32);
 }
 
 fn formatTime(a: A, timestamp: i64) ![]const u8 {
@@ -2372,6 +2438,33 @@ test "dashboard query accepts encoded repository names and rejects repeated or m
     try t.expectEqual(@as(?u32, 365), (try parseDashboardQuery(a, "days=365")).days);
     try t.expectEqual(@as(?u32, max_metrics_days), (try parseDashboardQuery(a, "days=3650")).days);
     try t.expectError(error.InvalidMetricsDays, parseDashboardQuery(a, "days=3651"));
+}
+
+test "dashboard queue accepts explicit modes with all models and keeps the default adaptive" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parse = DashboardQueueRequest.parse;
+    const default = try parse(a, "{\"repo\":\"example/repo\",\"number\":42,\"kind\":\"pr\"}");
+    try t.expectEqual(@as(?core.ReviewOptions, null), try default.reviewOptions());
+    const all_models = try parse(a, "{\"repo\":\"example/repo\",\"number\":42,\"kind\":\"pr\",\"all_models\":true}");
+    try t.expect((try all_models.reviewOptions()).?.allowRouting());
+    for (std.meta.tags(core.ReviewFocus)) |mode| {
+        const body = try io.json(a, .{ .repo = "example/repo", .number = 42, .kind = "stack", .member = 12, .mode = @tagName(mode), .all_models = true });
+        const queued = try parse(a, body);
+        const options = (try queued.reviewOptions()).?;
+        try t.expectEqual(@as(?u32, 12), queued.member);
+        try t.expectEqual(mode, options.focus);
+        try t.expect(options.all_models and options.explicit_mode and !options.allowRouting());
+        try t.expect(options.request == null and !options.publish_prompted);
+    }
+    const invalid_mode = try parse(a, "{\"repo\":\"example/repo\",\"number\":42,\"kind\":\"pr\",\"mode\":\"unknown\"}");
+    try t.expectError(error.InvalidReviewMode, invalid_mode.reviewOptions());
+    try t.expectError(error.BadQueueRequest, parse(a, "{\"repo\":\"example/repo\",\"number\":42,\"kind\":\"pr\",\"mode\":0}"));
+    try t.expectError(error.BadQueueRequest, parse(a, "{\"repo\":\"example/repo\",\"number\":42,\"kind\":\"pr\",\"member\":12}"));
+    try t.expectError(error.BadQueueRequest, parse(a, "{\"repo\":\"example/repo\",\"number\":42,\"kind\":\"stack\",\"member\":0}"));
+    try t.expectError(error.BadQueueRequest, parse(a, "{\"repo\":\"example/repo\",\"number\":42,\"kind\":\"pr\",\"publish_prompted\":true}"));
 }
 
 test "each reviewer combination registers with only its selected executables" {
