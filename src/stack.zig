@@ -498,7 +498,7 @@ pub fn syncNative(entry: *core.Entry, a: io.A, discovered: []const NativeGroup) 
     entry.stacks = groups.items;
 }
 
-pub fn queueNative(entry: *core.Entry, a: io.A, group: NativeGroup, options: ?core.ReviewOptions) !usize {
+pub fn queueNative(entry: *core.Entry, a: io.A, group: NativeGroup, options: ?core.ReviewOptions, rerun_completed: bool) !usize {
     var count: usize = 0;
     for (group.pins) |pin| {
         if (pin.reviewable()) count += 1;
@@ -520,7 +520,7 @@ pub fn queueNative(entry: *core.Entry, a: io.A, group: NativeGroup, options: ?co
     }
     try syncNative(entry, a, groups.items);
     for (group.pins) |pin| {
-        if (pin.reviewable()) try entry.queue(a, pin.pull(), options);
+        if (pin.reviewable()) try entry.queueReview(a, pin.pull(), options, rerun_completed);
     }
     return count;
 }
@@ -607,6 +607,20 @@ test "explicit all-model requeue preserves same-head receipt safety and is idemp
     try entry.queue(a, pr, options);
     try t.expectEqual(core.Phase.complete, job.phase);
     try t.expectEqual(id, job.followup_id);
+
+    try entry.queueReview(a, pr, options, true);
+    try t.expectEqual(core.Phase.pending, job.phase);
+    try t.expect(job.followup and job.options.all_models);
+    try t.expectEqual(@as(?u64, 42), job.receipt);
+    try t.expect(!io.eq(u8, &id, &job.followup_id));
+    const rerun_id = job.followup_id;
+    job.route_progress = .{ .fingerprint = @splat(1), .all_models = true };
+    try entry.queueReview(a, pr, options, true);
+    try t.expectEqual(rerun_id, job.followup_id);
+    try t.expect(job.route_progress != null);
+    job.phase = .uncertain;
+    try t.expectError(error.PublicationUnconfirmed, entry.queueReview(a, pr, options, true));
+    try t.expectEqual(@as(?u64, 42), job.receipt);
 }
 
 test "stack registration checks order and blocks the child on a failed parent across restart" {
@@ -837,7 +851,7 @@ test "GitHub order is authoritative for a 26-member stack" {
     const report = try statuses(a, entry);
     try t.expectEqual(@as(?u32, 23), report[0].native_number);
     try t.expectEqual(@as(u32, 1025), report[0].members[25].number);
-    try t.expectEqual(@as(usize, 25), try queueNative(&entry, a, group, null));
+    try t.expectEqual(@as(usize, 25), try queueNative(&entry, a, group, null, false));
     try t.expect(blocked(entry, entry.jobs[0]));
     try t.expect(!blocked(entry, entry.jobs[1]));
     pins[1].state = .MERGED;

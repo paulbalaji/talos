@@ -33,7 +33,7 @@ const usage =
     \\talos [--home DIR] followup THREAD_URL [--dry-run | --merge-when-ready]
     \\talos [--home DIR] followup status [--json]
     \\talos [--home DIR] followup pause|resume THREAD_URL
-    \\talos [--home DIR] stack OWNER/REPO STACK_NUMBER [--all-maxxing]
+    \\talos [--home DIR] stack OWNER/REPO STACK_NUMBER [--all-maxxing [--rerun]]
     \\talos [--home DIR] stack OWNER/REPO NAME PR PR [PR ...]
     \\talos [--home DIR] unstack OWNER/REPO NAME
     \\talos [--home DIR] run-once [OWNER/REPO [PR [--mode MODE] [--prompt TEXT]]]
@@ -1271,7 +1271,8 @@ const Main = struct {
     }
 
     fn registerStack(self: Main, state: *store.State, args: []const []const u8) !void {
-        const all_models = args.len == 3 and eq(u8, args[2], "--all-maxxing");
+        const rerun = args.len == 4 and eq(u8, args[2], "--all-maxxing") and eq(u8, args[3], "--rerun");
+        const all_models = rerun or (args.len == 3 and eq(u8, args[2], "--all-maxxing"));
         if (!all_models and args.len != 2 and (args.len < 4 or args.len > stack.max_members + 2)) return error.Usage;
         const entry = state.find(args[0]) orelse return error.UnknownRepository;
         const tools = self.local(entry.repo);
@@ -1281,7 +1282,7 @@ const Main = struct {
             const number = try prNumber(args[1]);
             if (!std.ascii.eqlIgnoreCase(entry.repo.login, try client.identity())) return error.GitHubIdentityChanged;
             const group = try client.nativeByNumber(number);
-            const count = try stack.queueNative(entry, self.a, group, if (all_models) .{ .all_models = true } else null);
+            const count = try stack.queueNative(entry, self.a, group, if (all_models) .{ .all_models = true } else null, rerun);
             try self.db.save(state);
             return self.out("Queued {s} GitHub stack #{d} with {d} open PRs{s}\n", .{ entry.repo.name, number, count, if (all_models) " for all-model review" else "" });
         }

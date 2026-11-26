@@ -506,15 +506,20 @@ pub const Entry = struct {
     }
 
     pub fn queue(self: *Entry, a: A, pr: Pull, options: ?ReviewOptions) !void {
+        return self.queueReview(a, pr, options, false);
+    }
+
+    pub fn queueReview(self: *Entry, a: A, pr: Pull, options: ?ReviewOptions, rerun_completed: bool) !void {
         const all_models = if (options) |requested| requested.all_models else false;
         for (self.jobs) |*job| {
             if (job.number != pr.number or !eq(u8, job.head, pr.headRefOid)) continue;
             if (job.phase == .uncertain) {
-                if (all_models and !job.options.all_models) return error.PublicationUnconfirmed;
+                if (rerun_completed or (all_models and !job.options.all_models)) return error.PublicationUnconfirmed;
                 job.next = 0;
                 job.attempts = 0;
             } else if (all_models) {
-                if (job.options.all_models or (job.route_report != null and job.route_report.?.all_models)) {
+                const rerun = rerun_completed and job.phase == .complete;
+                if (!rerun and (job.options.all_models or (job.route_report != null and job.route_report.?.all_models))) {
                     if (job.phase != .failed) return;
                 }
                 job.options = options.?;
@@ -758,7 +763,10 @@ fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, discussion: Discussi
     }
     if (previous) |commit| {
         if (eq(u8, commit, pr.headRefOid)) {
-            try writer.writeAll("\n\nThis is a same-head rereview. Check what the conversation or base change means for the prior findings. Carry forward accepted or verified resolutions unless the current evidence specifically invalidates them.");
+            try writer.writeAll(if (options.all_models)
+                "\n\nReview the full current change independently. Use prior findings and replies to identify what has already been reported or resolved."
+            else
+                "\n\nThis is a same-head rereview. Check what the conversation or base change means for the prior findings. Carry forward accepted or verified resolutions unless the current evidence specifically invalidates them.");
         } else if (prior_delta.evidence.len != 0 and prior_delta.coverage_reasons.len == 0) {
             try writer.writeAll("\n\nStart with the previous-to-current delta and the latest replies. For an existing finding, check whether the changed source or dependencies could alter the prior verdict. Retain still-valid blockers by thread ID. Review new changes independently, including new entries in generated release metadata.");
         }

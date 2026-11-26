@@ -141,6 +141,8 @@ Talos routes contract changes, ownership and signing changes, deployment permiss
 
 In adaptive routing, changes to Hyperlane's production CCIP Read verification and commit/reveal authentication use the security, reliability, and performance lenses with every configured full reviewer at maximum effort. Dependent PRs inherit that route from a reviewed open ancestor at the same pinned revision. To request it for all current open members of a GitHub stack, run `talos stack OWNER/REPO STACK_NUMBER --all-maxxing`.
 
+Add `--rerun` after `--all-maxxing` to review completed members again at the same head. Pending all-model jobs keep their progress. The normal publication rules still suppress unchanged findings.
+
 On scheduled reviews, the screening model can request up to six specific files or excerpts from the pinned commit. Talos reads one excerpt per distinct file before repeats. Changes to Hyperlane Merkle snapshot and insertion projections also get pinned schema, writer, and database adapter excerpts. Multi review uses a synthesis pass to verify candidate claims. If that response is malformed, Talos retains the independent passes and tries an eligible provider, resuming on a later tick if needed.
 
 ### Configure provider fallback
