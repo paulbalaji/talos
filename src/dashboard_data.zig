@@ -8,6 +8,7 @@ const usage = @import("usage.zig");
 
 const A = io.A;
 const day_seconds = std.time.s_per_day;
+const active_attempt_seconds = 35 * std.time.s_per_min;
 const detail_days = 90;
 const history_limit = 160;
 const legacy_file_limit = 256;
@@ -33,7 +34,7 @@ const Attempt = struct {
 };
 
 fn running(start: telemetry.Event, now: i64) bool {
-    if (now -| start.at > 35 * std.time.s_per_min) return false;
+    if (now -| start.at > active_attempt_seconds) return false;
     const pid = start.pid orelse return false;
     if (pid == 0 or pid > std.math.maxInt(std.posix.pid_t)) return false;
     std.posix.kill(@intCast(pid), 0) catch return false;
@@ -348,7 +349,7 @@ const StackRow = struct { repo: []const u8, number: ?u32, name: []const u8, memb
 
 pub fn stateJson(a: A, db: store.Store, include_history: bool, now: i64) ![]const u8 {
     const state = try db.load();
-    const attempts = try pairAttempts(a, try telemetry.read(a, db.dir, .{ .since = now - 35 * std.time.s_per_min, .limit = 2048, .now = now }), now);
+    const attempts = try pairAttempts(a, try telemetry.read(a, db.dir, .{ .since = now - active_attempt_seconds, .limit = 2048, .now = now }), now);
     var repos: std.ArrayList(RepoRow) = .empty;
     var jobs: std.ArrayList(JobRow) = .empty;
     var stacks: std.ArrayList(StackRow) = .empty;
@@ -448,8 +449,14 @@ pub fn metricsJson(a: A, db: store.Store, days: u32, offset: u32, now: i64) ![]c
     const first_day = @max(0, last_day - days + 1);
     const first = first_day * day_seconds;
     const day_count: usize = @intCast(last_day - first_day + 1);
-    const events = try telemetry.read(a, db.dir, .{ .since = first, .limit = telemetry.max_query_events, .now = end });
-    const attempts = try pairAttempts(a, events, end);
+    // Include neighboring starts and finishes so a call spanning midnight
+    // belongs only to the window containing its start.
+    const events = try telemetry.read(a, db.dir, .{
+        .since = @max(0, first - active_attempt_seconds),
+        .limit = telemetry.max_query_events,
+        .now = @min(now, end + active_attempt_seconds),
+    });
+    const attempts = try pairAttempts(a, events, now);
     const per_day = try a.alloc(Totals, day_count);
     @memset(per_day, .{});
     var totals: Totals = .{};
@@ -727,4 +734,21 @@ test "extended usage includes attempts and verdicts older than 90 days" {
     try t.expectEqual(Summary{ .attempts = 2, .review_count = 2, .input_tokens = 1300 }, extended);
     const older = try io.parse(a, Summary, try metricsJson(a, db, 30, 105, now));
     try t.expectEqual(Summary{ .attempts = 1, .review_count = 1, .input_tokens = 1200 }, older);
+
+    const midnight = @divFloor(now, day_seconds) * day_seconds - 110 * day_seconds;
+    attempt.id = "cross-midnight";
+    attempt.kind = .started;
+    attempt.at = midnight - 60;
+    attempt.outcome = null;
+    attempt.tokens = null;
+    try telemetry.append(a, db.dir, attempt);
+    attempt.kind = .finished;
+    attempt.at = midnight + 60;
+    attempt.outcome = .success;
+    attempt.tokens = .{ .input = 75 };
+    try telemetry.append(a, db.dir, attempt);
+    const day_started = try io.parse(a, Summary, try metricsJson(a, db, 1, 111, now));
+    try t.expectEqual(Summary{ .attempts = 1, .review_count = 0, .input_tokens = 75 }, day_started);
+    const day_finished = try io.parse(a, Summary, try metricsJson(a, db, 1, 110, now));
+    try t.expectEqual(Summary{ .attempts = 0, .review_count = 0, .input_tokens = null }, day_finished);
 }

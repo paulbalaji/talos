@@ -168,12 +168,12 @@ fn appendRecord(a: io.A, root: std.fs.Dir, directory: []const u8, record: anytyp
     try file.sync();
 }
 
-fn matches(record: anytype, query: Query) bool {
+fn matches(record: anytype, query: Query, until: i64) bool {
     const repo_name = if (@TypeOf(record) == Event) record.scope.repo else record.repo;
     const number = if (@TypeOf(record) == Event) record.scope.pr else record.pr;
     if (query.repo) |repo| if (!std.ascii.eqlIgnoreCase(repo, repo_name)) return false;
     if (query.pr) |pr| if (pr != number) return false;
-    return record.at >= query.since;
+    return record.at >= query.since and record.at <= until;
 }
 
 fn copyOptional(a: io.A, value: ?[]const u8) !?[]const u8 {
@@ -220,7 +220,8 @@ fn readRecords(a: io.A, root: std.fs.Dir, directory: []const u8, comptime Record
         else => return err,
     };
     defer dir.close();
-    const today = @divFloor(query.now orelse std.time.timestamp(), std.time.s_per_day);
+    const until = query.now orelse std.time.timestamp();
+    const today = @divFloor(until, std.time.s_per_day);
     const first = @divFloor(query.since, std.time.s_per_day);
     var found: std.ArrayList(Record) = .empty;
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -249,7 +250,7 @@ fn readRecords(a: io.A, root: std.fs.Dir, directory: []const u8, comptime Record
             if (line.len != 0 and line.len <= max_event_bytes) {
                 defer _ = scratch.reset(.retain_capacity);
                 if (std.json.parseFromSliceLeaky(Record, scratch.allocator(), line, .{ .ignore_unknown_fields = true, .allocate = .alloc_if_needed })) |record| {
-                    if (matches(record, query)) try found.append(a, try copyRecord(a, record));
+                    if (matches(record, query, until)) try found.append(a, try copyRecord(a, record));
                 } else |err| {
                     if (err == error.OutOfMemory) return err;
                 }
