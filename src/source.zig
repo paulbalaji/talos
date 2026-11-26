@@ -23,6 +23,7 @@ const supplement_limit = 16 * 1024;
 const scraper_context_limit = 10 * 1024;
 const delta_limit = 12 * 1024;
 const excerpt_blob_limit = 128 * 1024;
+const excerpt_source_limit = 512 * 1024;
 const excerpt_line_limit = 120;
 const registry_diff_limit = 16 * 1024;
 const registry_pin_path = ".registryrc";
@@ -982,7 +983,7 @@ pub const Git = struct {
         const a = self.cmd.a;
         if (!core.validPath(request.path) or sensitive(request.path)) return error.DisallowedExcerptPath;
         if (remaining.* <= request.path.len + 160) return error.ExcerptBudget;
-        const blob = try self.pinnedBlob(cache_path, try self.pinnedOid(cache_path, head, request.path));
+        const blob = try self.pinnedText(cache_path, try self.pinnedOid(cache_path, head, request.path), excerpt_source_limit);
         const lines = if (request.line_contains) |needle| try anchoredRange(blob, needle) else try excerptRange(request.start_line, request.end_line);
         const excerpt = try excerptLines(blob, lines);
         if (anchor_line) |line| {
@@ -1005,9 +1006,13 @@ pub const Git = struct {
     }
 
     fn pinnedBlob(self: Git, cache_path: []const u8, oid: []const u8) ![]const u8 {
+        return self.pinnedText(cache_path, oid, excerpt_blob_limit);
+    }
+
+    fn pinnedText(self: Git, cache_path: []const u8, oid: []const u8, limit: usize) ![]const u8 {
         const text = io.trim(u8, try self.gitWithin(cache_path, &.{ "cat-file", "-s", oid }, "", 30), "\r\n");
         const size = try std.fmt.parseUnsigned(usize, text, 10);
-        if (size > excerpt_blob_limit) return error.ExcerptTooLarge;
+        if (size > limit) return error.ExcerptTooLarge;
         const blob = try self.gitWithin(cache_path, &.{ "cat-file", "blob", oid }, "", 20);
         if (blob.len != size or !std.unicode.utf8ValidateSlice(blob) or std.mem.indexOfScalar(u8, blob, 0) != null)
             return error.ExcerptNotText;
@@ -1559,7 +1564,7 @@ test "pinned source reads exact trees and prioritizes active review anchors in a
     missing.line = 9;
     const threads: []const core.Thread = &.{ current, duplicate, stale, left, missing };
 
-    const docs_blob = io.trim(u8, try git.git(path, &.{ "hash-object", "-w", "--stdin" }, "large docs\n" ** 5000), "\n");
+    const docs_blob = io.trim(u8, try git.git(path, &.{ "hash-object", "-w", "--stdin" }, "large docs\n" ** 20000), "\n");
     const risk_blob = io.trim(u8, try git.git(path, &.{ "hash-object", "-w", "--stdin" }, "owner: new\n"), "\n");
     const active_blob = io.trim(u8, try git.git(path, &.{ "hash-object", "-w", "--stdin" }, "start\nactive anchor\nend\n"), "\n");
     const new_tree = try io.fmt(a, "100644 blob {s}\t{s}\n100644 blob {s}\t{s}\n100644 blob {s}\t{s}\n", .{
@@ -1583,6 +1588,16 @@ test "pinned source reads exact trees and prioritizes active review anchors in a
     try t.expectEqual(@as(usize, 1), try git.appendThreadExcerpts(path, new_head, &files, threads, false, &evidence, &remaining));
     try t.expectEqual(@as(usize, 1), std.mem.count(u8, evidence.items, "active anchor"));
     try t.expect(std.mem.indexOf(u8, evidence.items, "DO NOT PRESENT") == null);
+    try t.expectError(error.ExcerptTooLarge, git.pinnedBlob(path, docs_blob));
+    evidence.clearRetainingCapacity();
+    remaining = context_limit;
+    try t.expect(try git.appendExcerpt(path, new_head, .{
+        .path = docs,
+        .start_line = 20000,
+        .end_line = 20000,
+    }, null, &evidence, &remaining));
+    try t.expect(std.mem.indexOf(u8, evidence.items, "lines 20000-20000:\nlarge docs\n") != null);
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, evidence.items, "large docs"));
 }
 
 test "source excerpts cap requested lines and preserve the last line without a newline" {
