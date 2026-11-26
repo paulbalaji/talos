@@ -451,6 +451,8 @@ const ParallelPass = struct {
     }
 };
 
+const SectionPlan = struct { index: usize, plan: adaptive.Plan };
+
 const ReviewWorker = struct {
     // Only the coordinator uses adapter, gh_env and job. The worker borrows
     // immutable context and uses its own arena, processes and scratch directory.
@@ -467,6 +469,7 @@ const ReviewWorker = struct {
     done: std.atomic.Value(bool) = .init(false),
     result: anyerror!core.ReviewResults = undefined,
     plan: ?adaptive.Plan = null,
+    section_plans: []const SectionPlan = &.{},
     route_outcome: ?adaptive.Outcome = null,
     policy: queue.Budget = .{},
     rate_limits: u8 = 0,
@@ -576,6 +579,14 @@ const ReviewWorker = struct {
     }
 
     fn analyzeInScratch(self: *ReviewWorker) !core.ReviewResults {
+        if (self.section_plans.len != 0) {
+            self.route_outcome = try self.analyzeSections();
+            return undefined;
+        }
+        return self.analyzeSingle();
+    }
+
+    fn analyzeSingle(self: *ReviewWorker) !core.ReviewResults {
         const a = self.arena.allocator();
         const scratch = try io.temp(a);
         defer std.fs.deleteTreeAbsolute(scratch) catch {};
@@ -595,6 +606,55 @@ const ReviewWorker = struct {
             return undefined;
         }
         return core.analyze(a, self, self.prepared.engines, self.prepared.context);
+    }
+
+    fn analyzeSectionWorker(self: *ReviewWorker) void {
+        self.result = self.analyzeSingle();
+    }
+
+    fn analyzeSections(self: *ReviewWorker) !adaptive.Outcome {
+        var workers: [queue.parallel_sections]ReviewWorker = undefined;
+        var threads: [queue.parallel_sections]?std.Thread = @splat(null);
+        const count = self.section_plans.len;
+        const active = workers[0..count];
+        for (active, self.section_plans, threads[0..count]) |*worker, section, *thread| {
+            worker.* = .{
+                .job = undefined,
+                .adapter = self.adapter,
+                .batch = self.batch,
+                .prepared = section.plan.prepared,
+                .plan = section.plan,
+                .policy = self.policy,
+            };
+            if (count == 1) {
+                worker.analyzeSectionWorker();
+            } else {
+                thread.* = std.Thread.spawn(.{}, ReviewWorker.analyzeSectionWorker, .{worker}) catch fallback: {
+                    worker.analyzeSectionWorker();
+                    break :fallback null;
+                };
+            }
+        }
+        for (threads[0..count]) |thread| if (thread) |running| running.join();
+        defer for (active) |*worker| worker.arena.deinit();
+        var results: [queue.parallel_sections]adaptive.SectionOutcome = undefined;
+        for (active, self.section_plans, results[0..count]) |worker, section, *result| {
+            self.counts.reviewer_starts += worker.counts.reviewer_starts;
+            self.rate_limits |= worker.rate_limits;
+            result.* = .{
+                .task = .{ .index = section.index, .progress = section.plan.progress },
+                .review = if (worker.result) |_| worker.route_outcome.? else |err| .{ .progress = section.plan.progress, .failure = err },
+            };
+        }
+        const a = self.arena.allocator();
+        var outcome = try adaptive.mergeParallelSections(a, self.plan.?, results[0..count]);
+        // Child arenas own raw reviewer output. Keep only the merged state.
+        outcome.progress = try io.parse(a, core.RouteProgress, try io.json(a, outcome.progress));
+        if (outcome.review_results != null) {
+            outcome.review_results = outcome.progress.sections.results;
+            outcome.synthesis_summary = outcome.progress.sections.synthesis_gap;
+        }
+        return outcome;
     }
 };
 
@@ -1166,7 +1226,10 @@ const Main = struct {
             work.thread = null;
             batch.pending -= 1;
             counts.reviewer_starts += work.counts.reviewer_starts;
-            if (work.plan) |plan| batch.starts_left += plan.start_limit - work.counts.reviewer_starts;
+            if (work.plan) |plan| {
+                const reserved = plan.start_limit * @as(u32, @intCast(@max(1, work.section_plans.len)));
+                batch.starts_left += reserved - work.counts.reviewer_starts;
+            }
             for (std.meta.tags(core.Engine)) |engine| {
                 if (work.rate_limits & queue.engineBit(engine) == 0) continue;
                 const err = switch (engine) {
@@ -1271,61 +1334,115 @@ const Main = struct {
                 screen.floor = routing.all_lenses;
             }
             if (work.prepared.sections.len != 0 and !work.prepared.onchain_available) screen.ask_model = false;
-            const has_section = work.prepared.sections.len == 0 or progress.sections.index < work.prepared.sections.len;
-            const section = if (has_section) work.prepared.section(progress.sections.index) else work.prepared;
-            if (progress.onchain_reads.len != 0 and progress.onchain_observations == null) {
-                progress.onchain_observations = try work.adapter.onchainReads(work.prepared.pr, progress.onchain_reads);
-            }
-            var evidence: ?[]const u8 = null;
-            var evidence_limited = false;
-            if (progress.evidence_requests.len != 0) {
-                const pinned = try work.adapter.reviewEvidence(work.prepared.pr, progress.evidence_requests, adaptive.evidenceCapacity(section));
-                evidence = pinned.source;
-                evidence_limited = pinned.limited;
-                var hash = std.crypto.hash.sha2.Sha256.init(.{});
-                hash.update(evidence.?);
-                hash.update(&.{@intFromBool(evidence_limited)});
-                const evidence_key = hash.finalResult();
-                if (progress.evidence_key) |prior| {
-                    if (!eq(u8, &prior, &evidence_key)) {
-                        progress.results = &.{};
-                        progress.malformed_reviewers = 0;
-                        progress.rejected_synthesizers = 0;
-                        progress.review_ms = 0;
-                        progress.initial_evidence_limited = false;
-                        progress.completion_requests = null;
-                        progress.completion_attempted = 0;
-                        progress.completion_done = 0;
-                    }
-                }
-                progress.evidence_key = evidence_key;
-            }
-            var completion_evidence: ?adaptive.PinnedEvidence = null;
-            if (progress.completion_requests) |requests| {
-                if (requests.len != 0) {
-                    const capacity = try adaptive.completionCapacity(section, evidence orelse "", progress.onchain_observations orelse &.{}, self.a);
-                    completion_evidence = try work.adapter.reviewEvidence(work.prepared.pr, requests, capacity);
-                }
-            }
-            work.plan = .{
+            const plan: adaptive.Plan = .{
                 .repo = entry.repo,
                 .providers = try entry.repo.providers(self.a),
                 .prepared = work.prepared,
                 .screen = screen,
                 .progress = progress,
                 .start_limit = queue.reviewerCost(entry.repo),
-                .evidence = evidence,
-                .evidence_limited = evidence_limited,
-                .completion_evidence = completion_evidence,
             };
+            const has_section = work.prepared.sections.len == 0 or progress.sections.index < work.prepared.sections.len;
+            if (has_section and work.prepared.sections.len > 1 and work.prepared.all_models and
+                !work.prepared.context_update and !work.prepared.onchain_available)
+            {
+                try self.prepareSectionWindow(work, plan);
+            } else {
+                const section = if (has_section) work.prepared.section(progress.sections.index) else work.prepared;
+                work.plan = try self.prepareReviewEvidence(&work.adapter, plan, section);
+            }
         }
         if (!state.queue_budget.canReview(entry.repo, job.route_progress, std.time.timestamp(), batch.limited.load(.monotonic), batch.usageSnapshot()))
             return error.ReviewerCoolingDown;
         work.job_key = try ReviewWorker.jobKey(self.a, entry.repo, job.*);
         work.thread = try std.Thread.spawn(.{}, ReviewWorker.analyze, .{work});
+        batch.starts_left -= work.plan.?.start_limit * @as(u32, @intCast(work.section_plans.len -| 1));
         batch.pending += 1;
         batch.workers[batch.len] = work;
         batch.len += 1;
+    }
+
+    fn prepareSectionWindow(self: Main, work: *ReviewWorker, initial: adaptive.Plan) !void {
+        var root = initial;
+        root.progress.screen_waiting = false;
+        root.progress.decision = routing.all_lenses;
+        const sections = &root.progress.sections;
+        if (sections.finished_mask == null) {
+            // Older checkpoints have a contiguous prefix and one active section.
+            sections.finished_mask = adaptive.sectionBit(sections.index) - 1;
+            var active = root.progress;
+            active.sections = .{};
+            active.review_ms = 0;
+            sections.pending = try self.a.dupe(core.SectionTask, &.{.{ .index = sections.index, .progress = active }});
+            adaptive.resetSection(&root.progress);
+        }
+
+        const window = @min(queue.parallel_sections, 1 + work.batch.starts_left / root.start_limit);
+        var plans: std.ArrayList(SectionPlan) = .empty;
+        var occupied = sections.pending.len;
+        const now = std.time.timestamp();
+        const limited = work.batch.limited.load(.monotonic);
+        const provider_usage = work.batch.usageSnapshot();
+        for (0..root.prepared.sections.len) |index| {
+            if (sections.finished_mask.? & adaptive.sectionBit(index) != 0) continue;
+            if (plans.items.len == window) break;
+            var scoped = root;
+            scoped.progress = for (sections.pending) |saved| {
+                if (saved.index == index) break saved.progress;
+            } else new: {
+                if (occupied == queue.parallel_sections) continue;
+                occupied += 1;
+                break :new .{
+                    .fingerprint = root.progress.fingerprint,
+                    .all_models = true,
+                    .decision = routing.all_lenses,
+                    .screen_waiting = false,
+                };
+            };
+            if (!work.policy.canReview(root.repo, scoped.progress, now, limited, provider_usage)) continue;
+            scoped.prepared = root.prepared.section(index);
+            scoped.prepared.sections = &.{};
+            try plans.append(self.a, .{
+                .index = index,
+                .plan = try self.prepareReviewEvidence(&work.adapter, scoped, scoped.prepared),
+            });
+        }
+        if (plans.items.len == 0) return error.ReviewerCoolingDown;
+        work.plan = root;
+        work.section_plans = plans.items;
+    }
+
+    fn prepareReviewEvidence(self: Main, live: *Adapter, initial: adaptive.Plan, section: core.Prepared) !adaptive.Plan {
+        var plan = initial;
+        const progress = &plan.progress;
+        if (progress.onchain_reads.len != 0 and progress.onchain_observations == null) {
+            progress.onchain_observations = try live.onchainReads(plan.prepared.pr, progress.onchain_reads);
+        }
+        if (progress.evidence_requests.len != 0) {
+            const pinned = try live.reviewEvidence(plan.prepared.pr, progress.evidence_requests, adaptive.evidenceCapacity(section));
+            plan.evidence = pinned.source;
+            plan.evidence_limited = pinned.limited;
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            hash.update(pinned.source);
+            hash.update(&.{@intFromBool(pinned.limited)});
+            const evidence_key = hash.finalResult();
+            if (progress.evidence_key) |prior| {
+                if (!eq(u8, &prior, &evidence_key)) {
+                    const requests = progress.evidence_requests;
+                    adaptive.resetSection(progress);
+                    progress.evidence_requests = requests;
+                    progress.review_ms = 0;
+                }
+            }
+            progress.evidence_key = evidence_key;
+        }
+        if (progress.completion_requests) |requests| {
+            if (requests.len != 0) {
+                const capacity = try adaptive.completionCapacity(section, plan.evidence orelse "", progress.onchain_observations orelse &.{}, self.a);
+                plan.completion_evidence = try live.reviewEvidence(plan.prepared.pr, requests, capacity);
+            }
+        }
+        return plan;
     }
 
     fn resumeReview(self: Main, repo: core.Repo, job: *core.Job, prepared: *core.Prepared) !core.RouteProgress {
@@ -1390,6 +1507,10 @@ const Main = struct {
                 };
             }
             work.job.route_progress = try io.parse(self.a, core.RouteProgress, try io.json(self.a, outcome.progress));
+            if (outcome.progress.sections.index > work.plan.?.progress.sections.index) {
+                work.job.attempts = 0;
+                work.job.next = 0;
+            }
             if (outcome.failure) |err| return err;
             try self.db.save(state);
             return;

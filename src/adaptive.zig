@@ -129,27 +129,11 @@ pub fn run(a: io.A, reviewer: anytype, plan: Plan) !Outcome {
     var scoped = plan;
     scoped.prepared = plan.prepared.section(plan.progress.sections.index);
     var outcome = try runSection(a, reviewer, scoped);
-    const section_report = outcome.report orelse return outcome;
+    if (outcome.report == null) return outcome;
+    const section_outcome = outcome;
+    try mergeSection(a, &outcome.progress.sections, section_outcome, plan.prepared.context_update);
     const progress = &outcome.progress;
     const sections = &progress.sections;
-    const results = outcome.review_results orelse progress.results;
-    for (results) |result| {
-        if (!result.review.complete and result.complete_before_synthesis != null) {
-            sections.synthesis_gap = sections.synthesis_gap orelse outcome.synthesis_summary;
-            break;
-        }
-    }
-    sections.results = try combineSections(a, sections.results, results, plan.prepared.context_update);
-    sections.evidence_limited = sections.evidence_limited or outcome.evidence_limited;
-    for ([_][]const core.EvidenceRequest{ progress.evidence_requests, progress.completion_requests orelse &.{} }) |requests| {
-        for (requests) |request| {
-            if (!core.hasEvidenceRequest(sections.evidence_requests, request)) {
-                sections.evidence_requests = try std.mem.concat(a, core.EvidenceRequest, &.{ sections.evidence_requests, &.{request} });
-            }
-        }
-    }
-    sections.evidence_passes +|= section_report.evidence_passes;
-    sections.synthesis_provider = section_report.synthesis_provider orelse sections.synthesis_provider;
     sections.index += 1;
     const update_requested = if (sections.checkpoint) |checkpoint| checkpoint.update_discussion else false;
     if (sections.index == plan.prepared.sections.len and (plan.prepared.context_update or !update_requested)) {
@@ -160,6 +144,68 @@ pub fn run(a: io.A, reviewer: anytype, plan: Plan) !Outcome {
     resetSection(progress);
     outcome.report = null;
     outcome.review_results = null;
+    return outcome;
+}
+
+fn mergeSection(a: io.A, sections: *core.SectionProgress, outcome: Outcome, context_update: bool) !void {
+    const section_report = outcome.report.?;
+    const progress = outcome.progress;
+    const results = outcome.review_results orelse progress.results;
+    for (results) |result| {
+        if (!result.review.complete and result.complete_before_synthesis != null) {
+            sections.synthesis_gap = sections.synthesis_gap orelse outcome.synthesis_summary;
+            break;
+        }
+    }
+    sections.results = try combineSections(a, sections.results, results, context_update);
+    sections.evidence_limited = sections.evidence_limited or outcome.evidence_limited;
+    for ([_][]const core.EvidenceRequest{ progress.evidence_requests, progress.completion_requests orelse &.{} }) |requests| {
+        for (requests) |request| {
+            if (!core.hasEvidenceRequest(sections.evidence_requests, request)) {
+                sections.evidence_requests = try std.mem.concat(a, core.EvidenceRequest, &.{ sections.evidence_requests, &.{request} });
+            }
+        }
+    }
+    sections.evidence_passes +|= section_report.evidence_passes;
+    sections.synthesis_provider = section_report.synthesis_provider orelse sections.synthesis_provider;
+}
+
+pub const SectionOutcome = struct {
+    task: core.SectionTask,
+    review: Outcome,
+};
+
+pub fn sectionBit(index: usize) u16 {
+    return @as(u16, 1) << @intCast(index);
+}
+
+pub fn mergeParallelSections(a: io.A, plan: Plan, responses: []const SectionOutcome) !Outcome {
+    var outcome: Outcome = .{ .progress = plan.progress };
+    const progress = &outcome.progress;
+    const sections = &progress.sections;
+    var pending: std.ArrayList(core.SectionTask) = .empty;
+    prior: for (sections.pending) |task| {
+        for (responses) |response| {
+            if (task.index == response.task.index) continue :prior;
+        }
+        try pending.append(a, task);
+    }
+    for (responses) |response| {
+        const review = response.review;
+        progress.review_ms +|= review.progress.review_ms -| response.task.progress.review_ms;
+        if (review.report != null) {
+            try mergeSection(a, sections, review, false);
+            sections.finished_mask.? |= sectionBit(response.task.index);
+            sections.index += 1;
+        } else {
+            try pending.append(a, .{ .index = response.task.index, .progress = review.progress });
+            outcome.failure = outcome.failure orelse review.failure;
+        }
+    }
+    sections.pending = pending.items;
+    if (sections.index == plan.prepared.sections.len and !sections.checkpoint.?.update_discussion) {
+        try finishSections(a, plan, &outcome);
+    }
     return outcome;
 }
 
@@ -704,6 +750,48 @@ test "all-model sections checkpoint after every provider and verify late finding
     try t.expectEqual(@as(usize, 2), finished.report.?.diff_sections);
     try t.expectEqual(@as(usize, 3), finished.review_results.?.len);
     try t.expectEqual(@as(usize, 1), finished.review_results.?[0].review.findings.len);
+}
+
+test "parallel sections retain a successful later section across an earlier failure and restart" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var plan = sample_plan;
+    plan.prepared.sections = &.{
+        .{ .context = "First", .evidence = "First" },
+        .{ .context = "Second", .evidence = "Second" },
+        .{ .context = "Third", .evidence = "Third" },
+    };
+    const reviewer: core.ReviewerResult = .{ .engine = .codex, .review = try core.parseReview(a, clean_result) };
+    const scoped: core.RouteProgress = .{ .fingerprint = @splat(0), .results = &.{reviewer} };
+    const finished = Outcome{
+        .progress = scoped,
+        .report = .{ .mode = .adaptive, .suggested = .{}, .applied = routing.all_lenses, .providers = &.{.codex}, .screen_ms = 0, .review_ms = 0 },
+    };
+    plan.progress.sections = .{
+        .index = 1,
+        .finished_mask = 0b001,
+        .results = &.{reviewer},
+        .checkpoint = .{ .source = @splat(0), .discussion = @splat(0), .diff_priority = &.{}, .section_count = 3 },
+    };
+    const pending = try mergeParallelSections(a, plan, &.{
+        .{ .task = .{ .index = 1, .progress = scoped }, .review = .{ .progress = scoped, .failure = error.ClaudeFailed } },
+        .{ .task = .{ .index = 2, .progress = scoped }, .review = finished },
+    });
+    try t.expectEqual(error.ClaudeFailed, pending.failure.?);
+    try t.expectEqual(@as(u16, 0b101), pending.progress.sections.finished_mask.?);
+    try t.expectEqual(@as(usize, 1), pending.progress.sections.pending.len);
+    try t.expect(pending.report == null);
+
+    plan.progress = try io.parse(a, core.RouteProgress, try io.json(a, pending.progress));
+    const resumed = try mergeParallelSections(a, plan, &.{.{
+        .task = plan.progress.sections.pending[0],
+        .review = finished,
+    }});
+    try t.expectEqual(@as(u16, 0b111), resumed.progress.sections.finished_mask.?);
+    try t.expectEqual(@as(usize, 3), resumed.report.?.diff_sections);
+    try t.expect(resumed.review_results.?[0].review.complete);
 }
 
 test "an invalid full reviewer falls through to authorized providers across ticks" {

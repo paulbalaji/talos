@@ -614,6 +614,8 @@ pub const Entry = struct {
         try retained.ensureTotalCapacity(a, self.jobs.len);
         var prior: std.AutoHashMapUnmanaged(u32, ReviewRecord) = .empty;
         defer prior.deinit(a);
+        var all_model_requests: std.AutoHashMapUnmanaged(u32, ReviewOptions) = .empty;
+        defer all_model_requests.deinit(a);
         for (self.jobs) |job| {
             var current = job;
             const base = index.get(.{ .number = job.number, .head = job.head }).?.ready_base;
@@ -628,13 +630,21 @@ pub const Entry = struct {
             if (job.phase != .uncertain) {
                 if (job.last_review) |record| try prior.put(a, job.number, record);
             }
+            if (base == null and job.options.all_models and (job.phase == .pending or job.phase == .failed)) {
+                try all_model_requests.put(a, job.number, job.options);
+            }
         }
         if (!baseline) {
             for (open.items) |seen| {
                 const flags = index.getPtr(seen).?;
                 if (flags.queued or (seen.is_draft and !self.drafts_baselined)) continue;
                 if (flags.observed and (!flags.was_draft or seen.is_draft)) continue;
-                try retained.append(a, .{ .number = seen.number, .head = seen.head, .last_review = prior.get(seen.number) });
+                try retained.append(a, .{
+                    .number = seen.number,
+                    .head = seen.head,
+                    .last_review = prior.get(seen.number),
+                    .options = all_model_requests.get(seen.number) orelse .{},
+                });
                 flags.queued = true;
             }
         }
@@ -1486,6 +1496,8 @@ pub const RouteProgress = struct {
 
 pub const SectionProgress = struct {
     index: usize = 0,
+    finished_mask: ?u16 = null,
+    pending: []const SectionTask = &.{},
     results: []const ReviewerResult = &.{},
     evidence_limited: bool = false,
     evidence_requests: []const EvidenceRequest = &.{},
@@ -1493,6 +1505,11 @@ pub const SectionProgress = struct {
     synthesis_provider: ?Engine = null,
     synthesis_gap: ?[]const u8 = null,
     checkpoint: ?SectionCheckpoint = null,
+};
+
+pub const SectionTask = struct {
+    index: usize,
+    progress: RouteProgress,
 };
 
 pub const SectionCheckpoint = struct {

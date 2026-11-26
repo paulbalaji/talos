@@ -6,6 +6,7 @@ const workflow = @import("review_workflow.zig");
 pub const jobs_per_repo = 3;
 pub const active_repos = 5;
 pub const parallel_jobs = jobs_per_repo * active_repos;
+pub const parallel_sections = 3;
 pub const default_budget = parallel_jobs;
 
 pub const RepoJobs = struct {
@@ -100,6 +101,21 @@ pub const Budget = struct {
 
     fn reviewAt(self: Budget, repo: core.Repo, progress: ?core.RouteProgress, now: i64, limited: u8, current: usage.Snapshot) ?i64 {
         if (progress) |partial| if (partial.readyToPublish()) return 0;
+        if (progress) |partial| {
+            if (partial.sections.pending.len != 0) {
+                var earliest: ?i64 = null;
+                for (partial.sections.pending) |task| {
+                    if (self.reviewAt(repo, task.progress, now, limited, current)) |at| {
+                        earliest = @min(earliest orelse at, at);
+                    }
+                }
+                const count = partial.sections.checkpoint.?.section_count;
+                if (partial.sections.pending.len < parallel_sections and partial.sections.index + partial.sections.pending.len < count) {
+                    if (self.reviewAt(repo, null, now, limited, current)) |at| return @min(earliest orelse at, at);
+                }
+                return earliest;
+            }
+        }
         const can_make_progress = repo.routing_mode != .fixed or repo.fallback_engines.len != 0 or progress != null;
         const synthesizing = if (progress) |partial| workflow.waitsForSynthesis(repo, partial) else false;
         const completed = if (synthesizing) &.{} else if (progress) |partial| partial.results else &.{};

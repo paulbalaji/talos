@@ -809,6 +809,26 @@ test "discovery baselines open PRs and queues new draft heads and drafts becomin
     try t.expectEqual(@as(usize, 3), entry.jobs.len);
 }
 
+test "a push preserves an unfinished all-model request without reusing the old head passes" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var entry: core.Entry = .{ .repo = repo };
+    try entry.queue(a, fixture_pull, .{ .all_models = true });
+    entry.jobs[0].route_progress = .{ .fingerprint = @splat(0), .all_models = true };
+    var updated = fixture_pull;
+    updated.headRefOid = changed;
+    try entry.discover(a, &.{updated}, false);
+    try t.expectEqual(@as(usize, 1), entry.jobs.len);
+    try t.expectEqualStrings(changed, entry.jobs[0].head);
+    try t.expect(entry.jobs[0].options.all_models);
+    try t.expect(entry.jobs[0].route_progress == null);
+    entry.jobs[0].phase = .complete;
+    updated.headRefOid = head;
+    try entry.discover(a, &.{updated}, false);
+    try t.expect(!entry.jobs[0].options.all_models);
+}
+
 test "upgrading baselines existing drafts and reviews their next heads" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
