@@ -685,6 +685,13 @@ test "switching focus on a reviewed stack preserves receipts and identical reque
     try t.expectEqual(id, job.followup_id);
     try t.expect(job.route_progress != null);
 
+    var combined = perf;
+    combined.additional_focuses = &.{.@"reliability-maxxing"};
+    _ = try queueNative(&entry, a, group, combined, false);
+    try t.expect(job.options.selectedFocuses().eql(combined.selectedFocuses()));
+    try t.expect(job.route_progress == null);
+    try t.expect(!io.eq(u8, &id, &job.followup_id));
+
     job.phase = .uncertain;
     try t.expectError(error.PublicationUnconfirmed, queueNative(&entry, a, group, security, false));
     try t.expectEqual(@as(?u64, 42), job.receipt);

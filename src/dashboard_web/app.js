@@ -41,6 +41,9 @@ let detailRequest = null;
 let displayChart = "calls";
 let chartObserver = null;
 let pollTimer = null;
+let refreshIndicatorTimer = null;
+let tooltipAnchor = null;
+let tooltipTimer = null;
 let queueLookup = null;
 let queueSending = null;
 const renderKeys = new Map();
@@ -186,6 +189,7 @@ function update(key, value, render) {
 }
 
 function replace(container, content) {
+  if (tooltipAnchor && container.contains(tooltipAnchor)) hideTooltip();
   const focus = document.activeElement;
   const key = container.contains(focus) ? focus?.dataset?.reviewKey : null;
   container.replaceChildren(content);
@@ -193,6 +197,50 @@ function replace(container, content) {
     const next = Array.from(container.querySelectorAll("[data-review-key]")).find((node) => node.dataset.reviewKey === key);
     next?.focus({ preventScroll: true });
   }
+}
+
+function hideTooltip() {
+  clearTimeout(tooltipTimer);
+  tooltipAnchor?.removeAttribute("aria-describedby");
+  tooltipAnchor = null;
+  byId("dashboard-tooltip").hidden = true;
+}
+
+function revealTooltip(anchor, title, rows, point = null) {
+  hideTooltip();
+  const tip = byId("dashboard-tooltip");
+  const grid = element("dl");
+  for (const [name, value] of rows) {
+    if (value) grid.append(element("dt", null, name), element("dd", null, value));
+  }
+  tip.replaceChildren(element("strong", null, title), grid);
+  tip.hidden = false;
+  const rect = anchor.getBoundingClientRect();
+  const edge = 8;
+  const left = Math.max(edge, Math.min(point?.x ?? rect.left, document.documentElement.clientWidth - tip.offsetWidth - edge));
+  const below = (point?.y ?? rect.bottom) + edge;
+  const top = below + tip.offsetHeight <= window.innerHeight - edge ? below : (point?.y ?? rect.top) - tip.offsetHeight - edge;
+  tip.style.left = `${left}px`;
+  tip.style.top = `${Math.max(edge, top)}px`;
+  tooltipAnchor = anchor;
+  anchor.setAttribute("aria-describedby", tip.id);
+}
+
+function delayTooltipHide(anchor) {
+  clearTimeout(tooltipTimer);
+  tooltipTimer = setTimeout(() => {
+    if (tooltipAnchor === anchor) hideTooltip();
+  }, 130);
+}
+
+function tooltipFor(anchor, title, rows) {
+  anchor.tabIndex = 0;
+  const show = () => revealTooltip(anchor, title, rows);
+  anchor.addEventListener("pointerenter", show);
+  anchor.addEventListener("focus", show);
+  anchor.addEventListener("pointerleave", () => delayTooltipHide(anchor));
+  anchor.addEventListener("blur", () => delayTooltipHide(anchor));
+  return anchor;
 }
 
 function note(container, message, tone = "") {
@@ -207,6 +255,13 @@ function setConnection(connected, message) {
   if (indicator.textContent !== text) indicator.textContent = text;
   indicator.dataset.tone = connected ? "online" : "offline";
   note(byId("connection-error"), message || "");
+}
+
+function syncRefreshIndicator() {
+  clearTimeout(refreshIndicatorTimer);
+  const indicator = byId("sync-state");
+  if (stateRequest || metricsRequest) indicator.dataset.refreshing = "true";
+  else refreshIndicatorTimer = setTimeout(() => { delete indicator.dataset.refreshing; }, 360);
 }
 
 function chooseStage(job, now) {
@@ -240,7 +295,7 @@ function phaseLabel(status) {
   return output;
 }
 
-function progressLabel(job) {
+function progressLabel(job, inspect = true) {
   const wrap = element("div", "job-progress");
   const percent = Number.isFinite(job.percent) ? Math.max(0, Math.min(100, Math.round(job.percent))) : null;
   const completed = job.completed_sections || 0;
@@ -251,13 +306,52 @@ function progressLabel(job) {
   if (percent == null && !sectionCount) labels.append(element("span", "minor", "—"));
   wrap.append(labels);
   if (percent != null) {
+    const track = element("div", "progress-track");
     const bar = element("progress");
     bar.value = percent;
     bar.max = 100;
     bar.setAttribute("aria-label", `Review progress for #${job.number}`);
-    wrap.append(bar);
+    track.append(bar);
+    if (percent > 0 && percent < 100 && list(job.active_providers).length > 0) {
+      const shimmer = element("span", "progress-shimmer");
+      shimmer.setAttribute("aria-hidden", "true");
+      shimmer.style.width = `${percent}%`;
+      track.append(shimmer);
+    }
+    wrap.append(track);
+  }
+  const active = list(job.active_providers);
+  if (inspect && (sectionCount || active.length || job.blocked_by)) {
+    wrap.dataset.reviewKey = `${keyOf(job.repo, job.number)}:${job.head}:progress`;
+    return tooltipFor(wrap, `PR #${job.number}`, [
+      ["Sections reviewed", sectionCount ? `${completed} of ${job.total_sections}` : ""],
+      ["Sections left", sectionCount ? count(Math.max(0, job.total_sections - completed)) : ""],
+      ["Waiting for", job.blocked_by ? `#${job.blocked_by}` : ""],
+      ...active.map((item) => [phrase([humanize(item.engine), item.model]),
+        phrase([humanize(item.stage), item.section != null && `Section ${item.section}`, item.at && `Started ${date(item.at)}`])]),
+    ]);
   }
   return wrap;
+}
+
+const providerMarks = new Set(["codex", "claude", "kimi"]);
+
+function providerLabel(engine, model, calls = 1) {
+  const label = element("span", "provider-label");
+  if (providerMarks.has(engine)) {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    const mark = document.createElementNS(svg.namespaceURI, "use");
+    svg.setAttribute("class", "provider-icon");
+    svg.setAttribute("aria-hidden", "true");
+    mark.setAttribute("href", `/providers.svg#${engine}`);
+    svg.append(mark);
+    label.append(svg);
+  }
+  const name = calls > 1 ? `${humanize(engine)} ×${calls}` : humanize(engine);
+  const text = element("span", "provider-name", name);
+  if (model) text.append(element("span", "provider-model", ` · ${model}`));
+  label.append(text);
+  return label;
 }
 
 function providersLabel(values, allModels) {
@@ -269,13 +363,7 @@ function providersLabel(values, allModels) {
     if (names.has(key)) names.get(key).count += 1;
     else names.set(key, { ...item, count: 1 });
   }
-  for (const item of names.values()) {
-    const text = item.count > 1 ? `${humanize(item.engine)} ×${item.count}` : humanize(item.engine);
-    const line = element("div");
-    line.append(element("span", "provider-name", text));
-    if (item.model) line.append(element("span", "provider-model", ` · ${item.model}`));
-    group.append(line);
-  }
+  for (const item of names.values()) group.append(providerLabel(item.engine, item.model, item.count));
   return group;
 }
 
@@ -286,11 +374,23 @@ function reviewKey(item, head = null, showDetails = true, stack = null) {
   label.setAttribute("aria-label", `Review details for ${item.repo} #${item.number}`);
   label.dataset.reviewKey = phrase([keyOf(item.repo, item.number), head, item.at]);
   label.addEventListener("click", () => openReview(item.repo, item.number, head, item.at ?? null, item.review_id ?? null));
-  wrap.append(label);
-  if (showDetails && item.title) wrap.append(element("span", "review-title", item.title));
+  if (showDetails && item.title) {
+    const line = element("div", "review-keyline");
+    line.append(label, element("span", "review-title", item.title));
+    wrap.append(line);
+  } else wrap.append(label);
   if (showDetails) {
     const metadata = element("span", "review-repo", phrase([item.repo, item.draft && "Draft"]));
-    if (stack) metadata.append(element("span", "stack-label", ` · ${stack.label}`));
+    if (stack) {
+      const label = element("span", "stack-label", ` · ${stack.label}`);
+      if (stack.position) {
+        const badge = element("span", "stack-position", `${stack.position}/${stack.total}`);
+        badge.title = `PR ${stack.position} of ${stack.total}, bottom to top`;
+        badge.setAttribute("aria-hidden", "true");
+        label.append(badge, element("span", "sr-only", `, ${badge.title}`));
+      }
+      metadata.append(label);
+    }
     wrap.append(metadata);
   }
   return wrap;
@@ -343,15 +443,23 @@ function renderQueue() {
   for (const stack of list(snapshot?.stacks)) {
     const label = stack.number ? `Stack #${stack.number}` : `Stack ${stack.name}`;
     const accent = stackAccent(stack.repo, stack.number || stack.name);
-    for (const member of list(stack.members)) memberships.set(keyOf(stack.repo, member.number), { label, accent });
+    const members = list(stack.members);
+    for (const [index, member] of members.entries()) {
+      memberships.set(keyOf(stack.repo, member.number), { label, accent, position: index + 1, total: members.length });
+    }
   }
   const active = jobs.filter((job) => !["baseline", "complete"].includes(job.phase));
   const running = active.filter((job) => list(job.active_providers).length > 0);
   const pending = active.filter((job) => job.phase === "pending" && !list(job.active_providers).length).length;
-  byId("queue-summary").textContent = phrase([
-    plural(running.length, "running", "running"), plural(pending, "queued", "queued"),
-    plural(active.filter((job) => job.phase === "failed").length, "failed", "failed"),
-  ]);
+  const totals = [["Running", running.length], ["Queued", pending], ["Failed", active.filter((job) => job.phase === "failed").length]];
+  if (snapshot) update("queue-summary", totals, () => {
+    byId("queue-summary").replaceChildren(...totals.map(([label, amount]) => {
+      const field = element("span", "queue-stat");
+      if (amount > 0) field.dataset.tone = label.toLowerCase();
+      field.append(element("strong", "mono", count(amount)), element("span", null, label));
+      return field;
+    }));
+  });
   const rows = byId("queue-filter").value === "active" ? active : jobs;
   const selected = filterRows(rows, byId("queue-search").value);
   const now = snapshot?.at || 0;
@@ -441,6 +549,16 @@ function historyStatus(row) {
   return phrase([result, publication]);
 }
 
+function historyVerdict(row) {
+  const verdict = element("span", "inspectable", historyStatus(row));
+  verdict.dataset.reviewKey = `${keyOf(row.repo, row.number)}:${row.head}:${row.at}:verdict`;
+  return tooltipFor(verdict, `Verdict for #${row.number}`, [
+    ["Head", row.head?.slice(0, 12)], ["Depth", humanize(row.route)],
+    ["Coverage", row.complete === true ? "Complete" : row.complete === false ? "Limited" : "Unknown"],
+    ["Publication", humanize(row.publication)], ["GitHub review", row.review_id ? `#${row.review_id}` : ""], ["Saved", date(row.at)],
+  ]);
+}
+
 function renderHistory() {
   const history = list(historySnapshot);
   const desired = byId("history-filter").value;
@@ -452,7 +570,7 @@ function renderHistory() {
   byId("history-summary").textContent = history.length ? plural(history.length, "saved verdict") : "Saved verdicts";
   update("history", ordered, () => {
     replace(byId("history-results"), renderTable(["Pull request", "Verdict", "Depth", "Coverage", ["Saved", "time-cell"]], ordered.map((item) => [
-      reviewKey(item, item.head), historyStatus(item), humanize(item.route) || "—",
+      reviewKey(item, item.head), historyVerdict(item), humanize(item.route) || "—",
       item.complete === true ? "Complete" : item.complete === false ? "Limited" : "—", date(item.at),
     ]), historySnapshot ? "No matching saved verdicts." : "Loading saved verdicts…"));
   });
@@ -541,12 +659,14 @@ function drawChart(canvas, series) {
     context.textAlign = "center";
     context.fillText(chartDay(series[Math.floor(series.length / 2)].day), left + plot / 2, height - 3);
   }
+  return { left, step, top, bottom };
 }
 
 function renderMetrics() {
   const metrics = metricsSnapshot;
   if (!metrics) return;
-  update("metrics", metrics, () => {
+  const { through, ledger, ...display } = metrics;
+  update("metrics", display, () => {
     chartObserver?.disconnect();
     const content = document.createDocumentFragment();
     const totals = element("div", "metric-grid");
@@ -575,16 +695,51 @@ function renderMetrics() {
     daily.append(title);
     const chart = element("canvas", "chart-canvas");
     chart.setAttribute("role", "img");
+    chart.tabIndex = 0;
+    chart.dataset.reviewKey = "usage-chart";
+    let geometry = null;
+    let activeDay = -1;
+    const showDay = (index) => {
+      const point = series[index];
+      if (!point || !geometry) return;
+      const rect = chart.getBoundingClientRect();
+      activeDay = index;
+      revealTooltip(chart, `${chartDay(point.day)} UTC`, [
+        ["Model calls", count(point.attempts)], ["Token reports", `${count(point.reported)} / ${count(point.attempts)}`],
+        ["Input tokens", count(point.input_tokens)], ["Output tokens", count(point.output_tokens)],
+      ], { x: rect.left + geometry.left + geometry.step * (index + .5), y: rect.top + geometry.top });
+    };
+    chart.addEventListener("pointermove", (event) => {
+      if (!geometry) return;
+      const rect = chart.getBoundingClientRect();
+      const index = Math.floor((event.clientX - rect.left - geometry.left) / geometry.step);
+      const y = event.clientY - rect.top;
+      if (index < 0 || index >= series.length || y < geometry.top || y > geometry.bottom) {
+        if (tooltipAnchor === chart) hideTooltip();
+        return;
+      }
+      if (index !== activeDay || tooltipAnchor !== chart) showDay(index);
+    });
+    chart.addEventListener("pointerleave", () => delayTooltipHide(chart));
+    chart.addEventListener("focus", () => showDay(activeDay < 0 ? series.length - 1 : activeDay));
+    chart.addEventListener("blur", () => delayTooltipHide(chart));
+    chart.addEventListener("keydown", (event) => {
+      const steps = { ArrowLeft: -1, ArrowRight: 1 };
+      if (!Object.hasOwn(steps, event.key)) return;
+      event.preventDefault();
+      showDay(Math.max(0, Math.min(series.length - 1, activeDay + steps[event.key])));
+    });
     const explanation = element("p", "chart-guide");
     const refreshChart = () => {
       const tokens = displayChart === "tokens";
       const empty = tokens ? !series.some((point) => point.input_tokens > 0 || point.output_tokens > 0) : !series.some((point) => point.attempts > 0);
-      chart.setAttribute("aria-label", tokens ? "Reported input and output tokens by UTC day" : "Model calls and token reports by UTC day");
+      chart.setAttribute("aria-label", `${tokens ? "Reported input and output tokens" : "Model calls and token reports"} by UTC day. Use the arrow keys to inspect days.`);
       explanation.textContent = empty ? (tokens ? "No reported token totals in this period." : "No model calls in this period.") :
         tokens ? "Light bars show input tokens. Dark sections show output tokens. Days are UTC." :
           "Bars show calls. Light sections show calls with token counts. Days are UTC.";
       chart.hidden = empty;
-      if (!empty) drawChart(chart, series);
+      geometry = empty ? null : drawChart(chart, series);
+      if (document.activeElement === chart) showDay(activeDay < 0 ? series.length - 1 : activeDay);
     };
     chooser.addEventListener("change", () => {
       displayChart = chooser.value;
@@ -608,7 +763,7 @@ function renderMetrics() {
       "Provider / model", ["Calls", "numeric"], ["Failures", "numeric"], ["Token reports", "numeric"],
       ["Input tokens", "numeric"], ["Output tokens", "numeric"], ["Mean duration", "numeric"],
     ], list(metrics.providers).map((item) => [
-      phrase([humanize(item.engine), item.model]), count(item.attempts), count(item.failures),
+      providerLabel(item.engine, item.model), count(item.attempts), count(item.failures),
       `${count(item.reported)} / ${count(item.attempts)}`,
       count(item.input_tokens), count(item.output_tokens), duration(item.mean_duration_ms),
     ]), "Provider calls will appear here as they finish.")));
@@ -622,7 +777,7 @@ function renderMetrics() {
       models.append(heading, tableBox(renderTable([
         "Provider / model", ["Calls involving model", "numeric"], ["Input tokens", "numeric"], ["Output tokens", "numeric"],
       ], modelUsage.map((model) => [
-        phrase([humanize(model.engine), model.model]), count(model.participations), count(model.input_tokens), count(model.output_tokens),
+        providerLabel(model.engine, model.model), count(model.participations), count(model.input_tokens), count(model.output_tokens),
       ]), "No model-specific counts.")));
       models.append(element("p", "chart-guide", "A CLI call can use more than one model."));
       content.append(models);
@@ -654,7 +809,7 @@ function renderMetrics() {
       group.append(panel);
     }
     if (group.childElementCount) content.append(group);
-    byId("metrics-results").replaceChildren(content);
+    replace(byId("metrics-results"), content);
     refreshChart();
     chartObserver = new ResizeObserver(refreshChart);
     chartObserver.observe(chart);
@@ -723,7 +878,7 @@ function renderDetail(data, target) {
     if (job.all_models) details.append(element("span", null, "All models"));
     if (job.attempts > 0) details.append(element("span", null, plural(job.attempts, "retry", "retries")));
     holder.append(details);
-    if (Number.isFinite(job.percent) || job.total_sections > 0) holder.append(progressLabel(job));
+    if (Number.isFinite(job.percent) || job.total_sections > 0) holder.append(progressLabel(job, false));
     const active = list(job.active_providers);
     if (active.length) holder.append(providersLabel(active, job.all_models));
   }
@@ -783,7 +938,7 @@ function renderDetail(data, target) {
     if (relevant.length > 0) {
       const table = tableBox(renderTable(["Provider / stage", ["Duration", "numeric"], ["Input", "numeric"], ["Output", "numeric"]], relevant.map((item) => {
         const info = element("div");
-        info.append(element("span", null, phrase([humanize(item.engine), item.model])));
+        info.append(providerLabel(item.engine, item.model));
         info.append(element("span", "phase-note", phrase([humanize(item.stage), item.section != null && `Section ${item.section}`, humanize(item.outcome)])));
         const models = list(item.model_usage);
         if (models.length > 1 || (models.length === 1 && models[0].model !== item.model)) {
@@ -915,7 +1070,8 @@ function queueInputChanged() {
 function queuePayload(target, wholeStack, form) {
   if (!target) return;
   const payload = { repo: target.repo, number: target.number, kind: target.kind, all_models: form.elements.all_models.checked };
-  if (form.elements.mode.value) payload.mode = form.elements.mode.value;
+  const modes = new FormData(form).getAll("mode");
+  if (modes.length) payload.modes = modes;
   if (wholeStack) {
     const key = lookupKey(target);
     if (!key || queueLookup?.key !== key || !validNumber(queueLookup.stack)) return;
@@ -1003,6 +1159,7 @@ function refreshState() {
   if (stateRequest?.history === wantsHistory) return stateRequest.promise;
   const flight = { history: wantsHistory, promise: null };
   stateRequest = flight;
+  syncRefreshIndicator();
   const path = wantsHistory ? "/api/state?history=1" : "/api/state";
   flight.promise = request(path).then((data) => {
     if (stateRequest !== flight) return;
@@ -1018,7 +1175,10 @@ function refreshState() {
     if (stateRequest !== flight) return;
     setConnection(false, snapshot ? "Connection lost. Showing the last saved dashboard state." : "Talos could not be reached. Retrying shortly.");
   }).finally(() => {
-    if (stateRequest === flight) stateRequest = null;
+    if (stateRequest === flight) {
+      stateRequest = null;
+      syncRefreshIndicator();
+    }
   });
   return flight.promise;
 }
@@ -1028,6 +1188,7 @@ function refreshMetrics() {
   if (metricsRequest?.days === days) return;
   const flight = { days };
   metricsRequest = flight;
+  syncRefreshIndicator();
   if (metricsSnapshot?.days !== days) note(byId("metrics-notice"), "Loading usage…");
   request(`/api/metrics?days=${days}`).then((data) => {
     if (metricsRequest !== flight || view !== "usage") return;
@@ -1039,7 +1200,10 @@ function refreshMetrics() {
     if (metricsRequest !== flight || view !== "usage") return;
     note(byId("metrics-notice"), error.message);
   }).finally(() => {
-    if (metricsRequest === flight) metricsRequest = null;
+    if (metricsRequest === flight) {
+      metricsRequest = null;
+      syncRefreshIndicator();
+    }
   });
 }
 
@@ -1054,6 +1218,7 @@ function poll() {
 }
 
 function navigate() {
+  if (tooltipAnchor) hideTooltip();
   const hash = window.location.hash.slice(1);
   if (views.has(hash)) view = hash;
   for (const name of views) byId(`${name}-view`).hidden = view !== name;
@@ -1082,6 +1247,12 @@ byId("queue-form").addEventListener("submit", queueReview);
 byId("queue-target").addEventListener("input", queueInputChanged);
 byId("queue-repo").addEventListener("change", queueInputChanged);
 byId("queue-kind-field").addEventListener("change", queueInputChanged);
+byId("queue-focuses").addEventListener("change", ({ target, currentTarget }) => {
+  if (!target.checked) return;
+  for (const checked of currentTarget.querySelectorAll("input:checked")) {
+    if (checked !== target && (checked.value === "general" || target.value === "general")) checked.checked = false;
+  }
+});
 byId("history-search").addEventListener("input", renderHistory);
 byId("history-filter").addEventListener("change", renderHistory);
 byId("metrics-range").addEventListener("change", refreshMetrics);
@@ -1090,5 +1261,10 @@ byId("review-dialog").addEventListener("close", () => {
   renderKeys.delete("detail");
 });
 window.addEventListener("hashchange", navigate);
+window.addEventListener("scroll", () => { if (tooltipAnchor) hideTooltip(); }, true);
+window.addEventListener("resize", () => { if (tooltipAnchor) hideTooltip(); });
+document.addEventListener("keydown", (event) => { if (event.key === "Escape" && tooltipAnchor) hideTooltip(); });
+byId("dashboard-tooltip").addEventListener("pointerenter", () => clearTimeout(tooltipTimer));
+byId("dashboard-tooltip").addEventListener("pointerleave", hideTooltip);
 document.addEventListener("visibilitychange", poll);
 navigate();

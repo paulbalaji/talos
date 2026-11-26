@@ -85,7 +85,7 @@ const Destination = union(enum) {
     index,
     stylesheet,
     script,
-    tiles,
+    providers,
     api: @FieldType(Request, "route"),
 };
 
@@ -93,7 +93,7 @@ const destinations = std.StaticStringMap(Destination).initComptime(.{
     .{ "/", .index },
     .{ "/app.css", .stylesheet },
     .{ "/app.js", .script },
-    .{ "/tiles.png", .tiles },
+    .{ "/providers.svg", .providers },
     .{ "/api/state", Destination{ .api = .state } },
     .{ "/api/metrics", Destination{ .api = .metrics } },
     .{ "/api/review", Destination{ .api = .review } },
@@ -280,7 +280,7 @@ fn handle(fd: posix.socket_t, hosts: Hosts, stack_lookups: *LookupCount, context
         .index => return respond(fd, .ok, "text/html; charset=utf-8", @embedFile("dashboard_web/index.html"), head_only),
         .stylesheet => return respond(fd, .ok, "text/css; charset=utf-8", @embedFile("dashboard_web/app.css"), head_only),
         .script => return respond(fd, .ok, "text/javascript; charset=utf-8", @embedFile("dashboard_web/app.js"), head_only),
-        .tiles => return respond(fd, .ok, "image/png", @embedFile("dashboard_web/tiles.png"), head_only),
+        .providers => return respond(fd, .ok, "image/svg+xml", @embedFile("dashboard_web/providers.svg"), head_only),
         .api => |route| {
             var body: [max_body]u8 = undefined;
             @memcpy(body[0..received.len], received);

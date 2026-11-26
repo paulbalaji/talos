@@ -29,7 +29,7 @@
     <section id="queue-view" aria-labelledby="queue-title">
       <header class="page-heading">
         <h1 id="queue-title">Review queue</h1>
-        <p id="queue-summary" class="heading-meta">Loading reviews…</p>
+        <div id="queue-summary" class="queue-summary" aria-label="Queue totals">Loading reviews…</div>
       </header>
       <div class="queue-layout">
         <div class="queue-main">
@@ -74,17 +74,17 @@
                 <label><input type="radio" name="kind" value="stack"><span>Stack</span></label>
               </fieldset>
               <p id="queue-target-status" class="queue-target-status" role="status" hidden></p>
-              <label class="field">
-                <span>Review mode</span>
-                <select name="mode">
-                  <option value="">Automatic</option>
-                  <option value="general">General</option>
-                  <option value="perf-maxxing">Performance</option>
-                  <option value="reliability-maxxing">Reliability</option>
-                  <option value="security-maxxing">Security</option>
-                  <option value="simplicity">Simplicity</option>
-                </select>
-              </label>
+              <fieldset id="queue-focuses" class="review-focuses" aria-describedby="queue-focus-hint">
+                <legend>Review focus</legend>
+                <p id="queue-focus-hint">Automatic when none are selected.</p>
+                <div class="focus-toggles">
+                  <label><input type="checkbox" name="mode" value="perf-maxxing"><span>Performance</span></label>
+                  <label><input type="checkbox" name="mode" value="reliability-maxxing"><span>Reliability</span></label>
+                  <label><input type="checkbox" name="mode" value="security-maxxing"><span>Security</span></label>
+                  <label><input type="checkbox" name="mode" value="simplicity"><span>Simplicity</span></label>
+                  <label><input type="checkbox" name="mode" value="general"><span>General</span></label>
+                </div>
+              </fieldset>
               <label class="checkbox-field">
                 <input type="checkbox" name="all_models">
                 <span>All-model review</span>
@@ -147,6 +147,7 @@
     </section>
   </main>
 
+  <div id="dashboard-tooltip" class="dashboard-tooltip" role="tooltip" hidden></div>
   <dialog id="review-dialog" aria-labelledby="detail-title">
     <header class="dialog-header">
       <div>

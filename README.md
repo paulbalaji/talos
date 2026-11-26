@@ -62,9 +62,11 @@ talos status                          # See scans, queue, errors, and cache size
 
 ### Monitor reviews locally
 
-The local dashboard shows tracked jobs, active reviewers, and completed source sections. The displayed percentage counts completed sections. Reviewers working on a section can still require additional evidence or synthesis. [Open the local dashboard](http://127.0.0.1:8749).
+The local dashboard shows tracked jobs, active reviewers, and completed source sections. The displayed percentage counts completed sections. Reviewers working on a section can still require additional evidence or synthesis. Stack badges show each PR's position from the bottom of the stack. [Open the local dashboard](http://127.0.0.1:8749).
 
-Paste a GitHub PR or stack link to queue it. If the PR belongs to a GitHub stack, Talos offers a separate action to queue all open members. You can select a focus and enable all-model review for either action. The dashboard uses the same queue and publication policy as the CLI.
+Hover over a progress bar, a saved verdict, or a day on the usage chart for a breakdown. The same details are available with keyboard focus, and the arrow keys move between chart days.
+
+Paste a GitHub PR or stack link to queue it. If the PR belongs to a GitHub stack, Talos offers a separate action to queue all open members. Pick any combination of Performance, Reliability, Security, and Simplicity. Select General on its own for a broad review, or leave the focuses clear for automatic depth. All-model review can be enabled independently. The dashboard uses the same queue and publication policy as the CLI.
 
 The README screenshots use simulated repositories and review activity.
 
@@ -78,11 +80,11 @@ The Usage view defaults to 30 days and offers up to 365 days. `talos metrics --d
 
 ### Focus a review
 
-Use a review mode on a numbered preview or queued review. Add `--prompt` to give the configured reviewers specific context or a question.
+Repeat `--mode` to combine focuses on a numbered preview or queued review. Add `--prompt` to give the configured reviewers specific context or a question.
 
 ```sh
 talos run-once OWNER/REPO 123 --mode perf-maxxing --prompt 'Check allocations on the request path.'
-talos run-once OWNER/REPO 123 --mode reliability-maxxing
+talos run-once OWNER/REPO 123 --mode perf-maxxing --mode reliability-maxxing
 talos run-once OWNER/REPO 123 --mode security-maxxing
 ```
 

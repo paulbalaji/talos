@@ -1205,6 +1205,17 @@ test "focused preview keeps the operator request separate from untrusted PR evid
         try t.expect(std.mem.indexOf(u8, review.body, "review of") != null);
         try t.expectEqual(core.Event.COMMENT, review.event);
     }
+    const combined: core.ReviewOptions = .{
+        .focus = .@"perf-maxxing",
+        .additional_focuses = &.{.@"reliability-maxxing"},
+        .explicit_mode = true,
+    };
+    const review = (try core.run(a, &fake, repo, &job, .{ .preview = .{ .options = combined } })).?;
+    try t.expect(std.mem.indexOf(u8, fake.prompt_text, "Trace hot paths and scaling") != null);
+    try t.expect(std.mem.indexOf(u8, fake.prompt_text, "Trace partial failure, retries, restarts") != null);
+    try t.expectEqual(core.Event.COMMENT, review.event);
+    const legacy = try io.json(a, core.ReviewOptions{});
+    try t.expectEqualStrings("{\"focus\":\"general\",\"request\":null,\"publish_prompted\":false,\"explicit_mode\":false,\"all_models\":false}", legacy);
     try t.expectEqual(@as(usize, 0), fake.posts);
     try t.expectEqual(core.Phase.pending, job.phase);
 }
