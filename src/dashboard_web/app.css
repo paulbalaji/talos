@@ -267,6 +267,23 @@ select {
 .segmented input:focus-visible + span { outline: 2px solid var(--focus); outline-offset: -2px; }
 .field { display: grid; min-width: 0; gap: .37rem; color: var(--muted); font-size: .875rem; }
 .field > input, .field > select { width: 100%; min-width: 0; }
+.review-focuses { margin: 0; min-width: 0; padding: 0; border: 0; color: var(--muted); font-size: .875rem; }
+.review-focuses legend { padding: 0; }
+.review-focuses p { margin: .15rem 0 .45rem; color: var(--dim); }
+.focus-toggles { display: flex; flex-wrap: wrap; gap: .35rem; }
+.focus-toggles label { position: relative; }
+.focus-toggles input { position: absolute; opacity: 0; }
+.focus-toggles span {
+  display: block;
+  padding: .32rem .55rem;
+  border: 1px solid var(--line);
+  border-radius: .28rem;
+  background: var(--bg);
+  cursor: pointer;
+}
+.focus-toggles input:checked + span { color: var(--accent); background: var(--raised); border-color: var(--accent); }
+.focus-toggles input:focus-visible + span { outline: 2px solid var(--focus); outline-offset: 2px; }
+.focus-toggles input:disabled + span { cursor: wait; opacity: .65; }
 .checkbox-field {
   display: flex;
   align-items: center;

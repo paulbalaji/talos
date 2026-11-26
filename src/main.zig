@@ -35,14 +35,14 @@ const usage =
     \\talos [--home DIR] usage [ENGINE DAILY_STARTS]
     \\talos [--home DIR] metrics [--days DAYS] [--offset DAYS]
     \\talos [--home DIR] dashboard [install|remove] [--port PORT]
-    \\talos [--home DIR] queue OWNER/REPO PR [--all-maxxing] [--mode MODE] [--prompt TEXT [--publish]]
+    \\talos [--home DIR] queue OWNER/REPO PR [--all-maxxing] [--mode MODE ...] [--prompt TEXT [--publish]]
     \\talos [--home DIR] followup THREAD_URL [--dry-run | --merge-when-ready]
     \\talos [--home DIR] followup status [--json]
     \\talos [--home DIR] followup pause|resume THREAD_URL
     \\talos [--home DIR] stack OWNER/REPO STACK_NUMBER [--all-maxxing [--rerun]]
     \\talos [--home DIR] stack OWNER/REPO NAME PR PR [PR ...]
     \\talos [--home DIR] unstack OWNER/REPO NAME
-    \\talos [--home DIR] run-once [OWNER/REPO [PR [--mode MODE] [--prompt TEXT]]]
+    \\talos [--home DIR] run-once [OWNER/REPO [PR [--mode MODE ...] [--prompt TEXT]]]
     \\talos [--home DIR] pause|resume OWNER/REPO
     \\talos [--home DIR] install|remove [--label dev.talos.NAME]
     \\talos [--home DIR] tick
@@ -1350,6 +1350,7 @@ const Main = struct {
             .head = job.head,
             .review_id = try core.followupId(self.a, job.*),
             .focus = work.prepared.options.focus,
+            .additional_focuses = work.prepared.options.additional_focuses,
             .section_count = if (work.prepared.sections.len != 0) work.prepared.sections.len else null,
         } };
         if (job.analysis) |saved| {
@@ -1701,8 +1702,9 @@ const Main = struct {
         return pr;
     }
 
-    fn reviewOptions(args: []const []const u8, allow_publish: bool) !core.ReviewOptions {
+    fn reviewOptions(a: A, args: []const []const u8, allow_publish: bool) !core.ReviewOptions {
         var options: core.ReviewOptions = .{};
+        var focuses: core.ReviewFocusSet = .initEmpty();
         var index: usize = 0;
         while (index < args.len) {
             const flag = args[index];
@@ -1718,21 +1720,21 @@ const Main = struct {
             if (index == args.len) return error.Usage;
             const value = args[index];
             index += 1;
-            if (eq(u8, flag, "--mode") and !options.explicit_mode) {
-                options.focus = std.meta.stringToEnum(core.ReviewFocus, value) orelse return error.InvalidReviewMode;
-                options.explicit_mode = true;
+            if (eq(u8, flag, "--mode")) {
+                try addReviewFocus(&focuses, value);
             } else if (eq(u8, flag, "--prompt") and options.request == null) {
                 try core.validateReviewRequest(value);
                 options.request = value;
             } else return error.Usage;
         }
         if (options.publish_prompted and options.request == null) return error.Usage;
+        try options.setFocuses(a, focuses);
         return options;
     }
 
     fn dry(self: Main, state: *store.State, args: []const []const u8) !void {
         var preview: core.Preview = .{
-            .options = if (args.len > 2) try reviewOptions(args[2..], false) else null,
+            .options = if (args.len > 2) try reviewOptions(self.a, args[2..], false) else null,
         };
         if (args.len >= 1 and !core.validRepoName(args[0])) return error.Usage;
         const number = if (args.len >= 2) try prNumber(args[1]) else null;
@@ -1764,6 +1766,7 @@ const Main = struct {
                 .stage = .preview,
                 .review_id = try self.a.dupe(u8, &std.fmt.bytesToHex(preview_id, .lower)),
                 .focus = prepared.options.focus,
+                .additional_focuses = prepared.options.additional_focuses,
             } };
             const observations = try live.previewReads(prepared);
             var context = prepared.context;
@@ -2005,7 +2008,7 @@ const Main = struct {
             const failure: struct { status: std.http.Status, message: []const u8 } = switch (err) {
                 error.InvalidDashboardQuery => .{ .status = .bad_request, .message = "Invalid or repeated query parameter." },
                 error.BadQueueRequest => .{ .status = .bad_request, .message = "Select a repository and a valid PR or stack number." },
-                error.InvalidReviewMode => .{ .status = .bad_request, .message = "Choose a valid review mode." },
+                error.InvalidReviewMode => .{ .status = .bad_request, .message = "Select distinct review focuses. General is selected on its own." },
                 error.InvalidMetricsDays => .{ .status = .bad_request, .message = std.fmt.comptimePrint("Choose a range from 1 to {d} days.", .{max_metrics_days}) },
                 error.UnknownRepository => .{ .status = .not_found, .message = "Talos does not track that repository." },
                 error.AlreadyRunning => .{ .status = .conflict, .message = "Talos is saving queue changes. Try again in a moment." },
@@ -2082,7 +2085,7 @@ const Main = struct {
 
     fn dashboardQueue(self: Main, body: []const u8) ![]const u8 {
         const input = try DashboardQueueRequest.parse(self.a, body);
-        const options = try input.reviewOptions();
+        const options = try input.reviewOptions(self.a);
         var observed = try self.db.load();
         const earlier = observed.find(input.repo) orelse return error.UnknownRepository;
         var request_app = try self.dashboardLookup();
@@ -2223,7 +2226,7 @@ const Main = struct {
             return self.out("Removed {s} stack {s}\n", .{ entry.repo.name, params[1] });
         }
         if (eq(u8, cmd, "queue") and params.len >= 2) {
-            const options = if (params.len > 2) try reviewOptions(params[2..], true) else null;
+            const options = if (params.len > 2) try reviewOptions(self.a, params[2..], true) else null;
             const entry = state.find(params[0]) orelse return error.UnknownRepository;
             const job = try self.enqueuePull(&state, entry, try prNumber(params[1]), options);
             if (job.phase == .uncertain) return self.out("Queued receipt reconciliation for {s} #{d} at {s}{s}\n", .{
@@ -2239,12 +2242,20 @@ const Main = struct {
 
 const DashboardQuery = struct { repo: ?[]const u8 = null, number: ?u32 = null, days: ?u32 = null, history: ?bool = null };
 
+fn addReviewFocus(selected: *core.ReviewFocusSet, name: []const u8) !void {
+    const focus = std.meta.stringToEnum(core.ReviewFocus, name) orelse return error.InvalidReviewMode;
+    if (selected.contains(focus)) return error.Usage;
+    if (selected.contains(.general) or (focus == .general and selected.count() != 0)) return error.InvalidReviewMode;
+    selected.insert(focus);
+}
+
 const DashboardQueueRequest = struct {
     repo: []const u8,
     number: u32,
     kind: enum { pr, stack },
     all_models: bool = false,
     mode: ?[]const u8 = null,
+    modes: ?[]const []const u8 = null,
     member: ?u32 = null,
 
     fn parse(a: A, body: []const u8) !DashboardQueueRequest {
@@ -2256,13 +2267,17 @@ const DashboardQueueRequest = struct {
         return input;
     }
 
-    fn reviewOptions(self: DashboardQueueRequest) !?core.ReviewOptions {
-        if (self.mode == null and !self.all_models) return null;
-        return .{
-            .focus = if (self.mode) |mode| std.meta.stringToEnum(core.ReviewFocus, mode) orelse return error.InvalidReviewMode else .general,
-            .explicit_mode = self.mode != null,
-            .all_models = self.all_models,
-        };
+    fn reviewOptions(self: DashboardQueueRequest, a: A) !?core.ReviewOptions {
+        var selected: core.ReviewFocusSet = .initEmpty();
+        if (self.mode) |mode| {
+            if (self.modes != null) return error.InvalidReviewMode;
+            try addReviewFocus(&selected, mode);
+        }
+        for (self.modes orelse &.{}) |mode| addReviewFocus(&selected, mode) catch return error.InvalidReviewMode;
+        if (selected.count() == 0 and !self.all_models) return null;
+        var options: core.ReviewOptions = .{ .all_models = self.all_models };
+        try options.setFocuses(a, selected);
+        return options;
     }
 };
 
@@ -2447,20 +2462,27 @@ test "dashboard queue accepts explicit modes with all models and keeps the defau
     const a = arena.allocator();
     const parse = DashboardQueueRequest.parse;
     const default = try parse(a, "{\"repo\":\"example/repo\",\"number\":42,\"kind\":\"pr\"}");
-    try t.expectEqual(@as(?core.ReviewOptions, null), try default.reviewOptions());
+    try t.expectEqual(@as(?core.ReviewOptions, null), try default.reviewOptions(a));
     const all_models = try parse(a, "{\"repo\":\"example/repo\",\"number\":42,\"kind\":\"pr\",\"all_models\":true}");
-    try t.expect((try all_models.reviewOptions()).?.allowRouting());
+    try t.expect((try all_models.reviewOptions(a)).?.allowRouting());
     for (std.meta.tags(core.ReviewFocus)) |mode| {
         const body = try io.json(a, .{ .repo = "example/repo", .number = 42, .kind = "stack", .member = 12, .mode = @tagName(mode), .all_models = true });
         const queued = try parse(a, body);
-        const options = (try queued.reviewOptions()).?;
+        const options = (try queued.reviewOptions(a)).?;
         try t.expectEqual(@as(?u32, 12), queued.member);
         try t.expectEqual(mode, options.focus);
         try t.expect(options.all_models and options.explicit_mode and !options.allowRouting());
         try t.expect(options.request == null and !options.publish_prompted);
     }
     const invalid_mode = try parse(a, "{\"repo\":\"example/repo\",\"number\":42,\"kind\":\"pr\",\"mode\":\"unknown\"}");
-    try t.expectError(error.InvalidReviewMode, invalid_mode.reviewOptions());
+    try t.expectError(error.InvalidReviewMode, invalid_mode.reviewOptions(a));
+    const combined = try parse(a, "{\"repo\":\"example/repo\",\"number\":42,\"kind\":\"stack\",\"modes\":[\"reliability-maxxing\",\"perf-maxxing\"],\"all_models\":true}");
+    const combined_options = (try combined.reviewOptions(a)).?;
+    try t.expect(combined_options.all_models and !combined_options.allowRouting());
+    try t.expectEqual(.@"perf-maxxing", combined_options.focus);
+    try t.expectEqualSlices(core.ReviewFocus, &.{.@"reliability-maxxing"}, combined_options.additional_focuses.?);
+    const conflicting = try parse(a, "{\"repo\":\"example/repo\",\"number\":42,\"kind\":\"pr\",\"modes\":[\"general\",\"simplicity\"]}");
+    try t.expectError(error.InvalidReviewMode, conflicting.reviewOptions(a));
     try t.expectError(error.BadQueueRequest, parse(a, "{\"repo\":\"example/repo\",\"number\":42,\"kind\":\"pr\",\"mode\":0}"));
     try t.expectError(error.BadQueueRequest, parse(a, "{\"repo\":\"example/repo\",\"number\":42,\"kind\":\"pr\",\"member\":12}"));
     try t.expectError(error.BadQueueRequest, parse(a, "{\"repo\":\"example/repo\",\"number\":42,\"kind\":\"stack\",\"member\":0}"));
@@ -2619,21 +2641,29 @@ test "a budget-deferred ensemble gets first turn after reload" {
 
 test "numbered preview accepts each mode and one operator prompt" {
     const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
     for (std.meta.tags(core.ReviewFocus)) |mode| {
-        const options = try Main.reviewOptions(&.{ "--prompt", "Review the allocator path.", "--mode", @tagName(mode) }, false);
+        const options = try Main.reviewOptions(a, &.{ "--prompt", "Review the allocator path.", "--mode", @tagName(mode) }, false);
         try t.expectEqual(mode, options.focus);
         try t.expectEqualStrings("Review the allocator path.", options.request.?);
     }
-    try t.expectError(error.InvalidReviewMode, Main.reviewOptions(&.{ "--mode", "unknown" }, false));
-    try t.expectError(error.Usage, Main.reviewOptions(&.{ "--mode", "general", "--mode", "general" }, false));
-    try t.expectError(error.Usage, Main.reviewOptions(&.{"--prompt"}, false));
-    try t.expectError(error.InvalidReviewPrompt, Main.reviewOptions(&.{ "--prompt", "  " }, false));
-    try t.expectError(error.Usage, Main.reviewOptions(&.{ "--prompt", "Check retries.", "--publish" }, false));
-    try t.expectError(error.Usage, Main.reviewOptions(&.{"--publish"}, true));
-    try t.expect((try Main.reviewOptions(&.{ "--publish", "--prompt", "Check retries." }, true)).publish_prompted);
-    try t.expect((try Main.reviewOptions(&.{"--all-maxxing"}, true)).all_models);
-    try t.expectError(error.Usage, Main.reviewOptions(&.{"--all-maxxing"}, false));
-    try t.expectError(error.Usage, Main.reviewOptions(&.{ "--all-maxxing", "--all-maxxing" }, true));
+    try t.expectError(error.InvalidReviewMode, Main.reviewOptions(a, &.{ "--mode", "unknown" }, false));
+    const combined = try Main.reviewOptions(a, &.{ "--mode", "reliability-maxxing", "--mode", "perf-maxxing" }, false);
+    try t.expect(combined.selectedFocuses().contains(.@"reliability-maxxing"));
+    try t.expect(combined.selectedFocuses().contains(.@"perf-maxxing"));
+    try t.expect(!combined.allowRouting());
+    try t.expectError(error.InvalidReviewMode, Main.reviewOptions(a, &.{ "--mode", "simplicity", "--mode", "general" }, false));
+    try t.expectError(error.Usage, Main.reviewOptions(a, &.{ "--mode", "general", "--mode", "general" }, false));
+    try t.expectError(error.Usage, Main.reviewOptions(a, &.{"--prompt"}, false));
+    try t.expectError(error.InvalidReviewPrompt, Main.reviewOptions(a, &.{ "--prompt", "  " }, false));
+    try t.expectError(error.Usage, Main.reviewOptions(a, &.{ "--prompt", "Check retries.", "--publish" }, false));
+    try t.expectError(error.Usage, Main.reviewOptions(a, &.{"--publish"}, true));
+    try t.expect((try Main.reviewOptions(a, &.{ "--publish", "--prompt", "Check retries." }, true)).publish_prompted);
+    try t.expect((try Main.reviewOptions(a, &.{"--all-maxxing"}, true)).all_models);
+    try t.expectError(error.Usage, Main.reviewOptions(a, &.{"--all-maxxing"}, false));
+    try t.expectError(error.Usage, Main.reviewOptions(a, &.{ "--all-maxxing", "--all-maxxing" }, true));
 }
 
 test "completion fits encoded excerpts and leaves room for later small requests" {

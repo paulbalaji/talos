@@ -915,7 +915,8 @@ function queueInputChanged() {
 function queuePayload(target, wholeStack, form) {
   if (!target) return;
   const payload = { repo: target.repo, number: target.number, kind: target.kind, all_models: form.elements.all_models.checked };
-  if (form.elements.mode.value) payload.mode = form.elements.mode.value;
+  const modes = new FormData(form).getAll("mode");
+  if (modes.length) payload.modes = modes;
   if (wholeStack) {
     const key = lookupKey(target);
     if (!key || queueLookup?.key !== key || !validNumber(queueLookup.stack)) return;
@@ -1082,6 +1083,12 @@ byId("queue-form").addEventListener("submit", queueReview);
 byId("queue-target").addEventListener("input", queueInputChanged);
 byId("queue-repo").addEventListener("change", queueInputChanged);
 byId("queue-kind-field").addEventListener("change", queueInputChanged);
+byId("queue-focuses").addEventListener("change", ({ target, currentTarget }) => {
+  if (!target.checked) return;
+  for (const checked of currentTarget.querySelectorAll("input:checked")) {
+    if (checked !== target && (checked.value === "general" || target.value === "general")) checked.checked = false;
+  }
+});
 byId("history-search").addEventListener("input", renderHistory);
 byId("history-filter").addEventListener("change", renderHistory);
 byId("metrics-range").addEventListener("change", refreshMetrics);

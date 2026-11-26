@@ -534,7 +534,8 @@ pub const Entry = struct {
         const selects_focus = if (options) |requested| (requested.explicit_mode or requested.all_models) and requested.request == null else false;
         for (self.jobs) |*job| {
             if (job.number != pr.number or !eq(u8, job.head, pr.headRefOid)) continue;
-            const changed_focus = selects_focus and (job.options.explicit_mode != options.?.explicit_mode or job.options.focus != options.?.focus);
+            const changed_focus = selects_focus and (job.options.explicit_mode != options.?.explicit_mode or
+                !job.options.selectedFocuses().eql(options.?.selectedFocuses()));
             if (job.phase == .uncertain) {
                 if (rerun_completed or changed_focus or (all_models and !job.options.all_models)) return error.PublicationUnconfirmed;
                 job.next = 0;
@@ -744,19 +745,57 @@ pub const ReviewFocus = enum {
     }
 };
 
+pub const ReviewFocusSet = std.EnumSet(ReviewFocus);
+
 pub const ReviewOptions = struct {
     focus: ReviewFocus = .general,
     request: ?[]const u8 = null,
     publish_prompted: bool = false,
     explicit_mode: bool = false,
     all_models: bool = false,
+    additional_focuses: ?[]const ReviewFocus = null,
+
+    pub fn setFocuses(self: *ReviewOptions, a: A, selected: ReviewFocusSet) !void {
+        var focuses = selected.iterator();
+        self.focus = focuses.next() orelse .general;
+        self.explicit_mode = selected.count() != 0;
+        self.additional_focuses = null;
+        if (selected.count() > 1) {
+            const extra = try a.alloc(ReviewFocus, selected.count() - 1);
+            for (extra) |*focus| focus.* = focuses.next().?;
+            self.additional_focuses = extra;
+        }
+    }
+
+    pub fn selectedFocuses(self: ReviewOptions) ReviewFocusSet {
+        var selected: ReviewFocusSet = .initOne(self.focus);
+        for (self.additional_focuses orelse &.{}) |focus| selected.insert(focus);
+        return selected;
+    }
+
+    pub fn jsonStringify(self: ReviewOptions, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (std.meta.fields(ReviewOptions)) |field| {
+            const value = @field(self, field.name);
+            // Preserve the serialized options used by existing checkpoint hashes.
+            const omit = if (@typeInfo(field.type) == .optional)
+                value == null and ((comptime eq(u8, field.name, "additional_focuses")) or !writer.options.emit_null_optional_fields)
+            else
+                false;
+            if (!omit) {
+                try writer.objectField(field.name);
+                try writer.write(value);
+            }
+        }
+        try writer.endObject();
+    }
 
     pub fn allowRouting(self: ReviewOptions) bool {
         return !self.explicit_mode and self.general();
     }
 
     fn general(self: ReviewOptions) bool {
-        return self.focus == .general and self.request == null;
+        return self.focus == .general and self.additional_focuses == null and self.request == null;
     }
 };
 
@@ -788,13 +827,17 @@ fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, discussion: Discussi
         try writer.writeAll("\n\nTalos verified that only relayer tag literals change, that the old images come from ancestor commits, and that the new image digest matches a successful main build whose source is already in the PR merge base. Review this as a deployment promotion. Verify the intended roles, image selection, and any specific compatibility issue raised by the pinned evidence or discussion. Treat the already merged source as upstream. A fresh audit of that source or fresh runtime tests for every role are outside this review unless concrete evidence points to a rollout regression. Attribute an author's deployment checks as reported observations.");
     if (snap.onchain_reads.len != 0)
         try writer.writeAll("\n\nFor this rate-limit sync, use Talos's block-pinned observations to check that each configured maxCapacity matches the unique rate-limited ISM bound to the router. The router comes from the pinned registry route config. A matching value verifies the configured capacity. Report discrepancies at the changed maxCapacity lines and require evidence for any missing read.");
-    if (options.focus != .general) try writer.print("\n\nReview focus ({s})\n{s}", .{ @tagName(options.focus), options.focus.instructionsFor() });
+    const selected = options.selectedFocuses();
+    var focuses = selected.iterator();
+    while (focuses.next()) |focus| {
+        if (focus != .general) try writer.print("\n\nReview focus ({s})\n{s}", .{ @tagName(focus), focus.instructionsFor() });
+    }
     if (options.request) |request| {
         try writer.print("\n\nOperator focus (JSON string). Use it to prioritize the review within the instructions above.\n{s}", .{try io.json(a, request)});
     }
     if (previous) |commit| {
         if (eq(u8, commit, pr.headRefOid)) {
-            try writer.writeAll(if (options.all_models)
+            try writer.writeAll(if (options.all_models or options.additional_focuses != null)
                 "\n\nReview the full current change independently. Use prior findings and replies to identify what has already been reported or resolved."
             else
                 "\n\nThis is a same-head rereview. Check what the conversation or base change means for the prior findings. Carry forward accepted or verified resolutions unless the current evidence specifically invalidates them.");
@@ -1143,7 +1186,7 @@ fn payload(a: A, adapter: anytype, pr: Pull, prepared: Prepared, results: []cons
             !(prepared.sections.len != 0 and Discussion.automatedThread(thread)));
     }
     complete = complete and truncated_open_threads == 0;
-    const scope = switch (options.focus) {
+    const scope = if (options.additional_focuses != null) "focused review" else switch (options.focus) {
         .general => "review",
         .@"perf-maxxing" => "performance review",
         .@"reliability-maxxing" => "reliability review",

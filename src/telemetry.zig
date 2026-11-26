@@ -19,6 +19,7 @@ pub const Scope = struct {
     mode: Mode = .scheduled,
     route: ?routing.Depth = null,
     focus: ?core.ReviewFocus = null,
+    additional_focuses: ?[]const core.ReviewFocus = null,
 };
 
 // Cached and cache-write inputs are included in input. Reasoning output
@@ -187,6 +188,7 @@ fn copyRecord(a: io.A, record: anytype) !@TypeOf(record) {
         copy.scope.repo = try a.dupe(u8, record.scope.repo);
         copy.scope.head = try a.dupe(u8, record.scope.head);
         copy.scope.review_id = try copyOptional(a, record.scope.review_id);
+        if (record.scope.additional_focuses) |focuses| copy.scope.additional_focuses = try a.dupe(core.ReviewFocus, focuses);
         copy.model = try a.dupe(u8, record.model);
         copy.error_name = try copyOptional(a, record.error_name);
         if (record.model_usage.len != 0) {
