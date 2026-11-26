@@ -270,6 +270,8 @@ The state directory is `~/.local/state/talos`. One process holds its lock at a t
 
 Adaptive multi reviews also run independent provider passes concurrently within their start budget. The providers share one pinned source snapshot. Each process uses its own scratch directory under the job's temporary directory. Talos removes that directory when the job exits. Evidence collection and synthesis run between the independent passes.
 
+Ordinary reviewer calls have a 15-minute timeout. Full calls in all-model reviews can run for up to 30 minutes per provider call.
+
 Talos rotates `launchd.log` on the next tick after a UTC day boundary or when it reaches 1 MiB. It keeps up to 30 days and 10 MiB across the active log and its archives, with newer diagnostics taking priority. The scheduler also reports the last 12 errors per repo through `talos status`. Log retention only applies to scheduler diagnostics.
 
 The machine budget defaults to 15 reviewer starts per tick for new installs. Existing installs keep their saved limit. A PR with two configured reviewers reserves two starts. The same limit applies separately to receipt lookups, which use GitHub calls and zero reviewer starts. Set it with `talos queue-budget 15`. It must fit the largest configured reviewer list. Unserved work stays queued, and Talos rotates between repos across restarts. `status` shows the next eligible PR and the last active tick's review starts and GitHub CLI calls. Each repo keeps its own scan interval and Git cache limits.

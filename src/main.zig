@@ -462,7 +462,10 @@ const ReviewWorker = struct {
 
     fn fullProfile(self: *const ReviewWorker, engine: core.Engine) runner.Profile {
         var profile = reviewerProfile(self.adapter.repo, engine);
-        if (self.prepared.all_models) profile.effort = .max;
+        if (self.prepared.all_models) {
+            profile.effort = .max;
+            profile.timeout_seconds = 30 * std.time.s_per_min;
+        }
         return profile;
     }
 
@@ -2075,7 +2078,10 @@ test "providers in one review overlap and clean up their own scratch" {
     var batch: ReviewBatch = .{ .starts_left = 2, .receipts_left = 0 };
     var worker: ReviewWorker = .{ .job = undefined, .batch = &batch };
     worker.adapter.repo = repo;
+    worker.prepared.all_models = false;
+    try t.expectEqual(@as(u32, 15 * 60), worker.fullProfile(.codex).timeout_seconds);
     worker.prepared.all_models = true;
+    try t.expectEqual(@as(u32, 30 * 60), worker.fullProfile(.codex).timeout_seconds);
     worker.tools = .{ .a = a, .env = &env, .scratch = path, .scratch_dir = dir, .programs = Programs.fromRepo(repo) };
     var results: [2]anyerror![]const u8 = undefined;
     try worker.routeParallel(&.{

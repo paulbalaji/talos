@@ -5,6 +5,7 @@ pub const Profile = struct {
     model: ?[]const u8 = null,
     effort: core.ReviewEffort = .high,
     advisor: ?[]const u8 = null,
+    timeout_seconds: u32 = 15 * std.time.s_per_min,
 };
 
 pub const Invocation = struct {
