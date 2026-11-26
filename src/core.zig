@@ -531,15 +531,15 @@ pub const Entry = struct {
 
     pub fn queueReview(self: *Entry, a: A, pr: Pull, options: ?ReviewOptions, rerun_completed: bool) !void {
         const all_models = if (options) |requested| requested.all_models else false;
-        const explicit_focus = if (options) |requested| requested.explicit_mode and requested.request == null else false;
+        const selects_focus = if (options) |requested| (requested.explicit_mode or requested.all_models) and requested.request == null else false;
         for (self.jobs) |*job| {
             if (job.number != pr.number or !eq(u8, job.head, pr.headRefOid)) continue;
-            const changed_focus = explicit_focus and (!job.options.explicit_mode or job.options.focus != options.?.focus);
+            const changed_focus = selects_focus and (job.options.explicit_mode != options.?.explicit_mode or job.options.focus != options.?.focus);
             if (job.phase == .uncertain) {
                 if (rerun_completed or changed_focus or (all_models and !job.options.all_models)) return error.PublicationUnconfirmed;
                 job.next = 0;
                 job.attempts = 0;
-            } else if (all_models or explicit_focus) {
+            } else if (all_models or selects_focus) {
                 const rerun = rerun_completed and job.phase == .complete;
                 const has_all_models = job.options.all_models or (job.route_report != null and job.route_report.?.all_models);
                 if (!rerun and !changed_focus and (!all_models or has_all_models) and job.phase != .failed) return;

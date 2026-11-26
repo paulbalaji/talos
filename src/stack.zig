@@ -688,6 +688,13 @@ test "switching focus on a reviewed stack preserves receipts and identical reque
     job.phase = .uncertain;
     try t.expectError(error.PublicationUnconfirmed, queueNative(&entry, a, group, security, false));
     try t.expectEqual(@as(?u64, 42), job.receipt);
+
+    job.phase = .complete;
+    job.options = security;
+    try entry.queue(a, pins[0].pull(), .{ .all_models = true });
+    try t.expectEqual(core.Phase.pending, job.phase);
+    try t.expect(job.options.all_models and job.options.allowRouting());
+    try t.expectEqual(core.ReviewFocus.general, job.options.focus);
 }
 
 test "stack registration checks order and blocks the child on a failed parent across restart" {
