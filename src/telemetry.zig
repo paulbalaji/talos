@@ -80,14 +80,13 @@ pub const Recorder = struct {
 };
 
 pub const Query = struct {
-    since: ?i64 = null,
+    since: i64,
     repo: ?[]const u8 = null,
     pr: ?u32 = null,
     limit: usize = 2000,
     now: ?i64 = null,
 };
 
-pub const retention_days = 90;
 pub const max_query_events = 12_000;
 const attempt_directory = "telemetry";
 const verdict_directory = "verdicts";
@@ -97,26 +96,6 @@ const max_event_bytes = 8 * 1024;
 
 fn segmentName(buffer: *[32]u8, day: i64) ![]const u8 {
     return std.fmt.bufPrint(buffer, "{d}" ++ suffix, .{day});
-}
-
-fn segmentDay(name: []const u8) ?i64 {
-    if (!std.mem.endsWith(u8, name, suffix)) return null;
-    const digits = name[0 .. name.len - suffix.len];
-    if (digits.len == 0 or (digits.len > 1 and digits[0] == '0')) return null;
-    for (digits) |byte| if (!std.ascii.isDigit(byte)) return null;
-    return std.fmt.parseInt(i64, digits, 10) catch null;
-}
-
-fn prune(dir: std.fs.Dir, today: i64) !void {
-    var entries = dir.iterate();
-    while (try entries.next()) |entry| {
-        if (entry.kind != .file) continue;
-        const day = segmentDay(entry.name) orelse continue;
-        if (day <= today - retention_days) dir.deleteFile(entry.name) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
-    }
 }
 
 fn openSegment(dir: std.fs.Dir, name: []const u8, flags: posix.O) !std.fs.File {
@@ -167,7 +146,7 @@ fn appendRecord(a: io.A, root: std.fs.Dir, directory: []const u8, record: anytyp
         error.PathAlreadyExists => {},
         else => return err,
     };
-    var dir = try root.openDir(directory, .{ .iterate = true, .no_follow = true });
+    var dir = try root.openDir(directory, .{ .no_follow = true });
     defer dir.close();
     const day = @divFloor(record.at, std.time.s_per_day);
     var name_buffer: [32]u8 = undefined;
@@ -176,24 +155,17 @@ fn appendRecord(a: io.A, root: std.fs.Dir, directory: []const u8, record: anytyp
     var create = base;
     create.CREAT = true;
     create.EXCL = true;
-    var created = true;
     const file = openSegment(dir, name, create) catch |err| switch (err) {
-        error.PathAlreadyExists => existing: {
-            created = false;
-            break :existing try openSegment(dir, name, base);
-        },
+        error.PathAlreadyExists => try openSegment(dir, name, base),
         else => return err,
     };
     defer file.close();
-    {
-        try file.lock(.exclusive);
-        defer file.unlock();
-        const size = try repairTail(file);
-        if (size + encoded.len > max_day_bytes) return error.TelemetryDayLimit;
-        try file.writeAll(encoded);
-        try file.sync();
-    }
-    if (created) try prune(dir, day);
+    try file.lock(.exclusive);
+    defer file.unlock();
+    const size = try repairTail(file);
+    if (size + encoded.len > max_day_bytes) return error.TelemetryDayLimit;
+    try file.writeAll(encoded);
+    try file.sync();
 }
 
 fn matches(record: anytype, query: Query) bool {
@@ -201,8 +173,7 @@ fn matches(record: anytype, query: Query) bool {
     const number = if (@TypeOf(record) == Event) record.scope.pr else record.pr;
     if (query.repo) |repo| if (!std.ascii.eqlIgnoreCase(repo, repo_name)) return false;
     if (query.pr) |pr| if (pr != number) return false;
-    if (query.since) |since| if (record.at < since) return false;
-    return true;
+    return record.at >= query.since;
 }
 
 fn copyOptional(a: io.A, value: ?[]const u8) !?[]const u8 {
@@ -231,8 +202,8 @@ fn copyRecord(a: io.A, record: anytype) !@TypeOf(record) {
     return copy;
 }
 
-// Reads newest records first. The day files bound history and a read only
-// holds one day's bytes at a time. An incomplete final record is invisible.
+// Reads newest records first, holding one day's bytes at a time.
+// An incomplete final record is invisible.
 pub fn read(a: io.A, root: std.fs.Dir, query: Query) ![]const Event {
     return readRecords(a, root, attempt_directory, Event, query);
 }
@@ -250,8 +221,7 @@ fn readRecords(a: io.A, root: std.fs.Dir, directory: []const u8, comptime Record
     };
     defer dir.close();
     const today = @divFloor(query.now orelse std.time.timestamp(), std.time.s_per_day);
-    const first_retained = today - retention_days + 1;
-    const first = if (query.since) |since| @max(first_retained, @divFloor(since, std.time.s_per_day)) else first_retained;
+    const first = @divFloor(query.since, std.time.s_per_day);
     var found: std.ArrayList(Record) = .empty;
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
@@ -300,7 +270,7 @@ const sample: Event = .{
     .effort = .max,
 };
 
-test "interrupted appends recover and retention preserves unmanaged files" {
+test "interrupted appends recover and later writes leave older days readable" {
     const t = std.testing;
     var scratch = t.tmpDir(.{});
     defer scratch.cleanup();
@@ -309,35 +279,34 @@ test "interrupted appends recover and retention preserves unmanaged files" {
     const a = arena.allocator();
     const root = scratch.dir;
     var earlier = sample;
-    earlier.at -= retention_days * std.time.s_per_day;
+    earlier.at = 30 * std.time.s_per_day;
     try append(a, root, earlier);
     try append(a, root, sample);
 
     var dir = try root.openDir(attempt_directory, .{});
     defer dir.close();
-    try t.expectError(error.FileNotFound, dir.access("30.jsonl", .{}));
     const file = try dir.openFile("120.jsonl", .{ .mode = .read_write });
     defer file.close();
     try file.seekFromEnd(0);
     try file.writeAll("{\"id\":\"partial");
-    try t.expectEqual(@as(usize, 1), (try read(a, root, .{ .now = sample.at })).len);
+    try t.expectEqual(@as(usize, 1), (try read(a, root, .{ .since = sample.at, .now = sample.at })).len);
 
     var finish = sample;
     finish.kind = .finished;
     finish.duration_ms = 89;
     finish.outcome = .success;
     try append(a, root, finish);
-    const events = try read(a, root, .{ .now = sample.at, .repo = "Example/Repo", .pr = 7 });
+    const events = try read(a, root, .{ .since = sample.at, .now = sample.at, .repo = "Example/Repo", .pr = 7 });
     try t.expectEqual(@as(usize, 2), events.len);
     try t.expectEqual(.finished, events[0].kind);
     try t.expectEqual(@as(?u64, 89), events[0].duration_ms);
-    try t.expectEqual(@as(usize, 0), (try read(a, root, .{ .now = sample.at, .pr = 99 })).len);
-    try t.expectEqual(@as(usize, 1), (try read(a, root, .{ .now = sample.at, .limit = 1 })).len);
-    try io.write(dir, "notes.txt", "operator data");
-    finish.at += (retention_days + 1) * std.time.s_per_day;
+    try t.expectEqual(@as(usize, 0), (try read(a, root, .{ .since = sample.at, .now = sample.at, .pr = 99 })).len);
+    try t.expectEqual(@as(usize, 1), (try read(a, root, .{ .since = sample.at, .now = sample.at, .limit = 1 })).len);
+    finish.at += 91 * std.time.s_per_day;
     try append(a, root, finish);
-    try dir.access("notes.txt", .{});
-    try t.expectError(error.FileNotFound, dir.access("120.jsonl", .{}));
+    const history = try read(a, root, .{ .since = earlier.at, .now = finish.at });
+    try t.expectEqual(@as(usize, 4), history.len);
+    try t.expectEqual(earlier.at, history[3].at);
 }
 
 test "parallel telemetry writers keep every record readable" {
@@ -369,10 +338,10 @@ test "parallel telemetry writers keep every record readable" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const rows = try read(a, scratch.dir, .{ .now = sample.at });
+    const rows = try read(a, scratch.dir, .{ .since = sample.at, .now = sample.at });
     try t.expectEqual(@as(usize, workers.len * 24), rows.len);
     for (1..workers.len + 1) |pr| {
-        const filtered = try read(a, scratch.dir, .{ .now = sample.at, .pr = @intCast(pr) });
+        const filtered = try read(a, scratch.dir, .{ .since = sample.at, .now = sample.at, .pr = @intCast(pr) });
         try t.expectEqual(@as(usize, 24), filtered.len);
         const last_id = try std.fmt.allocPrint(a, "{d}-23", .{pr});
         try t.expectEqualStrings(last_id, filtered[0].id);
@@ -397,8 +366,8 @@ test "verdicts are durable separately from provider starts" {
         .github_review_id = 81,
         .complete = true,
     });
-    try t.expectEqual(@as(usize, 0), (try read(a, scratch.dir, .{ .now = sample.at })).len);
-    const verdicts = try readVerdicts(a, scratch.dir, .{ .now = sample.at, .pr = 7 });
+    try t.expectEqual(@as(usize, 0), (try read(a, scratch.dir, .{ .since = sample.at, .now = sample.at })).len);
+    const verdicts = try readVerdicts(a, scratch.dir, .{ .since = sample.at, .now = sample.at, .pr = 7 });
     try t.expectEqual(@as(usize, 1), verdicts.len);
     try t.expectEqual(@as(?u64, 81), verdicts[0].github_review_id);
 }

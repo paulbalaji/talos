@@ -18,6 +18,7 @@ const followup = @import("followup.zig");
 const followup_git = @import("followup_git.zig");
 const onchain = @import("onchain.zig");
 const telemetry = @import("telemetry.zig");
+const max_metrics_days = 3650;
 const dashboard = @import("dashboard.zig");
 const dashboard_data = @import("dashboard_data.zig");
 
@@ -2004,7 +2005,7 @@ const Main = struct {
             const failure: struct { status: std.http.Status, message: []const u8 } = switch (err) {
                 error.InvalidDashboardQuery => .{ .status = .bad_request, .message = "Invalid or repeated query parameter." },
                 error.BadQueueRequest => .{ .status = .bad_request, .message = "Select a repository and a valid PR or stack number." },
-                error.InvalidMetricsDays => .{ .status = .bad_request, .message = "Choose a range from 1 to 90 days." },
+                error.InvalidMetricsDays => .{ .status = .bad_request, .message = std.fmt.comptimePrint("Choose a range from 1 to {d} days.", .{max_metrics_days}) },
                 error.UnknownRepository => .{ .status = .not_found, .message = "Talos does not track that repository." },
                 error.AlreadyRunning => .{ .status = .conflict, .message = "Talos is saving queue changes. Try again in a moment." },
                 error.DashboardTargetChanged => .{ .status = .conflict, .message = "The repository or PR changed during lookup. Try again." },
@@ -2202,7 +2203,7 @@ fn dashboardHeadChanged(entry: core.Entry, number: u32, head: []const u8) bool {
 
 fn metricsDays(input: []const u8) !u32 {
     const days = std.fmt.parseUnsigned(u32, input, 10) catch return error.InvalidMetricsDays;
-    if (days == 0 or days > telemetry.retention_days) return error.InvalidMetricsDays;
+    if (days == 0 or days > max_metrics_days) return error.InvalidMetricsDays;
     return days;
 }
 
@@ -2358,7 +2359,9 @@ test "dashboard query accepts encoded repository names and rejects repeated or m
     try t.expectEqual(@as(?u32, 42), query.number);
     try t.expectError(error.InvalidDashboardQuery, parseDashboardQuery(a, "number=1&number=2"));
     try t.expectError(error.InvalidDashboardQuery, parseDashboardQuery(a, "repo=example%2"));
-    try t.expectError(error.InvalidMetricsDays, parseDashboardQuery(a, "days=91"));
+    try t.expectEqual(@as(?u32, 365), (try parseDashboardQuery(a, "days=365")).days);
+    try t.expectEqual(@as(?u32, max_metrics_days), (try parseDashboardQuery(a, "days=3650")).days);
+    try t.expectError(error.InvalidMetricsDays, parseDashboardQuery(a, "days=3651"));
 }
 
 test "each reviewer combination registers with only its selected executables" {

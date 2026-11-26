@@ -220,7 +220,7 @@ test "reviewer attempts retain terminal usage through failure and timeout withou
         } else {
             try t.expectEqualStrings("private-response-content", try reply);
         }
-        const events = try metrics.read(a, workspace.dir, .{ .pr = 15 });
+        const events = try metrics.read(a, workspace.dir, .{ .since = std.time.timestamp() - std.time.s_per_day, .pr = 15 });
         try t.expectEqual(count * 2, events.len);
         try t.expectEqualStrings(events[1].id, events[0].id);
         try t.expectEqual(metrics.Stage.completion, events[0].scope.stage);

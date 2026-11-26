@@ -68,7 +68,9 @@ These screenshots use simulated repositories and review activity.
 
 The dashboard binds to loopback. Browser queue writes require a matching local origin. Keep it on the machine running Talos. Use `talos dashboard remove` to stop the macOS service, or `talos dashboard --port 8750` to run on another local port.
 
-Talos retains up to 90 UTC days of local attempt and verdict metadata. Attempt records include repository, PR, head, stage, reviewer, model, elapsed time, outcome, and provider-reported tokens when available. The dashboard gives totals by PR and review, and shows advisor model usage separately when the CLI attributes it. Cached input and reasoning tokens are parts of the corresponding input and output totals. The recorded-token share shows how much of the selected range can support token totals. CLI versions with no reported usage still contribute attempt counts. Previously saved verdicts appear in history, and token history begins when the telemetry-enabled watcher starts recording. The telemetry logs store metadata only.
+Talos keeps local attempt and verdict metadata indefinitely in daily files. Attempt records include repository, PR, head, stage, reviewer, model, elapsed time, outcome, and provider-reported tokens when available. The dashboard gives totals by PR and review, and shows advisor model usage separately when the CLI attributes it. Cached input and reasoning tokens are parts of the corresponding input and output totals. The recorded-token share shows how much of the selected range can support token totals. CLI versions with no reported usage still contribute attempt counts. Previously saved verdicts appear in history, and token history begins when the telemetry-enabled watcher starts recording.
+
+The Usage view defaults to 30 days and offers up to 365 days. `talos metrics --days` accepts up to 3,650 days. Queries cap the number of records they read and flag partial totals. Talos caps each daily metadata file at 1 MiB.
 
 ### Focus a review
 

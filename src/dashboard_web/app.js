@@ -919,7 +919,7 @@ function refreshMetrics() {
   request(`/api/metrics?days=${days}`).then((data) => {
     if (metricsRequest !== flight || view !== "usage") return;
     metricsSnapshot = data;
-    if (data.truncated) note(byId("metrics-notice"), "Some records fell outside the available history.");
+    if (data.truncated) note(byId("metrics-notice"), "This range exceeds the history query limit. Choose a shorter range for complete totals.");
     else note(byId("metrics-notice"), "");
     renderMetrics();
   }).catch((error) => {

@@ -670,3 +670,52 @@ test "metrics pair starts and finishes and account for advisor models separately
         if (profile.engine == .kimi) try t.expect(profile.input_tokens == null);
     }
 }
+
+test "extended usage includes attempts and verdicts older than 90 days" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try io.temp(a);
+    defer std.fs.deleteTreeAbsolute(path) catch {};
+    var db = try store.Store.open(a, path);
+    defer db.dir.close();
+    const now = std.time.timestamp();
+    const scope: telemetry.Scope = .{ .repo = "example/repo", .pr = 8, .head = "a" ** 40 };
+    var attempt: telemetry.Event = .{
+        .id = "old-attempt",
+        .at = now - 120 * day_seconds,
+        .kind = .finished,
+        .scope = scope,
+        .engine = .codex,
+        .model = "example-model",
+        .effort = .high,
+        .outcome = .success,
+        .tokens = .{ .input = 1200 },
+    };
+    var verdict: telemetry.Verdict = .{
+        .at = attempt.at,
+        .repo = scope.repo,
+        .pr = scope.pr,
+        .head = scope.head,
+        .route = .multi,
+        .event = .APPROVE,
+        .publication = .local,
+        .complete = true,
+    };
+    try telemetry.append(a, db.dir, attempt);
+    try telemetry.recordVerdict(db.dir, verdict);
+    attempt.id = "new-attempt";
+    attempt.at = now;
+    attempt.tokens = .{ .input = 100 };
+    verdict.at = now;
+    verdict.head = "b" ** 40;
+    try telemetry.append(a, db.dir, attempt);
+    try telemetry.recordVerdict(db.dir, verdict);
+
+    const Summary = struct { attempts: usize, review_count: usize, input_tokens: ?u64 };
+    const recent = try io.parse(a, Summary, try metricsJson(a, db, 30, now));
+    try t.expectEqual(Summary{ .attempts = 1, .review_count = 1, .input_tokens = 100 }, recent);
+    const extended = try io.parse(a, Summary, try metricsJson(a, db, 365, now));
+    try t.expectEqual(Summary{ .attempts = 2, .review_count = 2, .input_tokens = 1300 }, extended);
+}
