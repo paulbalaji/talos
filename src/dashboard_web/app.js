@@ -44,6 +44,7 @@ let pollTimer = null;
 let refreshIndicatorTimer = null;
 let tooltipAnchor = null;
 let tooltipTimer = null;
+let tooltipClock = null;
 let queueLookup = null;
 let queueSending = null;
 const renderKeys = new Map();
@@ -201,6 +202,7 @@ function replace(container, content) {
 
 function hideTooltip() {
   clearTimeout(tooltipTimer);
+  clearInterval(tooltipClock);
   tooltipAnchor?.removeAttribute("aria-describedby");
   tooltipAnchor = null;
   byId("dashboard-tooltip").hidden = true;
@@ -211,20 +213,36 @@ function revealTooltip(anchor, title, rows, point = null) {
   const tip = byId("dashboard-tooltip");
   tip.classList.toggle("progress-tooltip", anchor.classList.contains("job-progress"));
   const grid = element("dl");
+  const liveRows = [];
+  const now = Date.now();
   for (const [name, value] of rows) {
-    if (value) grid.append(element("dt", null, name), element("dd", null, value));
+    const live = typeof value === "function";
+    const text = live ? value(now) : value;
+    if (!text) continue;
+    const detail = element("dd", null, text);
+    grid.append(element("dt", null, name), detail);
+    if (live) liveRows.push([detail, value]);
   }
   tip.replaceChildren(element("strong", null, title), grid);
   tip.hidden = false;
-  const rect = anchor.getBoundingClientRect();
-  const edge = 8;
-  const left = Math.max(edge, Math.min(point?.x ?? rect.left, document.documentElement.clientWidth - tip.offsetWidth - edge));
-  const below = (point?.y ?? rect.bottom) + edge;
-  const top = below + tip.offsetHeight <= window.innerHeight - edge ? below : (point?.y ?? rect.top) - tip.offsetHeight - edge;
-  tip.style.left = `${left}px`;
-  tip.style.top = `${Math.max(edge, top)}px`;
+  const position = () => {
+    const rect = anchor.getBoundingClientRect();
+    const edge = 8;
+    const left = Math.max(edge, Math.min(point?.x ?? rect.left, document.documentElement.clientWidth - tip.offsetWidth - edge));
+    const below = (point?.y ?? rect.bottom) + edge;
+    const top = below + tip.offsetHeight <= window.innerHeight - edge ? below : (point?.y ?? rect.top) - tip.offsetHeight - edge;
+    tip.style.left = `${left}px`;
+    tip.style.top = `${Math.max(edge, top)}px`;
+  };
+  position();
   tooltipAnchor = anchor;
   anchor.setAttribute("aria-describedby", tip.id);
+  if (liveRows.length) tooltipClock = setInterval(() => {
+    if (document.hidden) return;
+    const tick = Date.now();
+    for (const [detail, value] of liveRows) detail.textContent = value(tick);
+    position();
+  }, 1000);
 }
 
 function delayTooltipHide(anchor) {
@@ -236,7 +254,7 @@ function delayTooltipHide(anchor) {
 
 function tooltipFor(anchor, title, rows) {
   anchor.tabIndex = 0;
-  const show = () => revealTooltip(anchor, title, typeof rows === "function" ? rows() : rows);
+  const show = () => revealTooltip(anchor, title, rows);
   anchor.addEventListener("pointerenter", show);
   anchor.addEventListener("focus", show);
   anchor.addEventListener("pointerleave", () => delayTooltipHide(anchor));
@@ -326,10 +344,13 @@ function progressLabel(job, inspect = true) {
   if (inspect && (active.length || recent)) {
     const stage = (item) => phrase([item.section != null && `Section ${item.section}`, humanize(item.stage)]);
     wrap.dataset.reviewKey = `${keyOf(job.repo, job.number)}:${job.head}:progress`;
-    return tooltipFor(wrap, `PR #${job.number}`, () => active.length ? active.map((item) => [
-      item.model || humanize(item.engine),
-      phrase([stage(item), item.at > 0 && `${duration(Math.max(0, Date.now() - item.at * 1000))} elapsed`]),
-    ]) : [[
+    return tooltipFor(wrap, `PR #${job.number}`, active.length ? active.map((item) => {
+      const label = stage(item);
+      return [
+        item.model || humanize(item.engine),
+        item.at > 0 ? (now) => phrase([label, `${duration(Math.max(0, now - item.at * 1000))} elapsed`]) : label,
+      ];
+    }) : [[
       `Last pass · ${recent.model || humanize(recent.engine)}`,
       phrase([stage(recent), Number.isFinite(recent.duration_ms) && duration(recent.duration_ms), humanize(recent.outcome)]),
     ]]);
