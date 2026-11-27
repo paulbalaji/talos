@@ -3,6 +3,7 @@ const core = @import("core.zig");
 const io = @import("io.zig");
 const routing = @import("routing.zig");
 const posix = std.posix;
+const sqlite = @import("sqlite.zig");
 
 pub const Stage = enum { review, screen, completion, synthesis, preview, followup };
 pub const Mode = enum { scheduled, preview, followup };
@@ -67,6 +68,7 @@ pub const Verdict = struct {
     route: routing.Depth,
     event: core.Event,
     publication: enum { local, verified },
+    disposition: ?core.PublicationDisposition = null,
     github_review_id: ?u64 = null,
     complete: bool,
 };
@@ -95,171 +97,134 @@ const suffix = ".jsonl";
 const max_day_bytes = 1024 * 1024;
 const max_event_bytes = 8 * 1024;
 
-fn segmentName(buffer: *[32]u8, day: i64) ![]const u8 {
-    return std.fmt.bufPrint(buffer, "{d}" ++ suffix, .{day});
-}
-
-fn openSegment(dir: std.fs.Dir, name: []const u8, flags: posix.O) !std.fs.File {
-    const file: std.fs.File = .{ .handle = try posix.openat(dir.fd, name, flags, 0o600) };
-    errdefer file.close();
-    const stat = try posix.fstat(file.handle);
-    if (stat.mode & posix.S.IFMT != posix.S.IFREG or stat.nlink != 1) return error.InvalidTelemetryFile;
-    return file;
-}
-
-fn repairTail(file: std.fs.File) !u64 {
-    const size = try file.getEndPos();
-    if (size == 0) return 0;
-    var last: [1]u8 = undefined;
-    if (try file.preadAll(&last, size - 1) != last.len) return error.TelemetryChanged;
-    if (last[0] == '\n') return size;
-
-    // A previous write may have stopped mid-record. Remove just its tail
-    // under the same lock that serializes append operations.
-    var buffer: [max_event_bytes]u8 = undefined;
-    const offset = size -| buffer.len;
-    const count = try file.preadAll(&buffer, offset);
-    const end = if (std.mem.lastIndexOfScalar(u8, buffer[0..count], '\n')) |index|
-        offset + index + 1
-    else if (offset == 0)
-        0
-    else
-        return error.InvalidTelemetryTail;
-    try file.setEndPos(end);
-    return end;
-}
+const migration_key = "legacy_telemetry_imported";
 
 pub fn append(a: io.A, root: std.fs.Dir, event: Event) !void {
-    try appendRecord(a, root, attempt_directory, event);
+    const db = try open(a, root);
+    defer db.close();
+    try putEvent(db, a, event);
 }
 
 pub fn recordVerdict(root: std.fs.Dir, verdict: Verdict) !void {
-    try appendRecord(std.heap.page_allocator, root, verdict_directory, verdict);
+    const a = std.heap.page_allocator;
+    const db = try open(a, root);
+    defer db.close();
+    try putVerdict(db, a, verdict);
 }
 
-fn appendRecord(a: io.A, root: std.fs.Dir, directory: []const u8, record: anytype) !void {
-    const json = try std.json.Stringify.valueAlloc(a, record, .{ .emit_null_optional_fields = false });
-    defer a.free(json);
-    const encoded = try std.fmt.allocPrint(a, "{s}\n", .{json});
-    defer a.free(encoded);
-    if (encoded.len > max_event_bytes) return error.TelemetryRecordTooLarge;
-    root.makeDir(directory) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-    var dir = try root.openDir(directory, .{ .no_follow = true });
-    defer dir.close();
-    const day = @divFloor(record.at, std.time.s_per_day);
-    var name_buffer: [32]u8 = undefined;
-    const name = try segmentName(&name_buffer, day);
-    const base: posix.O = .{ .ACCMODE = .RDWR, .APPEND = true, .CLOEXEC = true, .NOFOLLOW = true, .NONBLOCK = true };
-    var create = base;
-    create.CREAT = true;
-    create.EXCL = true;
-    const file = openSegment(dir, name, create) catch |err| switch (err) {
-        error.PathAlreadyExists => try openSegment(dir, name, base),
-        else => return err,
-    };
-    defer file.close();
-    try file.lock(.exclusive);
-    defer file.unlock();
-    const size = try repairTail(file);
-    if (size + encoded.len > max_day_bytes) return error.TelemetryDayLimit;
-    try file.writeAll(encoded);
-    try file.sync();
-}
-
-fn matches(record: anytype, query: Query, until: i64) bool {
-    const repo_name = if (@TypeOf(record) == Event) record.scope.repo else record.repo;
-    const number = if (@TypeOf(record) == Event) record.scope.pr else record.pr;
-    if (query.repo) |repo| if (!std.ascii.eqlIgnoreCase(repo, repo_name)) return false;
-    if (query.pr) |pr| if (pr != number) return false;
-    return record.at >= query.since and record.at <= until;
-}
-
-fn copyOptional(a: io.A, value: ?[]const u8) !?[]const u8 {
-    return if (value) |str| try a.dupe(u8, str) else null;
-}
-
-fn copyRecord(a: io.A, record: anytype) !@TypeOf(record) {
-    var copy = record;
-    if (@TypeOf(record) == Event) {
-        copy.id = try a.dupe(u8, record.id);
-        copy.scope.repo = try a.dupe(u8, record.scope.repo);
-        copy.scope.head = try a.dupe(u8, record.scope.head);
-        copy.scope.review_id = try copyOptional(a, record.scope.review_id);
-        if (record.scope.additional_focuses) |focuses| copy.scope.additional_focuses = try a.dupe(core.ReviewFocus, focuses);
-        copy.model = try a.dupe(u8, record.model);
-        copy.error_name = try copyOptional(a, record.error_name);
-        if (record.model_usage.len != 0) {
-            const usage = try a.dupe(ModelUsage, record.model_usage);
-            for (usage) |*model| model.model = try a.dupe(u8, model.model);
-            copy.model_usage = usage;
-        }
-    } else {
-        copy.repo = try a.dupe(u8, record.repo);
-        copy.head = try a.dupe(u8, record.head);
-        copy.review_id = try copyOptional(a, record.review_id);
+fn open(a: io.A, root: std.fs.Dir) !sqlite.Db {
+    const db = try sqlite.Db.open(a, root);
+    errdefer db.close();
+    if (!try db.hasSetting(migration_key)) {
+        try db.beginWrite();
+        errdefer db.rollback();
+        try migrate(db, root);
+        try db.commit();
     }
-    return copy;
+    return db;
 }
 
-// Reads newest records first, holding one day's bytes at a time.
-// An incomplete final record is invisible.
+fn putEvent(db: sqlite.Db, a: io.A, event: Event) !void {
+    const json = try std.json.Stringify.valueAlloc(a, event, .{ .emit_null_optional_fields = false });
+    defer a.free(json);
+    if (json.len > max_event_bytes) return error.TelemetryRecordTooLarge;
+    try db.run(
+        "INSERT INTO telemetry_event(id,kind,at,repo,number,payload) VALUES (?,?,?,?,?,?) ON CONFLICT(id,kind) DO NOTHING",
+        .{ event.id, @tagName(event.kind), event.at, event.scope.repo, event.scope.pr, json },
+    );
+}
+
+/// Insert the verdict in the same transaction as the saved review.
+pub fn putVerdict(db: sqlite.Db, a: io.A, verdict: Verdict) !void {
+    const json = try std.json.Stringify.valueAlloc(a, verdict, .{ .emit_null_optional_fields = false });
+    defer a.free(json);
+    if (json.len > max_event_bytes) return error.TelemetryRecordTooLarge;
+    try db.run(
+        \\INSERT INTO review_verdict(repo,number,head,review_key,at,event,publication,payload) VALUES (?,?,?,?,?,?,?,?)
+        \\ON CONFLICT(repo,number,head,review_key,at,event,publication) DO NOTHING
+    , .{ verdict.repo, verdict.pr, verdict.head, verdict.review_id orelse "", verdict.at, @tagName(verdict.event), @tagName(verdict.publication), json });
+}
+
+/// Run under the caller's write transaction. Files remain as a pre-cutover snapshot.
+pub fn migrate(db: sqlite.Db, root: std.fs.Dir) !void {
+    if (try db.hasSetting(migration_key)) return;
+    try importSegments(db, root, attempt_directory, Event);
+    try importSegments(db, root, verdict_directory, Verdict);
+    try db.setSetting(migration_key, "1");
+}
+
+fn importSegments(db: sqlite.Db, root: std.fs.Dir, directory: []const u8, comptime Record: type) !void {
+    var dir = root.openDir(directory, .{ .iterate = true, .no_follow = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close();
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var segment = dir.iterate();
+    while (try segment.next()) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, suffix)) continue;
+        _ = std.fmt.parseInt(i64, entry.name[0 .. entry.name.len - suffix.len], 10) catch continue;
+        const fd = try posix.openat(dir.fd, entry.name, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true }, 0);
+        const file: std.fs.File = .{ .handle = fd };
+        defer file.close();
+        const stat = try posix.fstat(fd);
+        if (stat.mode & posix.S.IFMT != posix.S.IFREG or stat.nlink != 1) return error.InvalidTelemetryFile;
+        const raw = try file.readToEndAlloc(std.heap.page_allocator, max_day_bytes);
+        defer std.heap.page_allocator.free(raw);
+        const end = std.mem.lastIndexOfScalar(u8, raw, '\n') orelse continue;
+        var records = std.mem.splitScalar(u8, raw[0..end], '\n');
+        while (records.next()) |line| {
+            if (line.len == 0 or line.len > max_event_bytes) continue;
+            defer _ = scratch.reset(.retain_capacity);
+            const record = io.parse(a, Record, line) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => continue, // The old reader also ignored damaged records.
+            };
+            if (Record == Event) {
+                try putEvent(db, a, record);
+            } else {
+                try putVerdict(db, a, record);
+            }
+        }
+    }
+}
+
 pub fn read(a: io.A, root: std.fs.Dir, query: Query) ![]const Event {
-    return readRecords(a, root, attempt_directory, Event, query);
+    return readRecords(a, root, "telemetry_event", Event, query);
 }
 
 pub fn readVerdicts(a: io.A, root: std.fs.Dir, query: Query) ![]const Verdict {
-    return readRecords(a, root, verdict_directory, Verdict, query);
+    return readRecords(a, root, "review_verdict", Verdict, query);
 }
 
-fn readRecords(a: io.A, root: std.fs.Dir, directory: []const u8, comptime Record: type, query: Query) ![]const Record {
+fn readRecords(a: io.A, root: std.fs.Dir, comptime table: []const u8, comptime Record: type, query: Query) ![]const Record {
     const limit = @min(query.limit, max_query_events);
     if (limit == 0) return &.{};
-    var dir = root.openDir(directory, .{ .no_follow = true }) catch |err| switch (err) {
-        error.FileNotFound => return &.{},
-        else => return err,
-    };
-    defer dir.close();
+    const db = try open(a, root);
+    defer db.close();
+    const select = "SELECT payload FROM " ++ table ++ " WHERE at>=? AND at<=?";
+    const order = " ORDER BY at DESC, rowid DESC LIMIT ?";
     const until = query.now orelse std.time.timestamp();
-    const today = @divFloor(until, std.time.s_per_day);
-    const first = @divFloor(query.since, std.time.s_per_day);
-    var found: std.ArrayList(Record) = .empty;
-    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer scratch.deinit();
-    var day_buffer: std.ArrayList(u8) = .empty;
-    defer day_buffer.deinit(std.heap.page_allocator);
-    var day = today;
-    while (day >= first and found.items.len < limit) : (day -= 1) {
-        var name_buffer: [32]u8 = undefined;
-        const file = openSegment(dir, try segmentName(&name_buffer, day), .{
-            .ACCMODE = .RDONLY,
-            .CLOEXEC = true,
-            .NOFOLLOW = true,
-            .NONBLOCK = true,
-        }) catch |err| switch (err) {
-            error.FileNotFound => continue,
-            else => return err,
-        };
-        defer file.close();
-        try day_buffer.resize(std.heap.page_allocator, @intCast(@min(try file.getEndPos(), max_day_bytes)));
-        const raw = day_buffer.items[0..try file.preadAll(day_buffer.items, 0)];
-        var end = std.mem.lastIndexOfScalar(u8, raw, '\n') orelse continue;
-        while (found.items.len < limit) {
-            const offset = std.mem.lastIndexOfScalar(u8, raw[0..end], '\n');
-            const line = if (offset) |start| raw[start + 1 .. end] else raw[0..end];
-            if (line.len != 0 and line.len <= max_event_bytes) {
-                defer _ = scratch.reset(.retain_capacity);
-                if (std.json.parseFromSliceLeaky(Record, scratch.allocator(), line, .{ .ignore_unknown_fields = true, .allocate = .alloc_if_needed })) |record| {
-                    if (matches(record, query, until)) try found.append(a, try copyRecord(a, record));
-                } else |err| {
-                    if (err == error.OutOfMemory) return err;
-                }
-            }
-            end = offset orelse break;
-        }
+    var rows = if (query.repo != null and query.pr != null)
+        try db.prepare(select ++ " AND repo=? AND number=?" ++ order)
+    else if (query.repo != null)
+        try db.prepare(select ++ " AND repo=?" ++ order)
+    else if (query.pr != null)
+        try db.prepare(select ++ " AND number=?" ++ order)
+    else
+        try db.prepare(select ++ order);
+    defer rows.close();
+    if (query.repo) |repo| {
+        if (query.pr) |pr| try rows.bind(.{ query.since, until, repo, pr, limit }) else try rows.bind(.{ query.since, until, repo, limit });
+    } else if (query.pr) |pr| {
+        try rows.bind(.{ query.since, until, pr, limit });
+    } else {
+        try rows.bind(.{ query.since, until, limit });
     }
+    var found: std.ArrayList(Record) = .empty;
+    while (try rows.step()) try found.append(a, try io.parse(a, Record, rows.bytes(0)));
     return found.toOwnedSlice(a);
 }
 
@@ -273,7 +238,7 @@ const sample: Event = .{
     .effort = .max,
 };
 
-test "interrupted appends recover and later writes leave older days readable" {
+test "legacy complete records import once and later writes leave older days readable" {
     const t = std.testing;
     var scratch = t.tmpDir(.{});
     defer scratch.cleanup();
@@ -283,21 +248,23 @@ test "interrupted appends recover and later writes leave older days readable" {
     const root = scratch.dir;
     var earlier = sample;
     earlier.at = 30 * std.time.s_per_day;
-    try append(a, root, earlier);
-    try append(a, root, sample);
-
+    earlier.id = "earlier attempt";
+    try root.makePath(attempt_directory);
     var dir = try root.openDir(attempt_directory, .{});
     defer dir.close();
-    const file = try dir.openFile("120.jsonl", .{ .mode = .read_write });
-    defer file.close();
-    try file.seekFromEnd(0);
-    try file.writeAll("{\"id\":\"partial");
+    const early_file = try dir.createFile("30.jsonl", .{});
+    try early_file.writeAll(try io.fmt(a, "{s}\n", .{try io.json(a, earlier)}));
+    early_file.close();
+    const file = try dir.createFile("120.jsonl", .{});
+    try file.writeAll(try io.fmt(a, "{s}\n{{\"id\":\"partial", .{try io.json(a, sample)}));
+    file.close();
     try t.expectEqual(@as(usize, 1), (try read(a, root, .{ .since = sample.at, .now = sample.at })).len);
 
     var finish = sample;
     finish.kind = .finished;
     finish.duration_ms = 89;
     finish.outcome = .success;
+    try append(a, root, finish);
     try append(a, root, finish);
     const events = try read(a, root, .{ .since = sample.at, .now = sample.at, .repo = "Example/Repo", .pr = 7 });
     try t.expectEqual(@as(usize, 2), events.len);
@@ -306,6 +273,7 @@ test "interrupted appends recover and later writes leave older days readable" {
     try t.expectEqual(@as(usize, 0), (try read(a, root, .{ .since = sample.at, .now = sample.at, .pr = 99 })).len);
     try t.expectEqual(@as(usize, 1), (try read(a, root, .{ .since = sample.at, .now = sample.at, .limit = 1 })).len);
     finish.at += 91 * std.time.s_per_day;
+    finish.id = "later attempt";
     try append(a, root, finish);
     const history = try read(a, root, .{ .since = earlier.at, .now = finish.at });
     try t.expectEqual(@as(usize, 4), history.len);

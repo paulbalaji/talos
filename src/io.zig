@@ -85,6 +85,12 @@ pub fn temp(a: A) ![:0]const u8 {
     return template;
 }
 
+pub fn tempIn(a: A, path: []const u8) ![:0]const u8 {
+    const template = try std.fs.path.joinZ(a, &.{ path, "pass-XXXXXX" });
+    if (c.mkdtemp(template.ptr) == null) return error.TempDirectory;
+    return template;
+}
+
 pub fn write(dir: std.fs.Dir, name: []const u8, data: []const u8) !void {
     var file = try dir.atomicFile(name, .{ .mode = 0o600, .write_buffer = &.{} });
     defer file.deinit();

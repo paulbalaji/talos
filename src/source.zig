@@ -232,6 +232,15 @@ pub const Git = struct {
         try self.pin(repo_dir, path, pr);
         const merge_base = io.trim(u8, try self.git(path, &.{ "merge-base", pr.baseRefOid, pr.headRefOid }, ""), "\r\n");
         if (!core.validOid(merge_base)) return error.InvalidMergeBase;
+        const source_tree = tree: {
+            const tree_ref = try io.fmt(a, "{s}^{{tree}}", .{pr.headRefOid});
+            const raw = self.git(path, &.{ "rev-parse", "--verify", tree_ref }, "") catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => break :tree null,
+            };
+            const oid = io.trim(u8, raw, "\r\n");
+            break :tree if (core.validOid(oid)) oid else null;
+        };
 
         const priorities = self.diff_priority orelse try priorityPaths(a, threads);
         const ordered = try prioritizeFiles(a, files, priorities);
@@ -341,7 +350,10 @@ pub const Git = struct {
             .relayer_promotion = image.promotion,
             .optional_evidence_start = image.optional_start,
             .onchain_reads = onchain_reads,
-            .large_diff = if (prefix.len == patch.len) null else .{ .patch = patch, .start = diff_start, .end = diff_end },
+            .diff = .{ .patch = patch, .start = diff_start, .end = diff_end },
+            .missing_changed_files = sensitive_count + patch_count + invalid_path_count,
+            .base_sensitive = core.registryMain(self.object_cache.repo, pr) or image.optional_start != null,
+            .source_tree = source_tree,
             .diff_priority = priorities,
             .thread_evidence = try a.dupe(u8, evidence.items[0 .. diff_start - "Merge-base diff:\n".len]),
         };

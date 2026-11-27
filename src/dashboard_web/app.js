@@ -29,6 +29,18 @@ const labelNames = {
   synthesis: "Synthesis",
   uncertain: "Checking publication",
   verified: "Published",
+  preview: "Preview",
+  success: "Finished",
+  interrupted: "Interrupted",
+  timed_out: "Timed out",
+  rate_limited: "Rate limited",
+  no_material_change: "No material change",
+  repeated_finding: "Finding already reported",
+  already_published: "Already published",
+  ready_to_publish: "Publication pending",
+  repository_policy: "Repository publishing policy",
+  own_pr: "Self approval excluded",
+  insufficient_evidence: "Insufficient evidence",
 };
 
 let view = "queue";
@@ -193,6 +205,8 @@ function replace(container, content) {
   if (tooltipAnchor && container.contains(tooltipAnchor)) hideTooltip();
   const focus = document.activeElement;
   const key = container.contains(focus) ? focus?.dataset?.reviewKey : null;
+  const opened = new Set([...container.querySelectorAll("details[data-detail-id][open]")].map((item) => item.dataset.detailId));
+  for (const item of content.querySelectorAll("details[data-detail-id]")) item.open = opened.has(item.dataset.detailId);
   container.replaceChildren(content);
   if (key) {
     const next = Array.from(container.querySelectorAll("[data-review-key]")).find((node) => node.dataset.reviewKey === key);
@@ -286,23 +300,48 @@ function syncRefreshIndicator() {
 function chooseStage(job, now) {
   const active = list(job.active_providers);
   const stage = humanize(job.stage);
-  if (job.phase === "complete" || job.phase === "baseline") {
-    return { title: job.phase === "baseline" ? "Baselined" : "Complete", tone: job.phase === "complete" ? "good" : "" };
+  const verdict = job.verdict;
+  if (job.phase === "baseline") return { title: "Baselined" };
+  if (job.phase === "complete") {
+    const publication = verdict?.publication;
+    const reason = verdict?.disposition;
+    const detail = publication === "verified" ? "Published" : publication === "local" ?
+      reason && reason !== "insufficient_evidence" ? humanize(reason) : "Local only" : "";
+    if (publication === "pending") return { title: "Publication pending", tone: "warning" };
+    if (verdict?.coverage_complete === false) return { title: "Limited coverage", tone: "warning", detail };
+    if (verdict?.coverage_complete === true) {
+      return { title: publication === "verified" && verdict.event === "APPROVE" ? "Approved" : "Reviewed", tone: "good", detail };
+    }
+    return { title: "Review finished", detail };
   }
   if (job.phase === "failed") return { title: "Failed", tone: "error", detail: humanize(job.last_error) };
-  if (job.phase === "uncertain") return { title: "Checking publication", tone: "warning" };
   if (active.length) {
     const shared = [...new Set(active.map((provider) => humanize(provider.stage)).filter(Boolean))];
-    return { title: "Running", tone: "active", detail: shared.length === 1 ? shared[0] : (stage === "Reviewing" ? "" : stage) };
+    return { title: "Running", tone: "active", detail: shared.length === 1 ? shared[0] : "Multiple passes" };
+  }
+  if (job.wait === "stack_publication") {
+    return { title: "Waiting to publish", detail: job.blocked_by ? `Depends on #${job.blocked_by}` : "Pinned heads changed" };
   }
   if (job.blocked_by) return { title: "Waiting for stack", detail: `Depends on #${job.blocked_by}` };
-  if (stage === "Paused" || snapshot?.repos?.some((repo) => sameRepo(repo.name, job.repo) && repo.paused)) {
+  if (job.wait === "stack") return { title: "Waiting for stack", detail: "Pinned heads changed" };
+  if (job.wait === "receipt_exhausted") {
+    return { title: "Publication unconfirmed", tone: "warning", detail: "Retries exhausted" };
+  }
+  if (job.wait === "paused" || stage === "Paused" || snapshot?.repos?.some((repo) => sameRepo(repo.name, job.repo) && repo.paused)) {
     return { title: "Paused", tone: "warning" };
   }
-  if (job.next_at > now) {
-    return { title: job.attempts > 0 ? "Retry scheduled" : "Scheduled", tone: "warning", detail: date(job.next_at) };
+  const eligible = job.eligible_at ?? job.next_at;
+  if (job.phase === "uncertain") {
+    return { title: "Checking publication", tone: "warning", detail: eligible > now ? `Next check ${date(eligible)}` : "" };
   }
-  return { title: stage && stage !== "Pending" ? stage : "Queued", detail: job.last_error ? humanize(job.last_error) : "" };
+  if (job.wait === "more_providers") return { title: "Needs another provider", tone: "warning" };
+  if (job.wait === "unavailable") return { title: "Waiting for reviewer", tone: "warning" };
+  if (eligible > now) {
+    const delay = job.wait === "github_cooldown" ? "GitHub cooldown" :
+      job.wait === "provider_cooldown" ? "Reviewer cooldown" : job.attempts > 0 ? "Retry scheduled" : "Scheduled";
+    return { title: delay, tone: "warning", detail: date(eligible) };
+  }
+  return { title: stage && stage !== "Pending" ? stage : "Queued", detail: job.attempts > 0 ? humanize(job.last_error) : "" };
 }
 
 function phaseLabel(status) {
@@ -329,7 +368,7 @@ function progressLabel(job, inspect = true) {
     const bar = element("progress");
     bar.value = percent;
     bar.max = 100;
-    bar.setAttribute("aria-label", `Review progress for #${job.number}`);
+    bar.setAttribute("aria-label", `Planned diff sections reviewed for #${job.number}`);
     track.append(bar);
     if (percent > 0 && percent < 100 && list(job.active_providers).length > 0) {
       const shimmer = element("span", "progress-shimmer");
@@ -405,7 +444,7 @@ function reviewKey(item, head = null, showDetails = true, stack = null) {
   label.type = "button";
   label.setAttribute("aria-label", `Review details for ${item.repo} #${item.number}`);
   label.dataset.reviewKey = phrase([keyOf(item.repo, item.number), head, item.at]);
-  label.addEventListener("click", () => openReview(item.repo, item.number, head, item.at ?? null, item.review_id ?? null));
+  label.addEventListener("click", () => openReview(item.repo, item.number, head, item.at ?? null, item.review_id ?? null, item.review_key ?? null));
   if (showDetails && item.title) {
     const line = element("div", "review-keyline");
     line.append(label, element("span", "review-title", item.title));
@@ -482,8 +521,9 @@ function renderQueue() {
   }
   const active = jobs.filter((job) => !["baseline", "complete"].includes(job.phase));
   const running = active.filter((job) => list(job.active_providers).length > 0);
-  const pending = active.filter((job) => job.phase === "pending" && !list(job.active_providers).length).length;
-  const totals = [["Running", running.length], ["Queued", pending], ["Failed", active.filter((job) => job.phase === "failed").length]];
+  const attention = active.filter((job) => job.phase === "failed" || ["receipt_exhausted", "more_providers"].includes(job.wait)).length;
+  const pending = active.length - running.length - attention;
+  const totals = [["Running", running.length], ["Waiting", pending], ["Attention", attention]];
   if (snapshot) update("queue-summary", totals, () => {
     byId("queue-summary").replaceChildren(...totals.map(([label, amount]) => {
       const field = element("span", "queue-stat");
@@ -497,7 +537,7 @@ function renderQueue() {
   const now = snapshot?.at || 0;
   const rank = (job) => {
     if (list(job.active_providers).length) return 0;
-    if (job.phase === "pending") return job.blocked_by ? 3 : job.next_at > now ? 2 : 1;
+    if (job.phase === "pending") return job.blocked_by ? 3 : (job.eligible_at ?? job.next_at) > now ? 2 : 1;
     return { uncertain: 2, failed: 4, complete: 5, baseline: 6 }[job.phase] ?? 7;
   };
   const ordered = [...selected].sort((first, second) => rank(first) - rank(second) ||
@@ -511,9 +551,13 @@ function renderQueue() {
   });
 
   const activeKeys = new Set(active.map((job) => keyOf(job.repo, job.number)));
+  const stackJobs = new Map(jobs.filter((job) => job.phase !== "uncertain").map((job) => [keyOf(job.repo, job.number), job]));
   const stacks = list(snapshot?.stacks).filter((stack) => list(stack.members).some((member) => activeKeys.has(keyOf(stack.repo, member.number))));
   byId("stacks-panel").hidden = !stacks.length;
-  update("stacks", stacks, () => {
+  update("stacks", stacks.map((stack) => [stack, list(stack.members).map((member) => {
+    const job = stackJobs.get(keyOf(stack.repo, member.number));
+    return [job?.blocked_by, job?.publication_blocked_by, job?.wait];
+  })]), () => {
     const group = element("div", "stack-items");
     for (const stack of stacks) {
       const details = element("details", `stack ${stackAccent(stack.repo, stack.number || stack.name)}`);
@@ -528,7 +572,11 @@ function renderQueue() {
       const members = element("ol", "stack-list");
       for (const member of list(stack.members)) {
         const row = element("li", null);
-        const state = phrase([humanize(member.phase), member.draft && "Draft", member.blocked_by && `Depends on #${member.blocked_by}`]);
+        const job = stackJobs.get(keyOf(stack.repo, member.number));
+        const state = phrase([humanize(member.phase), member.draft && "Draft",
+          job?.publication_blocked_by && (!job.blocked_by || job.wait === "stack_publication") ?
+            `Publish after #${job.publication_blocked_by}` :
+            member.blocked_by && `Depends on #${member.blocked_by}`]);
         row.append(reviewKey({ ...member, repo: stack.repo }, null, false), element("span", "phase-note", state));
         members.append(row);
       }
@@ -542,14 +590,18 @@ function renderQueue() {
 function renderRepos() {
   const repos = list(snapshot?.repos);
   byId("repo-count").textContent = count(repos.length);
-  const rows = repos.map((repo) => ({ ...repo, label: repo.paused ? "Paused" : repo.last_scan_at > 0 ?
+  const rows = repos.map((repo) => ({ ...repo, label: repo.paused ? "Paused" : repo.scan_attempts > 0 ? "Scan delayed" : repo.last_scan_at > 0 ?
     `Scanned ${age(repo.last_scan_at, snapshot.at)}` : "Awaiting first scan" }));
   update("repos", rows, () => {
     const nodes = document.createDocumentFragment();
     for (const repo of rows) {
       const description = element("span", "repo-status", repo.label);
-      if (repo.paused) description.dataset.tone = "warning";
-      if (repo.last_scan_at > 0) description.title = date(repo.last_scan_at);
+      if (repo.paused || repo.scan_attempts > 0) description.dataset.tone = "warning";
+      description.title = phrase([
+        repo.last_scan_at > 0 && `Last scan ${date(repo.last_scan_at)}`,
+        repo.scan_error && humanize(repo.scan_error),
+        repo.scan_attempts > 0 && repo.next_scan_at > 0 && `Next scan ${date(repo.next_scan_at)}`,
+      ]);
       const item = element("li");
       item.append(element("span", "repo-name", repo.name), description);
       nodes.append(item);
@@ -588,6 +640,7 @@ function historyVerdict(row) {
     ["Head", row.head?.slice(0, 12)], ["Depth", humanize(row.route)],
     ["Coverage", row.complete === true ? "Complete" : row.complete === false ? "Limited" : "Unknown"],
     ["Publication", humanize(row.publication)], ["GitHub review", row.review_id ? `#${row.review_id}` : ""], ["Saved", date(row.at)],
+    ["Disposition", humanize(row.disposition)],
   ]);
 }
 
@@ -595,11 +648,12 @@ function renderHistory() {
   const history = list(historySnapshot);
   const desired = byId("history-filter").value;
   const filtered = filterRows(history, byId("history-search").value).filter((item) => {
-    const published = item.publication === "verified" || item.publication === "published";
-    return desired === "" || (desired === "published" ? published : !published);
+    const publication = item.publication === "verified" ? "published" : item.publication;
+    return desired === "" || publication === desired;
   });
   const ordered = [...filtered].sort((first, second) => second.at - first.at || second.number - first.number);
-  byId("history-summary").textContent = history.length ? plural(history.length, "saved verdict") : "Saved verdicts";
+  byId("history-summary").textContent = history.length ?
+    `${historyTruncated ? "Latest " : ""}${plural(history.length, "saved verdict")}` : "Saved verdicts";
   update("history", ordered, () => {
     replace(byId("history-results"), renderTable(["Pull request", "Verdict", "Depth", "Coverage", ["Saved", "time-cell"]], ordered.map((item) => [
       reviewKey(item, item.head), historyVerdict(item), humanize(item.route) || "—",
@@ -707,7 +761,11 @@ function renderMetrics() {
       metric("Model calls", metrics.attempts, observations),
       metric("Reported tokens", batchAmount(metrics.input_tokens, metrics.output_tokens),
         metrics.reported > 0 ? `${count(metrics.input_tokens)} input · ${count(metrics.output_tokens)} output` : "No provider counts in this period"),
-      metric("Saved reviews", metrics.review_count, "Local and published verdicts")
+      metric("Saved verdicts", metrics.review_count,
+        Number.isFinite(metrics.review_published) ? `${count(metrics.review_published)} published` : "Local and published"),
+      metric("Reviewed heads", metrics.reviewed_heads, metrics.coverage ?
+        phrase([`${count(metrics.coverage.complete)} complete`, `${count(metrics.coverage.limited)} limited`,
+          metrics.coverage.unknown > 0 && `${count(metrics.coverage.unknown)} unknown`]) : "")
     );
     content.append(totals);
 
@@ -780,7 +838,10 @@ function renderMetrics() {
     daily.append(chart, explanation);
     if (series.length) {
       const details = element("details");
-      details.append(element("summary", null, "View daily totals"));
+      details.dataset.detailId = "daily-totals";
+      const summary = element("summary", null, "View daily totals");
+      summary.dataset.reviewKey = "daily-totals-summary";
+      details.append(summary);
       details.append(tableBox(renderTable(["UTC day", ["Calls", "numeric"], ["Token reports", "numeric"], ["Input tokens", "numeric"], ["Output tokens", "numeric"]],
         series.map((point) => [chartDay(point.day), count(point.attempts), count(point.reported), count(point.input_tokens), count(point.output_tokens)]),
         "No daily activity.")));
@@ -793,12 +854,14 @@ function renderMetrics() {
     providerTitle.append(element("h2", null, "CLI calls by invocation profile"));
     providers.append(providerTitle, tableBox(renderTable([
       "Provider / model", ["Calls", "numeric"], ["Failures", "numeric"], ["Token reports", "numeric"],
-      ["Input tokens", "numeric"], ["Output tokens", "numeric"], ["Mean duration", "numeric"],
+      ["Input tokens", "numeric"], ["Output tokens", "numeric"], ["Median / p95", "numeric"],
     ], list(metrics.providers).map((item) => [
       providerLabel(item.engine, item.model), count(item.attempts), count(item.failures),
       `${count(item.reported)} / ${count(item.attempts)}`,
-      count(item.input_tokens), count(item.output_tokens), duration(item.mean_duration_ms),
+      count(item.input_tokens), count(item.output_tokens), item.measured > 0 ?
+        `${duration(item.p50_duration_ms)} / ${duration(item.p95_duration_ms)}` : "—",
     ]), "Provider calls will appear here as they finish.")));
+    providers.append(element("p", "chart-guide", "Latency uses calls with recorded durations. Failures include rate limits, timeouts, and interrupted calls."));
     content.append(providers);
 
     const modelUsage = list(metrics.models);
@@ -828,6 +891,7 @@ function renderMetrics() {
       { label: "Review stages", list: list(metrics.stages), name: "stage", value: "attempts" },
       { label: "Review depth", list: list(metrics.routes), name: "route", value: "count" },
       { label: "Review mode", list: list(metrics.modes), name: "mode", value: "count" },
+      { label: "CLI call outcomes", list: list(metrics.outcomes), name: "outcome", value: "attempts" },
     ];
     const group = element("div", "metrics-splits");
     for (const split of splits) {
@@ -852,16 +916,35 @@ function reviewVerdict(result, target) {
   if (!result || !target.head) return result;
   const all = [result, ...list(result.history)];
   if (target.reviewId != null) {
-    const exact = all.find((candidate) => candidate.explanation?.github_review_id === target.reviewId);
-    if (exact) return exact;
+    return all.find((candidate) => candidate.commit_id === target.head && candidate.explanation?.github_review_id === target.reviewId) || null;
   }
-  return all.find((candidate) => candidate.commit_id === target.head && candidate.explanation?.at === target.at) ||
-    all.find((candidate) => candidate.commit_id === target.head) || null;
+  if (target.reviewKey != null) {
+    return all.find((candidate) => candidate.commit_id === target.head &&
+      candidate.explanation?.followup_id === target.reviewKey) || null;
+  }
+  return all.find((candidate) => candidate.commit_id === target.head && (target.at == null ||
+    candidate.explanation?.at === target.at || (candidate === result && !candidate.explanation))) || null;
+}
+
+function planSummary(plan) {
+  return phrase([
+    plan.scope === "discussion" && "Discussion follow-up",
+    plan.scope === "publication" && "Ready for review",
+    plan.required_source_units > 0 && plan.scope === "full" &&
+      `${count(plan.planned_source_units)} of ${count(plan.required_source_units)} diff entries planned`,
+    plan.reused_source_units > 0 && `${count(plan.reused_source_units)} reused`,
+    plan.open_human_threads > 0 && plural(plan.open_human_threads, "open human thread"),
+    plan.missing_changed_files > 0 && plural(plan.missing_changed_files, "changed file missing from the diff", "changed files missing from the diff"),
+  ]);
 }
 
 function renderCoverage(coverage, blockers) {
   const section = element("section", "detail-section");
   section.append(element("h3", null, coverage.complete ? "Coverage complete" : "Coverage limited"));
+  if (coverage.coverage_plan) {
+    const summary = planSummary(coverage.coverage_plan);
+    if (summary) section.append(element("p", "detail-meta", summary));
+  }
   const gaps = [...list(coverage.snapshot_reasons), ...list(coverage.historical_reasons)];
   if (coverage.supplemental_limited) gaps.push("Some requested source excerpts were unavailable or exceeded the evidence budget.");
   if (coverage.truncated_open_threads > 0) gaps.push(plural(coverage.truncated_open_threads, "truncated open thread"));
@@ -897,7 +980,7 @@ function renderDetail(data, target) {
   const top = element("div", "detail-heading");
   const jobsLabel = job ? phaseLabel(chooseStage(job, snapshot?.at || Math.floor(Date.now() / 1000))) :
     element("span", "minor", data.tracked ? "Tracked" : "No queue entry");
-  const link = gitHubLink(target.repo, target.number, result?.explanation?.github_review_id);
+  const link = gitHubLink(target.repo, target.number, result?.explanation?.github_review_id ?? target.reviewId);
   top.append(jobsLabel);
   if (link) top.append(link);
   holder.append(top);
@@ -908,8 +991,20 @@ function renderDetail(data, target) {
     if (job.draft) details.append(element("span", null, "Draft"));
     if (job.stack) details.append(element("span", null, `Stack #${job.stack}`));
     if (job.all_models) details.append(element("span", null, "All models"));
+    if (job.route) details.append(element("span", null, humanize(job.route)));
     if (job.attempts > 0) details.append(element("span", null, plural(job.attempts, "retry", "retries")));
     holder.append(details);
+    if (job.last_error && (job.phase === "failed" || job.attempts > 0)) {
+      holder.append(element("p", "detail-note", phrase([humanize(job.last_error),
+        job.last_error_at > 0 && date(job.last_error_at)])));
+    }
+    if (job.coverage_plan && !result?.explanation?.coverage?.coverage_plan) {
+      const summary = planSummary(job.coverage_plan);
+      if (summary) holder.append(element("p", "detail-note", summary));
+    }
+    if (job.publication_blocked_by && !job.blocked_by) {
+      holder.append(element("p", "detail-note", `Publication waits on stack PR #${job.publication_blocked_by}.`));
+    }
     if (Number.isFinite(job.percent) || job.total_sections > 0) holder.append(progressLabel(job, false));
     const active = list(job.active_providers);
     if (active.length) holder.append(providersLabel(active, job.all_models));
@@ -919,10 +1014,12 @@ function renderDetail(data, target) {
     const section = element("section", "detail-section");
     const explanation = result.explanation;
     const status = historyStatus({ ...result, publication: explanation?.publication });
-    const older = job?.head && job.head !== result.commit_id;
+    const older = job?.head && (job.head !== result.commit_id ||
+      (job.review_key || "") !== (result.explanation?.followup_id || ""));
     section.append(element("h3", null, older ? "Previous saved verdict" : "Saved verdict"));
     section.append(element("p", "detail-meta", phrase([
       status, result.commit_id?.slice(0, 10), humanize(explanation?.route), explanation?.at && date(explanation.at),
+      explanation?.disposition !== "posted" && humanize(explanation?.disposition),
     ])));
     if (result.body) section.append(element("p", "detail-body-text", result.body));
     else if (!Object.hasOwn(result, "body")) section.append(element("p", "chart-guide", "This earlier verdict retains its summary only."));
@@ -936,8 +1033,15 @@ function renderDetail(data, target) {
     if (explanation?.coverage) holder.append(renderCoverage(explanation.coverage, list(explanation.blockers)));
   } else {
     const section = element("section", "detail-section");
-    section.append(element("h3", null, "Saved verdict"),
-      element("p", "minor", target.head ? "No retained verdict for this selection." : "No saved verdict yet."));
+    section.append(element("h3", null, "Saved verdict"));
+    const retained = target.head ? null : job?.verdict;
+    if (retained) {
+      section.append(element("p", "detail-meta", phrase([
+        historyStatus(retained), retained.at && date(retained.at), humanize(retained.disposition),
+      ])));
+    } else {
+      section.append(element("p", "minor", target.head ? "No retained verdict for this selection." : "No saved verdict yet."));
+    }
     holder.append(section);
   }
 
@@ -945,17 +1049,22 @@ function renderDetail(data, target) {
   const attempts = list(data.attempts);
   if (data.usage?.attempts > 0 || groups.length || attempts.length) {
     const exactHead = target.head || job?.head || result?.commit_id;
-    const exactKey = result && result.commit_id === exactHead ? result.explanation?.followup_id : null;
+    const exactKey = target.head ?
+      target.reviewKey ?? result?.explanation?.followup_id ?? "" :
+      job?.review_key ?? result?.explanation?.followup_id ?? "";
     const headUsage = groups.filter((group) => group.head === exactHead);
-    const current = exactKey != null ? headUsage.find((group) => group.review_key === exactKey) :
-      headUsage.length === 1 ? headUsage[0] : null;
+    const current = headUsage.find((group) => (group.review_key || "") === exactKey && group.mode === "scheduled");
     const section = element("section", "detail-section");
     section.append(element("h3", null, "Reviewer usage"));
+    if (data.activity_truncated) section.append(element("p", "chart-guide", "Showing the newest recorded activity."));
     if (data.usage?.attempts > 0) section.append(element("p", "detail-meta", `All heads · ${usagePhrase(data.usage)}`));
     if (current) section.append(element("p", "detail-meta", `Selected review · ${usagePhrase(current.totals)}`));
     if (groups.length > 1 || (!current && groups.length)) {
       const revisions = element("details", "detail-section");
-      revisions.append(element("summary", null, "Review runs"));
+      revisions.dataset.detailId = "runs";
+      const summary = element("summary", null, "Review runs");
+      summary.dataset.reviewKey = "review-run-summary";
+      revisions.append(summary);
       revisions.append(tableBox(renderTable(["Head / mode", ["Calls", "numeric"], ["Token reports", "numeric"], ["Reported tokens", "numeric"]], groups.map((group) => [
         phrase([group.head?.slice(0, 10), humanize(group.mode), date(group.at)]), count(group.totals?.attempts),
         count(group.totals?.reported), count(batchAmount(group.totals?.input_tokens, group.totals?.output_tokens)),
@@ -963,15 +1072,18 @@ function renderDetail(data, target) {
       section.append(revisions);
     }
 
-    const relevant = attempts.filter((item) => {
-      if (!target.head || !item.head) return true;
-      return item.head === target.head && (exactKey == null || item.review_key === exactKey);
-    });
+    const relevant = attempts.filter((item) =>
+      item.head === exactHead && (item.review_key || "") === exactKey && item.mode === "scheduled");
     if (relevant.length > 0) {
-      const table = tableBox(renderTable(["Provider / stage", ["Duration", "numeric"], ["Input", "numeric"], ["Output", "numeric"]], relevant.map((item) => {
+      const table = tableBox(renderTable(["Provider / stage", "Outcome", ["Started", "time-cell"], ["Duration", "numeric"], ["Input", "numeric"], ["Output", "numeric"]], relevant.map((item) => {
         const info = element("div");
         info.append(providerLabel(item.engine, item.model));
-        info.append(element("span", "phase-note", phrase([humanize(item.stage), item.section != null && `Section ${item.section}`, humanize(item.outcome)])));
+        info.append(element("span", "phase-note", phrase([humanize(item.stage), item.section != null && `Section ${item.section}`])));
+        const outcome = phaseLabel({
+          title: humanize(item.outcome),
+          detail: item.error_name && humanize(item.error_name),
+          tone: item.outcome === "running" ? "active" : item.outcome === "success" ? "" : "warning",
+        });
         const models = list(item.model_usage);
         if (models.length > 1 || (models.length === 1 && models[0].model !== item.model)) {
           for (const model of models) {
@@ -981,7 +1093,7 @@ function renderDetail(data, target) {
             info.append(element("span", "phase-note", phrase([model.model, usage])));
           }
         }
-        return [info, duration(item.duration_ms), count(item.tokens?.input), count(item.tokens?.output)];
+        return [info, outcome, date(item.at), duration(item.duration_ms), count(item.tokens?.input), count(item.tokens?.output)];
       }), "No model calls for this review."));
       table.classList.add("detail-section");
       section.append(table);
@@ -990,7 +1102,7 @@ function renderDetail(data, target) {
   }
   const container = byId("detail-body");
   const scroll = container.scrollTop;
-  container.replaceChildren(holder);
+  replace(container, holder);
   container.scrollTop = scroll;
 }
 
@@ -1012,9 +1124,9 @@ function refreshDetail() {
   });
 }
 
-function openReview(repo, number, head = null, at = null, reviewId = null) {
+function openReview(repo, number, head = null, at = null, reviewId = null, reviewKey = null) {
   if (!repoPattern.test(repo) || !validNumber(number)) return;
-  detailSelection = { repo, number, head, at, reviewId };
+  detailSelection = { repo, number, head, at, reviewId, reviewKey };
   renderKeys.delete("detail");
   byId("detail-repo").textContent = repo;
   byId("detail-title").textContent = `Pull request #${number}`;
@@ -1185,6 +1297,7 @@ async function queueReview(event) {
 }
 
 let historySnapshot = null;
+let historyTruncated = false;
 
 function refreshState() {
   const wantsHistory = view === "history";
@@ -1196,7 +1309,10 @@ function refreshState() {
   flight.promise = request(path).then((data) => {
     if (stateRequest !== flight) return;
     snapshot = data;
-    if (wantsHistory) historySnapshot = list(data.history);
+    if (wantsHistory) {
+      historySnapshot = list(data.history);
+      historyTruncated = data.history_truncated === true;
+    }
     setConnection(true);
     if (view === "queue") {
       renderQueue();

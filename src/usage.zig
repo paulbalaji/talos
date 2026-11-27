@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("core.zig");
 const io = @import("io.zig");
+const sqlite = @import("sqlite.zig");
 
 pub const Provider = struct {
     limit: u32 = 0,
@@ -37,13 +38,12 @@ pub const Snapshot = struct {
     }
 };
 
-const filename = "usage.json";
+const setting = "provider_usage";
 
 pub fn load(a: io.A, dir: std.fs.Dir, now: i64) !Snapshot {
-    const raw = dir.readFileAlloc(a, filename, 16 * 1024) catch |err| switch (err) {
-        error.FileNotFound => return .{},
-        else => return err,
-    };
+    const db = try sqlite.Db.open(a, dir);
+    defer db.close();
+    const raw = (try db.setting(a, setting)) orelse return .{};
     defer a.free(raw);
     var data = try io.parse(a, Snapshot, raw);
     data.roll(now);
@@ -51,7 +51,24 @@ pub fn load(a: io.A, dir: std.fs.Dir, now: i64) !Snapshot {
 }
 
 pub fn save(dir: std.fs.Dir, data: Snapshot) !void {
-    try io.writeJson(dir, filename, data);
+    const a = std.heap.page_allocator;
+    const db = try sqlite.Db.open(a, dir);
+    defer db.close();
+    const json = try io.json(a, data);
+    defer a.free(json);
+    try db.setSetting(setting, json);
+}
+
+pub fn migrate(db: sqlite.Db, dir: std.fs.Dir) !void {
+    if (try db.hasSetting(setting)) return;
+    const a = std.heap.page_allocator;
+    const raw = dir.readFileAlloc(a, "usage.json", 16 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer a.free(raw);
+    _ = try io.parse(a, Snapshot, raw);
+    try db.setSetting(setting, raw);
 }
 
 pub const Ledger = struct {

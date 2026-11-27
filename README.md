@@ -8,7 +8,7 @@ Talos baselines existing PRs and picks up new PRs and new heads. Existing drafts
 
 ## Use Talos
 
-You need Zig 0.15.2, Git, GitHub CLI with `gh api --slurp`, and one reviewer CLI. On macOS, install the Xcode Command Line Tools. On Linux, run `talos tick` from your scheduler.
+You need Zig 0.15.2, Git, GitHub CLI with `gh api --slurp`, SQLite, and one reviewer CLI. On macOS, SQLite comes with the system and Zig uses the Xcode Command Line Tools. On Linux, install the SQLite runtime library (`libsqlite3.so.0`) and run `talos tick` from your scheduler.
 
 ```sh
 git clone https://github.com/paulbalaji/talos.git
@@ -62,7 +62,7 @@ talos status                          # See scans, queue, errors, and cache size
 
 ### Monitor reviews locally
 
-The local dashboard shows tracked jobs, active reviewers, and completed source sections. The displayed percentage counts completed sections. Reviewers working on a section can still require additional evidence or synthesis. Stack badges show each PR's position from the bottom of the stack. [Open the local dashboard](http://127.0.0.1:8749).
+The local dashboard shows tracked jobs, active reviewers, and completed source sections. It also shows coverage gaps, retry times, stack dependencies, and the publication decision for saved reviews. The displayed percentage counts completed sections. Reviewers working on a section can still require additional evidence or synthesis. Stack badges show each PR's position from the bottom of the stack. [Open the local dashboard](http://127.0.0.1:8749).
 
 Hover over a progress bar, a saved verdict, or a day on the usage chart for a breakdown. The same details are available with keyboard focus, and the arrow keys move between chart days.
 
@@ -74,9 +74,9 @@ The README screenshots use simulated repositories and review activity.
 
 The dashboard binds to loopback. Browser queue writes require a matching local origin. Keep it on the machine running Talos. Use `talos dashboard remove` to stop the macOS service, or `talos dashboard --port 8750` to run on another local port.
 
-Talos keeps local attempt and verdict metadata indefinitely in daily files. Attempt records include repository, PR, head, stage, reviewer, model, elapsed time, outcome, and provider-reported tokens when available. The dashboard gives totals by PR and review, and shows advisor model usage separately when the CLI attributes it. Cached input and reasoning tokens are parts of the corresponding input and output totals. The recorded-token share shows how much of the selected range can support token totals. CLI versions with no reported usage still contribute attempt counts. Previously saved verdicts appear in history, and token history begins when the telemetry-enabled watcher starts recording.
+Talos keeps local attempt and verdict metadata indefinitely in SQLite. Attempt records include repository, PR, head, stage, reviewer, model, elapsed time, outcome, and provider-reported tokens when available. The dashboard gives totals by PR and review, and shows advisor model usage separately when the CLI attributes it. Cached input and reasoning tokens are parts of the corresponding input and output totals. The recorded-token share shows how much of the selected range can support token totals. CLI versions with no reported usage still contribute attempt counts. Previously saved verdicts appear in history, and token history begins when the telemetry-enabled watcher starts recording.
 
-The Usage view defaults to 30 days and offers up to 365 days. `talos metrics --days` accepts up to 3,650 days. Queries cap the number of records they read and flag partial totals. Use `talos metrics --days 30 --offset 90` for a 30-day window ending 90 UTC days ago. Talos caps each daily metadata file at 1 MiB.
+The Usage view defaults to 30 days and offers up to 365 days. `talos metrics --days` accepts up to 3,650 days. Queries cap the number of records they read and flag partial totals. Use `talos metrics --days 30 --offset 90` for a 30-day window ending 90 UTC days ago.
 
 ### Focus a review
 
@@ -94,11 +94,11 @@ After a review, Talos checks for substantive PR conversation, human replies to r
 
 Talos puts files with active review threads and risky code early in the bounded diff. It also reads pinned source around current right-side thread anchors. Incomplete current evidence and unassessed open threads prevent approval. Reviewers can still approve when the current head is fully covered and the only gap is a clipped historical delta.
 
-Scheduled reviews split large diffs on Git hunk boundaries. A large hunk can use its own section. If the prompt runs out of room, Talos shortens resolved and fully automated threads before dropping source. Hunks outside the section limits keep coverage incomplete. Adaptive rereviews can use one routing pass to consider the previous verdict, available delta, and current discussion. All source sections reuse that decision. Talos checkpoints completed sections and combines their verdicts before it publishes one review. During model runs, the watcher continues scanning due repos and accepts new queue requests.
+Scheduled reviews split large diffs on Git hunk boundaries. A large hunk can use its own section. If the prompt runs out of room, Talos shortens resolved and fully automated threads and can review some sections as source only. Those sections cannot clear open threads. Hunks outside the section limits keep coverage incomplete. Adaptive rereviews can use one routing pass to consider the previous verdict, available delta, and current discussion. All source sections reuse that decision. Talos checkpoints completed sections and combines their verdicts before it publishes one review. During model runs, the watcher continues scanning due repos and accepts new queue requests.
 
-All-model reviews can run up to three source sections at once within the configured reviewer start budget. Each section keeps its own checkpoint and temporary reviewer directories.
+Once Talos decides the review scope, it can run up to three independent source sections at once within the configured reviewer start budget. Each section keeps its own checkpoint and temporary reviewer directories.
 
-For a sectioned review on the same pinned source, new discussion leaves completed source work intact. New human discussion or edits to the PR description get a focused follow-up pass before publication. Automated threads can inform remaining passes. They do not require a new pass on their own.
+For a sectioned review on the same pinned source, new discussion leaves completed source work intact. New human discussion or edits to the PR description get a focused follow-up pass before publication. Automated threads can inform remaining passes. They do not require a new pass on their own. A clean draft with unchanged source and discussion can reuse its review when marked ready.
 
 A new thread containing only automated replies does not invalidate an in-flight review. Edits to reviewed threads and new human threads still require current inputs.
 
@@ -298,15 +298,15 @@ launchctl print "gui/$(id -u)/dev.talos.watcher"
 talos status --json
 ```
 
-The state directory is `~/.local/state/talos`. One process holds its lock at a time. Each tick admits up to three independent PRs per repo across five repos. Model reviews run in parallel. One coordinator collects source, updates state, and handles GitHub publication. PRs in a stack still wait for queued ancestors. `state.json` holds reviewer defaults, the baseline, queue, stacks, publication receipts, and recent errors. `repos/OWNER/REPO/results/` holds candidate reviews. Check `launchd.log` for scheduler errors.
+The state directory is `~/.local/state/talos`. The private `talos.sqlite3` database holds configuration, the queue, provider counts, review results, and publication receipts. Stop the old watcher and dashboard before upgrading from v1 and take a copy of the state directory. The first v2 command imports legacy files in one transaction. After cutover, use the CLI or dashboard to read current state. Check `launchd.log` for scheduler errors.
 
-Adaptive multi reviews also run independent provider passes concurrently within their start budget. The providers share one pinned source snapshot. Each process uses its own scratch directory under the job's temporary directory. Talos removes that directory when the job exits. Evidence collection and synthesis run between the independent passes.
+One coordinator collects pinned source, updates state, and handles GitHub publication. It can refill idle review slots during a running batch, with up to three concurrent PRs per repo across five repos and three concurrent calls per provider. Independently pinned native stack members can collect source evidence in parallel. Publication waits for required ancestor review decisions and reassesses changed ancestor evidence. Valid review and screening responses are recoverable for seven days when the review generation and model input match exactly. Temporary reviewer directories are cleaned on completion and recovered on startup under the provider batch lock.
 
 Ordinary reviewer calls have a 15-minute timeout. Full calls in all-model reviews can run for up to 30 minutes per provider call.
 
 Talos rotates `launchd.log` on the next tick after a UTC day boundary or when it reaches 1 MiB. It keeps up to 30 days and 10 MiB across the active log and its archives, with newer diagnostics taking priority. The scheduler also reports the last 12 errors per repo through `talos status`. Log retention only applies to scheduler diagnostics.
 
-The machine budget defaults to 15 reviewer starts per tick for new installs. Existing installs keep their saved limit. A PR with two configured reviewers reserves two starts. The same limit applies separately to receipt lookups, which use GitHub calls and zero reviewer starts. Set it with `talos queue-budget 15`. It must fit the largest configured reviewer list. Unserved work stays queued, and Talos rotates between repos across restarts. `status` shows the next eligible PR and the last active tick's review starts and GitHub CLI calls. Each repo keeps its own scan interval and Git cache limits.
+The machine budget defaults to 15 reviewer starts per scheduling window for new installs. A PR with two configured reviewers reserves two starts. Every 15 seconds, a running batch can admit more work within the budget after accounting for existing reservations. The same limit applies separately to receipt lookups, which use GitHub calls and zero reviewer starts. Set it with `talos queue-budget 15`. It must fit the largest configured reviewer list. Unserved work stays queued, and Talos rotates between repos across restarts. `status` shows the next eligible PR and the last active tick's review starts and GitHub CLI calls. Each repo keeps its own scan interval and Git cache limits.
 
 A recognized GitHub rate limit holds scans and review jobs. A recognized reviewer rate limit holds jobs that use that reviewer. Talos saves these cooldowns across restarts and backs off from 60 seconds up to 16 minutes. During a GitHub cooldown it can hold up to 15 finished analyses for reuse. Reuse requires the same review inputs and fresh checks before publishing.
 
@@ -336,7 +336,8 @@ Use `talos remove` to stop the default scheduler and keep its data. For a full u
 | Change | Start here |
 | --- | --- |
 | CLI parsing, registration, and scheduling | `src/repo_config.zig`, `src/main.zig`, `src/launchd.zig` |
-| Discovery, retries, and publication policy | `src/core.zig`, `src/store.zig` |
+| Discovery, retries, and publication policy | `src/core.zig` |
+| Transactional state, pass recovery and migration | `src/store.zig`, `src/sqlite.zig` |
 | Review budget, scheduling order, and cooldowns | `src/queue.zig` |
 | Review routing and fallback execution | `src/routing.zig`, `src/adaptive.zig` |
 | Durable provider start counts and limits | `src/usage.zig` |
