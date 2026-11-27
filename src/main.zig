@@ -1393,7 +1393,10 @@ const Main = struct {
                 progress.all_models = true;
                 screen.floor = routing.all_lenses;
             }
-            if (work.prepared.sections.len != 0 and !work.prepared.onchain_available) screen.ask_model = false;
+            if (work.prepared.sections.len != 0 and !work.prepared.onchain_available) {
+                // Route a rereview once, then reuse the selected depth across its sections.
+                screen.ask_model = automatically_routed and work.prepared.rereview and screen.floor.depth != .multi;
+            }
             const plan: adaptive.Plan = .{
                 .repo = entry.repo,
                 .providers = try entry.repo.providers(self.a),

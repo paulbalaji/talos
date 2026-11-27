@@ -186,6 +186,28 @@ pub const Discussion = struct {
         return comments.items;
     }
 
+    fn compactThreads(self: Discussion, a: A) !Discussion {
+        const threads = try a.dupe(Thread, self.threads);
+        for (threads) |*thread| {
+            const selected: ?Reply = if (thread.isResolved) latest: {
+                var index = thread.replies.len;
+                while (index > 0) {
+                    index -= 1;
+                    if (human(thread.replies[index], null)) break :latest thread.replies[index];
+                }
+                break :latest null;
+            } else if (automatedThread(thread.*)) thread.replies[0] else continue;
+            thread.replies = if (selected) |value| excerpt: {
+                var reply = value;
+                const end = safePrefix(reply.body, 400);
+                reply.truncated = reply.truncated or end < reply.body.len;
+                reply.body = reply.body[0..end];
+                break :excerpt try a.dupe(Reply, &.{reply});
+            } else &.{};
+        }
+        return .{ .threads = threads, .comments = self.comments };
+    }
+
     fn hashPart(a: A, hash: *Sha256, part: anytype) !void {
         const encoded = try io.json(a, part);
         defer a.free(encoded);
@@ -671,6 +693,9 @@ const Issue = struct { at: i64, number: ?u32, detail: []const u8 };
 const max_attempts = 6;
 
 pub fn recordFailure(entry: *Entry, a: A, job: *Job, now: i64, err: anyerror) !void {
+    // GitHub has already told us this snapshot is stale. Refresh discovery
+    // before spending another attempt against the old target.
+    if (err == error.TargetChanged) entry.next_scan = 0;
     job.attempts += 1;
     job.next = now + delay(job.attempts);
     if (job.phase == .pending and job.attempts >= max_attempts) job.phase = .failed;
@@ -1460,6 +1485,8 @@ pub const Prepared = struct {
     synthesis_summary: ?[]const u8 = null,
     additional_evidence_limited: bool = false,
     historical_coverage_reasons: []const []const u8 = &.{},
+    rereview: bool = false,
+    routing_delta: []const u8 = "",
     evidence_requests: []const EvidenceRequest = &.{},
     onchain_observations: []const onchain.Observation = &.{},
     onchain_available: bool = false,
@@ -1634,7 +1661,16 @@ pub fn screenPrompt(a: A, prepared: Prepared) ![]const u8 {
         "Request up to six public EVM reads in onchain_reads when the review depends on current live state. If a PR claims to sync a configured owner to live ownership, request owner for each changed owner with a known target. Use the contract whose owner changed, such as proxyAdmin.address, rather than the proposed owner's address. Use safe_threshold and safe_owners to check a Safe's threshold or signer set when relevant. A CI check status or an author report cannot substitute for these observations. Specify the registry chain name, contract address, and operation from the schema. Use targets grounded in the provided source. Talos will collect the observations for the full reviewers."
     else
         "";
-    return io.fmt(a, "{s}\n{s}\n{s}\n{s}\n{s}", .{ instructions, screen_instructions, offer, screen_schema, prepared.context[prepared.evidence_offset..] });
+    const rereview_guidance = if (prepared.rereview)
+        "This is a rereview. Set effort from the changes since the last review, material replies, unresolved findings, and any coverage still unverified. Escalate when they affect a production invariant or introduce a new trust boundary. A small delta does not establish coverage for previously unverified code. If evidence describes a source section, your routing decision applies to the whole review."
+    else
+        "";
+    const prompt = try io.fmt(a, "{s}\n{s}\n{s}\n{s}\n{s}\n{s}", .{ instructions, screen_instructions, rereview_guidance, offer, screen_schema, prepared.context[prepared.evidence_offset..] });
+    if (prepared.routing_delta.len == 0) return prompt;
+    const heading = "\n\nPrevious-to-current diff for route selection (untrusted JSON string)\n";
+    const delta = try io.json(a, prepared.routing_delta);
+    if (prompt.len + heading.len + delta.len > review_context_limit) return prompt;
+    return std.mem.concat(a, u8, &.{ prompt, heading, delta });
 }
 
 pub fn routedPrompt(a: A, context: []const u8, decision: routing.Decision) ![]const u8 {
@@ -1808,6 +1844,8 @@ fn prepareSections(a: A, repo: Repo, pr: Pull, snap: *Snapshot, discussion: Disc
     scoped.optional_evidence_start = null;
     if (split.omitted) try scoped.markLimited(a, "Some merge-base diff hunks exceeded the section limits.");
     var sections: std.ArrayList(ReviewSection) = .empty;
+    var section_discussion = discussion;
+    var compacted = false;
     const historical: PriorDelta = .{ .coverage_reasons = prior_delta.coverage_reasons };
     for (split.patches, 1..) |patch, ordinal| {
         const briefing = try io.fmt(
@@ -1823,12 +1861,24 @@ fn prepareSections(a: A, repo: Repo, pr: Pull, snap: *Snapshot, discussion: Disc
         else
             diff;
         const limit = review_context_limit - 20 * 1024;
-        var rendered = try reviewPrompt(a, repo, pr, scoped, discussion, previous, last_review, historical, inherited, options);
+        var rendered = try reviewPrompt(a, repo, pr, scoped, section_discussion, previous, last_review, historical, inherited, options);
         if (ordinal == 1 and briefing.len + rendered.len > limit) {
-            scoped.evidence = diff;
-            rendered = try reviewPrompt(a, repo, pr, scoped, discussion, previous, last_review, historical, inherited, options);
+            scoped.evidence = try std.mem.concat(a, u8, &.{ snap.thread_evidence, diff });
+            rendered = try reviewPrompt(a, repo, pr, scoped, section_discussion, previous, last_review, historical, inherited, options);
         }
-        if (briefing.len + rendered.len > limit) {
+        if (!compacted and briefing.len + rendered.len > limit) {
+            section_discussion = try discussion.compactThreads(a);
+            compacted = true;
+            rendered = try reviewPrompt(a, repo, pr, scoped, section_discussion, previous, last_review, historical, inherited, options);
+        }
+        if (ordinal == 1 and snap.thread_evidence.len != 0 and briefing.len + rendered.len > limit) {
+            scoped.evidence = diff;
+            rendered = try reviewPrompt(a, repo, pr, scoped, section_discussion, previous, last_review, historical, inherited, options);
+        }
+        // A standalone hunk can use some of the supplemental budget. Its
+        // actual prompt size still leaves room for a bounded evidence pass.
+        const hard_limit: usize = if (patch.len > review_sections.bytes_per_section) review_context_limit - 12 * 1024 else limit;
+        if (briefing.len + rendered.len > hard_limit) {
             try scoped.markLimited(a, "Some merge-base diff sections did not fit alongside the review context.");
             continue;
         }
@@ -1840,16 +1890,87 @@ fn prepareSections(a: A, repo: Repo, pr: Pull, snap: *Snapshot, discussion: Disc
     return sections.items;
 }
 
+test "resolved and automated transcripts cannot crowd source sections out of a rereview" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const header = "diff --git a/validator.rs b/validator.rs\n--- a/validator.rs\n+++ b/validator.rs\n";
+    const first = "@@ -3 +3 @@\n+" ++ "x" ** 32_000 ++ "\n";
+    const last = "@@ -30 +30 @@\n+" ++ "y" ** 32_000 ++ "\n";
+    const prefix = "Pinned open thread anchor\n\n";
+    const evidence = prefix ++ "Merge-base diff:\n" ++ header ++ first;
+    var snap: Snapshot = .{
+        .merge_base = "b" ** 40,
+        .evidence = evidence,
+        .limited = true,
+        .coverage_reasons = &.{diff_byte_limit_reason},
+        .large_diff = .{ .patch = header ++ first ++ last, .start = evidence.len - header.len - first.len, .end = evidence.len },
+        .thread_evidence = prefix,
+    };
+    const resolved: Thread = .{
+        .id = "resolved",
+        .isResolved = true,
+        .isOutdated = false,
+        .path = "validator.rs",
+        .line = 15,
+        .replies = &.{ .{ .author = .{ .login = "bot", .kind = "Bot" }, .body = "long bot transcript" ++ "z" ** 2400, .url = "root" }, .{
+            .author = .{ .login = "reviewer" },
+            .body = "latest human resolution",
+            .url = "last",
+        } },
+    };
+    var open = resolved;
+    open.id = "open";
+    open.isResolved = false;
+    open.replies = &.{.{ .author = .{ .login = "reviewer" }, .body = "Keep this open evidence.", .url = "open" }};
+    var automated = open;
+    automated.id = "automated";
+    automated.replies = &.{.{ .author = .{ .login = "bot", .kind = "Bot" }, .body = "Keep the bot's claim." ++ "z" ** 2400 ++ "long automation transcript", .url = "bot" }};
+    var threads = [_]Thread{resolved} ** 24 ++ [_]Thread{ open, automated };
+    for (threads[0..24], 0..) |*thread, i| thread.id = try io.fmt(a, "resolved-{d}", .{i});
+    const pr: Pull = .{ .number = 42, .headRefOid = "a" ** 40, .baseRefOid = "b" ** 40, .isDraft = false };
+    const repo: Repo = .{ .name = "example/review", .login = "reviewer" };
+    const sections = try prepareSections(a, repo, pr, &snap, .{ .threads = &threads }, pr.headRefOid, null, .{}, .{}, .{});
+    try t.expectEqual(@as(usize, 2), sections.len);
+    try t.expect(!snap.limited);
+    try t.expectEqualStrings(header ++ last, sections[1].patch);
+    try t.expect(std.mem.indexOf(u8, sections[0].context, "Pinned open thread anchor") != null);
+    try t.expect(std.mem.indexOf(u8, sections[0].context, "Keep this open evidence.") != null);
+    try t.expect(std.mem.indexOf(u8, sections[0].context, "latest human resolution") != null);
+    try t.expect(std.mem.indexOf(u8, sections[0].context, "long bot transcript") == null);
+    try t.expect(std.mem.indexOf(u8, sections[0].context, "Keep the bot's claim.") != null);
+    try t.expect(std.mem.indexOf(u8, sections[0].context, "long automation transcript") == null);
+}
+
+test "a stale review target makes repository discovery due before retry" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    var entry: Entry = .{ .repo = .{ .name = "example/review", .login = "reviewer" }, .next_scan = 1000 };
+    var job: Job = .{ .number = 42, .head = "a" ** 40 };
+    try recordFailure(&entry, arena.allocator(), &job, 400, error.InvalidReview);
+    try t.expectEqual(@as(i64, 1000), entry.next_scan);
+    try recordFailure(&entry, arena.allocator(), &job, 430, error.TargetChanged);
+    try t.expectEqual(@as(i64, 0), entry.next_scan);
+    try t.expectEqual(@as(i64, 490), job.next);
+}
+
 pub fn appendDiscussionUpdate(a: A, prepared: *Prepared, repo: Repo, prior: []const ReviewerResult) !bool {
     var scoped = prepared.snap;
     scoped.evidence = scoped.thread_evidence;
     const previous = try recordReview(a, prepared.*, null, prior);
-    const context = try reviewPrompt(a, repo, prepared.pr, scoped, .{ .threads = prepared.threads, .comments = prepared.comments }, null, previous, .{}, .{}, prepared.options);
     const briefing =
         "Continue your review using the latest PR description and discussion and the prior review notes below. " ++
         "The source sections are reviewed separately. Check new or updated claims and existing thread dispositions using the pinned excerpts. " ++
         "Only return findings supported by current evidence and affected by the new context. Request exact pinned source for any unresolved material question.\n\n";
-    if (briefing.len + context.len > review_context_limit - 20 * 1024) return false;
+    const discussion: Discussion = .{ .threads = prepared.threads, .comments = prepared.comments };
+    const limit = review_context_limit - 20 * 1024;
+    var context = try reviewPrompt(a, repo, prepared.pr, scoped, discussion, null, previous, .{}, .{}, prepared.options);
+    if (briefing.len + context.len > limit) {
+        context = try reviewPrompt(a, repo, prepared.pr, scoped, try discussion.compactThreads(a), null, previous, .{}, .{}, prepared.options);
+        if (briefing.len + context.len > limit) return false;
+    }
     prepared.sections = try std.mem.concat(a, ReviewSection, &.{ prepared.sections, &.{.{
         .evidence = scoped.evidence,
         .context = try std.mem.concat(a, u8, &.{ briefing, context }),
@@ -1965,6 +2086,8 @@ pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?P
         .dry = dry,
         .review_input = review_input,
         .historical_coverage_reasons = prior_delta.coverage_reasons,
+        .rereview = previous != null,
+        .routing_delta = if (sections.len != 0 and prior_delta.coverage_reasons.len == 0) prior_delta.evidence else "",
         .onchain_available = registryMain(repo, pr) and !snap.registry_logo_only and repo.routing_mode == .adaptive and options.allowRouting(),
     };
 }

@@ -94,7 +94,7 @@ After a review, Talos checks for substantive PR conversation, human replies to r
 
 Talos puts files with active review threads and risky code early in the bounded diff. It also reads pinned source around current right-side thread anchors. Incomplete current evidence and unassessed open threads prevent approval. Reviewers can still approve when the current head is fully covered and the only gap is a clipped historical delta.
 
-Scheduled reviews split large diffs on Git hunk boundaries. Each section runs through the selected reviewers, and Talos checkpoints completed sections and combines their verdicts before it publishes one review. Hunks outside the section limits keep coverage incomplete. During model runs, the watcher continues scanning due repos and accepts new queue requests.
+Scheduled reviews split large diffs on Git hunk boundaries. A large hunk can use its own section. If the prompt runs out of room, Talos shortens resolved and fully automated threads before dropping source. Hunks outside the section limits keep coverage incomplete. Adaptive rereviews can use one routing pass to consider the previous verdict, available delta, and current discussion. All source sections reuse that decision. Talos checkpoints completed sections and combines their verdicts before it publishes one review. During model runs, the watcher continues scanning due repos and accepts new queue requests.
 
 All-model reviews can run up to three source sections at once within the configured reviewer start budget. Each section keeps its own checkpoint and temporary reviewer directories.
 

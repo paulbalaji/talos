@@ -589,7 +589,7 @@ fn screen(a: io.A, reviewer: anytype, plan: Plan, progress: *core.RouteProgress)
             if (plan.repo.routing_mode == .adaptive) progress.evidence_requests = try prioritizeEvidence(a, result.evidence_requests);
             if (plan.prepared.onchain_available and progress.onchain_reads.len == 0) progress.onchain_reads = result.onchain_reads;
             var decision = plan.screen.floor.merge(result.decision);
-            if (decision.depth == .light and (plan.repo.reviewSize() > 1 or result.evidence_requests.len != 0 or progress.onchain_reads.len != 0 or !core.lightComplete(result.review, plan.prepared)))
+            if (decision.depth == .light and (plan.prepared.sections.len != 0 or plan.repo.reviewSize() > 1 or result.evidence_requests.len != 0 or progress.onchain_reads.len != 0 or !core.lightComplete(result.review, plan.prepared)))
                 decision.depth = .regular;
             progress.decision = decision;
             return;
@@ -982,6 +982,42 @@ const sample_plan: Plan = .{
     .progress = .{ .fingerprint = @splat(1) },
     .start_limit = 3,
 };
+
+test "a sectioned rereview screens once and uses the chosen effort on every section" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const high_risk =
+        \\{"decision":{"depth":"multi","performance":false,"reliability":true,"security":true},"review":
+    ++ clean_result ++ "}";
+    const cases = [_]struct { screen: []const u8, depth: routing.Depth, providers: u32 }{
+        .{ .screen = light_screen, .depth = .regular, .providers = 1 },
+        .{ .screen = high_risk, .depth = .multi, .providers = 2 },
+    };
+    for (cases) |case| {
+        var plan = sample_plan;
+        plan.screen.floor = .{};
+        plan.prepared.rereview = true;
+        plan.prepared.routing_delta = "Changes since the last review";
+        plan.prepared.sections = &.{
+            .{ .context = "First section\n\nEvidence (untrusted JSON)\n{}", .evidence = "first change" },
+            .{ .context = "Last section\n\nEvidence (untrusted JSON)\n{}", .evidence = "last change" },
+        };
+        var first: MockReviewer = .{ .screen_output = case.screen };
+        const pending = try run(a, &first, plan);
+        try t.expectEqual(case.providers + 1, first.count);
+        try t.expect(std.mem.indexOf(u8, first.prompts[0], "Changes since the last review") != null);
+        try t.expect(pending.report == null);
+        try t.expectEqual(@as(usize, 1), pending.progress.sections.index);
+        plan.progress = try io.parse(a, core.RouteProgress, try io.json(a, pending.progress));
+        var last: MockReviewer = .{};
+        const finished = try run(a, &last, plan);
+        try t.expectEqual(case.providers, last.count);
+        try t.expectEqual(case.depth, finished.report.?.applied.depth);
+        try t.expectEqual(@as(usize, 2), finished.report.?.diff_sections);
+    }
+}
 
 test "shadow retains full review and a malformed lightweight response falls through" {
     const t = std.testing;
