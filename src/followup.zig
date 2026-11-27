@@ -43,6 +43,7 @@ fn number(comptime T: type, bytes: []const u8) !T {
 }
 
 pub const Stage = enum { waiting, drafting, draft, ready, needs_input, queued_to_merge, merged, closed, obsolete };
+pub const SelfReview = enum { waiting, clean, needs_attention };
 
 pub const Pending = struct {
     head: []const u8,
@@ -396,6 +397,17 @@ fn shepherd(service: anytype, job: *Job, origin: core.Pull, pull: core.Pull) !vo
         job.note = "Waiting for GitHub checks.";
         return;
     }
+    switch (try service.selfReview(job.*, pull)) {
+        .waiting => {
+            job.note = "Waiting for the exact-head self-review.";
+            return;
+        },
+        .needs_attention => {
+            job.note = "The self-review found a concern or needs more evidence.";
+            return;
+        },
+        .clean => {},
+    }
     if (pull.isDraft) {
         try service.ready(job.*);
         job.stage = .ready;
@@ -490,6 +502,7 @@ const TestService = struct {
     lost_push_response: bool = false,
     lost_create_response: bool = false,
     latest_feedback: Feedback = .{},
+    self_review: SelfReview = .clean,
     pushes: u32 = 0,
     preparations: u32 = 0,
     creations: u32 = 0,
@@ -554,6 +567,10 @@ const TestService = struct {
         if (self.lost_create_response) return error.FollowupDraftUnconfirmed;
     }
 
+    pub fn selfReview(self: *TestService, _: Job, _: core.Pull) !SelfReview {
+        return self.self_review;
+    }
+
     pub fn ready(self: *TestService, _: Job) !void {
         self.draft_open = false;
     }
@@ -601,6 +618,13 @@ test "lost push and draft responses recover once and feedback updates the tracke
     try t.expectEqual(@as(u32, 1), service.creations);
 
     service.checks_green = true;
+    service.self_review = .waiting;
+    try advance(a, &service, &job);
+    try t.expectEqual(Stage.draft, job.stage);
+    service.self_review = .needs_attention;
+    try advance(a, &service, &job);
+    try t.expectEqual(Stage.draft, job.stage);
+    service.self_review = .clean;
     try advance(a, &service, &job);
     try t.expectEqual(Stage.ready, job.stage);
     service.latest_feedback = .{ .text = "Keep the partial write pending too.", .key = @splat(42) };

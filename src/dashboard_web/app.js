@@ -6,7 +6,7 @@ const numbers = new Intl.NumberFormat();
 const dates = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 const shortDays = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", timeZone: "UTC" });
 const repoPattern = /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i;
-const views = new Set(["queue", "history", "usage"]);
+const views = new Set(["queue", "history", "followups", "usage"]);
 const labelNames = {
   all_models: "All models",
   approve: "Approval",
@@ -40,11 +40,13 @@ const labelNames = {
   ready_to_publish: "Publication pending",
   repository_policy: "Repository publishing policy",
   own_pr: "Self approval excluded",
+  unknown_author: "PR author could not be verified",
   insufficient_evidence: "Insufficient evidence",
 };
 
 let view = "queue";
 let snapshot = null;
+let stateUnavailable = false;
 let stateRequest = null;
 let metricsRequest = null;
 let metricsSnapshot = null;
@@ -297,22 +299,29 @@ function syncRefreshIndicator() {
   else refreshIndicatorTimer = setTimeout(() => { delete indicator.dataset.refreshing; }, 360);
 }
 
+function publicationStatus(verdict) {
+  const transport = verdict?.publication;
+  if (transport === "verified") return { key: "published", label: "Published", tone: "good" };
+  if (transport === "pending") return { key: "pending", label: "Checking publication", tone: "warning" };
+  if (transport !== "local") return { key: transport, label: humanize(transport) };
+  const disposition = verdict.disposition || (verdict.complete === false ? "insufficient_evidence" : null);
+  const reason = humanize(disposition) || "Original decision unavailable";
+  if (!disposition || ["insufficient_evidence", "unknown_author"].includes(disposition)) {
+    return { key: "local", label: "Local only", reason, tone: "warning" };
+  }
+  return { key: "skipped", label: "Decided not to publish", reason };
+}
+
 function chooseStage(job, now) {
   const active = list(job.active_providers);
   const stage = humanize(job.stage);
   const verdict = job.verdict;
   if (job.phase === "baseline") return { title: "Baselined" };
   if (job.phase === "complete") {
-    const publication = verdict?.publication;
-    const reason = verdict?.disposition;
-    const detail = publication === "verified" ? "Published" : publication === "local" ?
-      reason && reason !== "insufficient_evidence" ? humanize(reason) : "Local only" : "";
-    if (publication === "pending") return { title: "Publication pending", tone: "warning" };
-    if (verdict?.coverage_complete === false) return { title: "Limited coverage", tone: "warning", detail };
-    if (verdict?.coverage_complete === true) {
-      return { title: publication === "verified" && verdict.event === "APPROVE" ? "Approved" : "Reviewed", tone: "good", detail };
-    }
-    return { title: "Review finished", detail };
+    const status = publicationStatus({ ...verdict, complete: verdict?.coverage_complete });
+    return { title: status.label || "Review finished", tone: status.tone,
+      detail: status.reason || phrase([status.key === "published" && humanize(verdict.event),
+        verdict?.coverage_complete === false && "Limited coverage"]) };
   }
   if (job.phase === "failed") return { title: "Failed", tone: "error", detail: humanize(job.last_error) };
   if (active.length) {
@@ -544,10 +553,12 @@ function renderQueue() {
     first.repo.localeCompare(second.repo) || second.number - first.number);
   const statuses = ordered.map((job) => [job, chooseStage(job, now), memberships.get(keyOf(job.repo, job.number)) ||
     (job.stack ? { label: `Stack #${job.stack}`, accent: stackAccent(job.repo, job.stack) } : null)]);
-  update("queue", statuses, () => {
+  const empty = snapshot ? (rows.length ? "No matching reviews." : "The review queue is empty.") :
+    stateUnavailable ? "Queue unavailable. Retrying…" : "Loading queue…";
+  update("queue", statuses.length ? statuses : [empty], () => {
     replace(byId("queue-results"), renderTable(["Pull request", "State", "Progress", "Reviewers"], statuses.map(([job, status, stack]) => [
       reviewKey(job, null, true, stack), phaseLabel(status), progressLabel(job), providersLabel(list(job.active_providers), job.all_models),
-    ]), snapshot ? "No matching reviews." : "Loading queue…", statuses.map(([, , stack]) => stack ? `linked-row ${stack.accent}` : "")));
+    ]), empty, statuses.map(([, , stack]) => stack ? `linked-row ${stack.accent}` : "")));
   });
 
   const activeKeys = new Set(active.map((job) => keyOf(job.repo, job.number)));
@@ -591,7 +602,7 @@ function renderRepos() {
   const repos = list(snapshot?.repos);
   byId("repo-count").textContent = count(repos.length);
   const rows = repos.map((repo) => ({ ...repo, label: repo.paused ? "Paused" : repo.scan_attempts > 0 ? "Scan delayed" : repo.last_scan_at > 0 ?
-    `Scanned ${age(repo.last_scan_at, snapshot.at)}` : "Awaiting first scan" }));
+    age(repo.last_scan_at, snapshot.at) : "Awaiting first scan" }));
   update("repos", rows, () => {
     const nodes = document.createDocumentFragment();
     for (const repo of rows) {
@@ -603,7 +614,9 @@ function renderRepos() {
         repo.scan_attempts > 0 && repo.next_scan_at > 0 && `Next scan ${date(repo.next_scan_at)}`,
       ]);
       const item = element("li");
-      item.append(element("span", "repo-name", repo.name), description);
+      const name = element("span", "repo-name", repo.name.split("/").at(-1));
+      name.title = repo.name;
+      item.append(name, description);
       nodes.append(item);
     }
     if (rows.length === 0) nodes.append(element("li", "repo-status", "No registered repositories"));
@@ -627,38 +640,52 @@ function renderRepos() {
 }
 
 function historyStatus(row) {
-  const publication = humanize(row.publication);
-  const result = humanize(row.event);
-  if (!result) return publication || "Saved";
-  return phrase([result, publication]);
+  const status = publicationStatus(row);
+  return phrase([status.label || "Saved", status.key === "published" && humanize(row.event)]);
 }
 
 function historyVerdict(row) {
-  const verdict = element("span", "inspectable", historyStatus(row));
+  const status = publicationStatus(row);
+  const verdict = phaseLabel({ title: historyStatus(row), detail: status.reason, tone: status.tone });
+  verdict.classList.add("inspectable");
   verdict.dataset.reviewKey = `${keyOf(row.repo, row.number)}:${row.head}:${row.at}:verdict`;
   return tooltipFor(verdict, `Verdict for #${row.number}`, [
     ["Head", row.head?.slice(0, 12)], ["Depth", humanize(row.route)],
     ["Coverage", row.complete === true ? "Complete" : row.complete === false ? "Limited" : "Unknown"],
-    ["Publication", humanize(row.publication)], ["GitHub review", row.review_id ? `#${row.review_id}` : ""], ["Saved", date(row.at)],
-    ["Disposition", humanize(row.disposition)],
+    ["GitHub review", row.review_id ? `#${row.review_id}` : ""], ["Saved", date(row.at)],
   ]);
 }
 
 function renderHistory() {
   const history = list(historySnapshot);
   const desired = byId("history-filter").value;
-  const filtered = filterRows(history, byId("history-search").value).filter((item) => {
-    const publication = item.publication === "verified" ? "published" : item.publication;
-    return desired === "" || publication === desired;
-  });
+  const filtered = filterRows(history, byId("history-search").value).filter((item) =>
+    desired === "" || publicationStatus(item).key === desired);
   const ordered = [...filtered].sort((first, second) => second.at - first.at || second.number - first.number);
   byId("history-summary").textContent = history.length ?
     `${historyTruncated ? "Latest " : ""}${plural(history.length, "saved verdict")}` : "Saved verdicts";
-  update("history", ordered, () => {
+  const empty = historySnapshot ? "No matching saved verdicts." :
+    stateUnavailable ? "History unavailable. Retrying…" : "Loading saved verdicts…";
+  update("history", ordered.length ? ordered : [empty], () => {
     replace(byId("history-results"), renderTable(["Pull request", "Verdict", "Depth", "Coverage", ["Saved", "time-cell"]], ordered.map((item) => [
       reviewKey(item, item.head), historyVerdict(item), humanize(item.route) || "—",
       item.complete === true ? "Complete" : item.complete === false ? "Limited" : "—", date(item.at),
-    ]), historySnapshot ? "No matching saved verdicts." : "Loading saved verdicts…"));
+    ]), empty));
+  });
+}
+
+function renderFollowups() {
+  const rows = list(snapshot?.followups);
+  const empty = snapshot ? "No tracked follow-ups." : stateUnavailable ? "Follow-ups unavailable. Retrying…" : "Loading follow-ups…";
+  update("followups", rows.length ? rows : [empty], () => {
+    replace(byId("followup-results"), renderTable(["Source", "Follow-up PR", "State"], rows.map((row) => {
+      const source = element("a", null, `${row.repo} #${row.source_pr}`);
+      source.href = row.source_url;
+      source.target = "_blank";
+      source.rel = "noopener";
+      return [source, row.draft ? gitHubLink(row.repo, row.draft) : "—",
+        phaseLabel({ title: row.paused ? "Paused" : humanize(row.stage), detail: row.note })];
+    }), empty));
   });
 }
 
@@ -918,12 +945,9 @@ function reviewVerdict(result, target) {
   if (target.reviewId != null) {
     return all.find((candidate) => candidate.commit_id === target.head && candidate.explanation?.github_review_id === target.reviewId) || null;
   }
-  if (target.reviewKey != null) {
-    return all.find((candidate) => candidate.commit_id === target.head &&
-      candidate.explanation?.followup_id === target.reviewKey) || null;
-  }
-  return all.find((candidate) => candidate.commit_id === target.head && (target.at == null ||
-    candidate.explanation?.at === target.at || (candidate === result && !candidate.explanation))) || null;
+  return all.find((candidate) => candidate.commit_id === target.head &&
+    (target.reviewKey == null || candidate.explanation?.followup_id === target.reviewKey) &&
+    (target.at == null || candidate.explanation?.at === target.at || (candidate === result && !candidate.explanation))) || null;
 }
 
 function planSummary(plan) {
@@ -1013,7 +1037,8 @@ function renderDetail(data, target) {
   if (result) {
     const section = element("section", "detail-section");
     const explanation = result.explanation;
-    const status = historyStatus({ ...result, publication: explanation?.publication });
+    const status = historyStatus({ ...result, publication: explanation?.publication,
+      disposition: explanation?.disposition, complete: explanation?.coverage?.complete });
     const older = job?.head && (job.head !== result.commit_id ||
       (job.review_key || "") !== (result.explanation?.followup_id || ""));
     section.append(element("h3", null, older ? "Previous saved verdict" : "Saved verdict"));
@@ -1309,6 +1334,7 @@ function refreshState() {
   flight.promise = request(path).then((data) => {
     if (stateRequest !== flight) return;
     snapshot = data;
+    stateUnavailable = false;
     if (wantsHistory) {
       historySnapshot = list(data.history);
       historyTruncated = data.history_truncated === true;
@@ -1319,9 +1345,14 @@ function refreshState() {
       renderRepos();
     }
     if (view === "history") renderHistory();
+    if (view === "followups") renderFollowups();
   }).catch(() => {
     if (stateRequest !== flight) return;
+    stateUnavailable = true;
     setConnection(false, snapshot ? "Connection lost. Showing the last saved dashboard state." : "Talos could not be reached. Retrying shortly.");
+    if (view === "queue" && !snapshot) renderQueue();
+    if (view === "history" && !historySnapshot) renderHistory();
+    if (view === "followups" && !snapshot) renderFollowups();
   }).finally(() => {
     if (stateRequest === flight) {
       stateRequest = null;
@@ -1379,6 +1410,8 @@ function navigate() {
     renderRepos();
   } else if (view === "history") {
     renderHistory();
+  } else if (view === "followups") {
+    renderFollowups();
   } else {
     renderMetrics();
   }

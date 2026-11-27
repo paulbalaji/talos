@@ -64,6 +64,8 @@ talos status                          # See scans, queue, errors, and cache size
 
 The local dashboard shows tracked jobs, active reviewers, and completed source sections. It also shows coverage gaps, retry times, stack dependencies, and the publication decision for saved reviews. The displayed percentage counts completed sections. Reviewers working on a section can still require additional evidence or synthesis. Stack badges show each PR's position from the bottom of the stack. [Open the local dashboard](http://127.0.0.1:8749).
 
+History distinguishes published reviews, local results that need attention, decisions to stay quiet, and publication still awaiting a receipt. On desktop, the queue, history, repositories, and usage can scroll within the console. Queue a current head again to retry an evidence-blocked review. Completed decisions to stay quiet remain deduplicated.
+
 Hover over a progress bar, a saved verdict, or a day on the usage chart for a breakdown. The same details are available with keyboard focus, and the arrow keys move between chart days.
 
 Paste a GitHub PR or stack link to queue it. If the PR belongs to a GitHub stack, Talos offers a separate action to queue all open members. Pick any combination of Performance, Reliability, Security, and Simplicity. Select General on its own for a broad review, or leave the focuses clear for automatic depth. All-model review can be enabled independently. The dashboard uses the same queue and publication policy as the CLI.
@@ -108,7 +110,9 @@ Rereviews update the local verdict. Talos posts new actionable findings, an appr
 
 `talos status OWNER/REPO` shows up to five completed jobs still tracked and links to verified GitHub reviews. `talos result OWNER/REPO 123` prints the last saved local candidate and up to seven previous verdict explanations, including after the PR closes. The explanation records the head and base, reviewer-specific gaps, requested evidence, approval blockers, and the GitHub review ID after readback. Older local candidates keep their original JSON fields. A review reconciled from GitHub can have a receipt without a local candidate.
 
-### Follow up on a deferred finding
+### Audit a merged PR or follow up on a deferred finding
+
+Run `talos audit OWNER/REPO PR` for a local pass over a merged change. Talos checks the original diff against bounded source from the current target branch and prints its exact source pins, actionable findings, and any remaining coverage gaps as JSON.
 
 Copy the link to an inline review comment in a registered repo.
 
@@ -124,7 +128,7 @@ The scheduler waits for the original PR to merge, then checks the finding agains
 
 Talos uses the configured reviewer CLIs to propose changes to the file named in the thread. It can read up to three more source files from the pinned commit, within 24 KiB of extra context. It applies the replacement in an isolated Git index and leaves code execution to GitHub CI. Followups share the review budget and respect repo pauses.
 
-Talos watches the draft from creation. It verifies feedback on the current head, pushes up to three scoped updates, and marks the draft ready when GitHub checks pass. Feedback outside the original fix and changes from another author can require a human decision. Use `talos followup status --json` for the tracked head and state.
+Talos watches the draft from creation. It verifies feedback on the current head, pushes up to three scoped updates, and requires a clean exact-head self-review and passing GitHub checks before marking the draft ready. Feedback outside the original fix and changes from another author can require a human decision. See the Follow-ups tab or `talos followup status --json` for the tracked state.
 
 With `--merge-when-ready`, Talos submits the current head for normal GitHub merge after an independent approval and passing checks. The same flag also opts in an existing followup. Use the thread link shown by `status` to pause or resume. Pausing a followup stops Talos actions. GitHub handles any merge already submitted.
 

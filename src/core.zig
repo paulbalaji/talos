@@ -111,6 +111,7 @@ pub const Pull = struct {
     author: ?struct { login: []const u8 = "" } = null,
     statusCheckRollup: ?[]const Check = null,
     mergeStateStatus: []const u8 = "",
+    mergeCommit: ?struct { oid: []const u8 } = null,
 };
 
 const Check = struct {
@@ -349,7 +350,7 @@ pub const Snapshot = struct {
     }
 };
 const Severity = enum { P0, P1, P2, P3 };
-const Finding = struct { severity: Severity, path: []const u8, line: u32, body: []const u8 };
+pub const Finding = struct { severity: Severity, path: []const u8, line: u32, body: []const u8 };
 const ThreadAssessment = struct {
     id: []const u8,
     reason: []const u8,
@@ -417,6 +418,32 @@ pub const Explanation = struct {
     publication: enum { preview, local, pending, verified },
     disposition: ?PublicationDisposition = null,
     github_review_id: ?u64 = null,
+
+    pub fn publicationReason(self: Explanation) ?PublicationDisposition {
+        if (self.disposition) |reason| return reason;
+        if (self.publication != .local) return null;
+        for (self.blockers) |blocker| {
+            if (blocker == .unassessed_threads or blocker == .limited_coverage) return .insufficient_evidence;
+        }
+        if (!self.coverage.complete) return .insufficient_evidence;
+        if (std.mem.indexOfScalar(ApprovalBlocker, self.blockers, .draft) != null) return .draft;
+        if (std.mem.indexOfScalar(ApprovalBlocker, self.blockers, .own_pr) != null) return .own_pr;
+        if (std.mem.indexOfScalar(ApprovalBlocker, self.blockers, .unknown_author) != null) return .unknown_author;
+        if (std.mem.indexOfScalar(ApprovalBlocker, self.blockers, .approvals_disabled) != null) return .repository_policy;
+        if (std.mem.indexOfScalar(ApprovalBlocker, self.blockers, .new_findings) == null) return .no_material_change;
+        return null;
+    }
+
+    pub fn cleanSelfReview(self: Explanation) bool {
+        if (self.publication != .local or !self.coverage.complete) return false;
+        var own = false;
+        for (self.blockers) |blocker| switch (blocker) {
+            .own_pr => own = true,
+            .approvals_disabled => {},
+            else => return false,
+        };
+        return own;
+    }
 };
 
 pub const PublicationDisposition = enum {
@@ -427,6 +454,7 @@ pub const PublicationDisposition = enum {
     repository_policy,
     draft,
     own_pr,
+    unknown_author,
     insufficient_evidence,
     no_material_change,
 };
@@ -613,11 +641,11 @@ pub const Entry = struct {
                 if (rerun_completed or changed_focus or (all_models and !job.options.all_models)) return error.PublicationUnconfirmed;
                 job.next = 0;
                 job.attempts = 0;
-            } else if (all_models or selects_focus) {
+            } else if (all_models or selects_focus or rerun_completed) {
                 const rerun = rerun_completed and job.phase == .complete;
                 const has_all_models = job.options.all_models or (job.route_report != null and job.route_report.?.all_models);
                 if (!rerun and !changed_focus and (!all_models or has_all_models) and job.phase != .failed) return;
-                job.options = options.?;
+                job.options = options orelse job.options;
                 job.phase = .pending;
                 job.next = 0;
                 job.attempts = 0;
@@ -628,7 +656,7 @@ pub const Entry = struct {
                 job.review_input = null;
                 job.verdict = null;
                 // Use a fresh receipt without republishing unchanged findings.
-                job.followup = job.receipt != null or job.last_review != null;
+                job.followup = rerun or job.receipt != null or job.last_review != null;
                 if (job.followup) std.crypto.random.bytes(&job.followup_id);
             } else if (job.followup and (job.phase == .pending or job.phase == .failed)) {
                 job.phase = .pending;
@@ -2520,7 +2548,7 @@ pub fn finish(a: A, adapter: anytype, repo: Repo, job: *Job, prepared: Prepared,
         if (!permitted and repeated_body) duplicate = .repeated_finding;
     }
     const disposition: PublicationDisposition = if (permitted) .ready_to_publish else duplicate orelse
-        if (blockers.contains(.draft)) .draft else if (blockers.contains(.own_pr) or blockers.contains(.unknown_author)) .own_pr else if (!enabled) .repository_policy else if (!evaluated.coverage.complete or blockers.contains(.unassessed_threads)) .insufficient_evidence else .no_material_change;
+        if (blockers.contains(.draft)) .draft else if (blockers.contains(.own_pr)) .own_pr else if (blockers.contains(.unknown_author)) .unknown_author else if (!enabled) .repository_policy else if (!evaluated.coverage.complete or blockers.contains(.unassessed_threads)) .insufficient_evidence else .no_material_change;
     const reasons = try a.alloc(ApprovalBlocker, blockers.count());
     var blocker_iter = blockers.iterator();
     for (reasons) |*reason| reason.* = blocker_iter.next().?;

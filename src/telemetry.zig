@@ -5,7 +5,7 @@ const routing = @import("routing.zig");
 const posix = std.posix;
 const sqlite = @import("sqlite.zig");
 
-pub const Stage = enum { review, screen, completion, synthesis, preview, followup };
+pub const Stage = enum { review, screen, completion, synthesis, preview, followup, audit };
 pub const Mode = enum { scheduled, preview, followup };
 pub const Outcome = enum { success, failed, timed_out, rate_limited };
 

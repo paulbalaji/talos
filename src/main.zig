@@ -16,6 +16,7 @@ const adaptive = @import("adaptive.zig");
 const usage_meter = @import("usage.zig");
 const followup = @import("followup.zig");
 const followup_git = @import("followup_git.zig");
+const merged_audit = @import("audit.zig");
 const onchain = @import("onchain.zig");
 const telemetry = @import("telemetry.zig");
 const max_metrics_days = 3650;
@@ -43,6 +44,7 @@ const usage =
     \\talos [--home DIR] stack OWNER/REPO NAME PR PR [PR ...]
     \\talos [--home DIR] unstack OWNER/REPO NAME
     \\talos [--home DIR] run-once [OWNER/REPO [PR [--mode MODE ...] [--prompt TEXT]]]
+    \\talos [--home DIR] audit OWNER/REPO MERGED_PR
     \\talos [--home DIR] pause|resume OWNER/REPO
     \\talos [--home DIR] install|remove [--label dev.talos.NAME]
     \\talos [--home DIR] tick
@@ -800,6 +802,33 @@ const FollowupService = struct {
         if (job.paused or try self.app.db.paused(job.source.repo)) return error.RepoPaused;
         if (!std.ascii.eqlIgnoreCase(job.login, self.repo.login) or !std.ascii.eqlIgnoreCase(try self.client.identity(), job.login))
             return error.GitHubIdentityChanged;
+    }
+
+    pub fn selfReview(self: *FollowupService, job: followup.Job, pull: core.Pull) !followup.SelfReview {
+        const entry = self.state.find(job.source.repo) orelse return error.UnknownRepository;
+        const reviewed = for (entry.jobs) |item| {
+            if (item.number == pull.number and eq(u8, item.head, pull.headRefOid)) break item;
+        } else {
+            try entry.queue(self.app.a, pull, null);
+            return .waiting;
+        };
+        switch (reviewed.phase) {
+            .pending, .uncertain => return .waiting,
+            .failed => return .needs_attention,
+            .complete => {},
+        }
+        const raw = self.app.db.readResult(entry.repo.name, pull.number) catch |err| switch (err) {
+            error.NoLocalReview => return .needs_attention,
+            else => return err,
+        };
+        const result = try io.parse(self.app.a, core.Result, raw);
+        if (!eq(u8, result.commit_id, pull.headRefOid) or
+            !eq(u8, result.followupId(), (try core.followupId(self.app.a, reviewed)) orelse "")) return .needs_attention;
+        const detail = result.explanation orelse return .needs_attention;
+        if (!detail.cleanSelfReview() or !eq(u8, detail.base.ref, pull.baseRefName)) return .needs_attention;
+        if (!eq(u8, detail.base.oid, pull.baseRefOid) and
+            !eq(u8, detail.merge_base, try self.client.mergeBase(pull.baseRefOid, pull.headRefOid))) return .waiting;
+        return .clean;
     }
 
     pub fn prepare(self: *FollowupService, job: followup.Job, source_pr: core.Pull, parent: []const u8, input: []const u8) !followup.Prepared {
@@ -1823,18 +1852,40 @@ const Main = struct {
     }
 
     fn enqueuePinnedPull(self: Main, state: *store.State, entry: *core.Entry, pull: core.Pull, options: ?core.ReviewOptions) !core.Job {
+        var retry_completed = false;
         if (options == null) {
             for (entry.jobs) |job| {
                 if (job.number != pull.number or !eq(u8, job.head, pull.headRefOid)) continue;
-                if (job.phase == .complete or (job.phase == .pending and job.attempts == 0)) return job;
+                if (job.phase == .pending and job.attempts == 0) return job;
+                if (job.phase == .complete) {
+                    const reason = try self.savedPublicationReason(entry.repo.name, job);
+                    retry_completed = reason == .insufficient_evidence or
+                        (reason == .unknown_author and pull.author != null);
+                    if (!retry_completed) return job;
+                }
+                break;
             }
         }
-        try entry.queue(self.a, pull, options);
+        try entry.queueReview(self.a, pull, options, retry_completed);
         try self.db.save(state);
         for (entry.jobs) |job| {
             if (job.number == pull.number and eq(u8, job.head, pull.headRefOid)) return job;
         }
         unreachable;
+    }
+
+    fn savedPublicationReason(self: Main, repo: []const u8, job: core.Job) !?core.PublicationDisposition {
+        if (job.verdict) |verdict| {
+            if (eq(u8, job.head, verdict.head)) return if (verdict.publication == .local) verdict.disposition else null;
+        }
+        const raw = self.db.readResult(repo, job.number) catch |err| switch (err) {
+            error.NoLocalReview => return null,
+            else => return err,
+        };
+        const saved = try io.parse(self.a, core.Result, raw);
+        if (!eq(u8, job.head, saved.commit_id) or !eq(u8, saved.followupId(), (try core.followupId(self.a, job)) orelse "")) return null;
+        const detail = saved.explanation orelse return null;
+        return detail.publicationReason();
     }
 
     fn choose(self: Main, entry: *core.Entry, number: u32) !core.Pull {
@@ -1845,6 +1896,48 @@ const Main = struct {
         if (!core.isReviewable(pr)) return error.PullRequestNotReady;
         if (!core.validOid(pr.headRefOid)) return error.InvalidCommit;
         return pr;
+    }
+
+    fn auditMerged(self: Main, state: *store.State, args: []const []const u8) !void {
+        if (args.len != 2) return error.Usage;
+        const entry = state.find(args[0]) orelse return error.UnknownRepository;
+        var env: std.process.EnvMap = undefined;
+        var service = try self.followupService(state, entry.repo, &env);
+        const pr = try service.client.pull(try prNumber(args[1]));
+        if (!eq(u8, pr.state, "MERGED")) return error.AuditRequiresMergedPull;
+        const merged = (pr.mergeCommit orelse return error.AuditMergeCommitMissing).oid;
+        if (!core.validOid(merged) or !core.validOid(pr.headRefOid)) return error.InvalidCommit;
+        const target = (try service.work.remote(pr.baseRefName)) orelse return error.FollowupBaseMissing;
+        if (!eq(u8, merged, target) and !eq(u8, try service.client.mergeBase(merged, target), merged))
+            return error.AuditMergeOutsideTarget;
+        try service.work.fetch(pr.baseRefName, target);
+        const input = try merged_audit.prepare(self.a, &service.work, pr, target, try service.client.files(pr.number));
+        const now = std.time.timestamp();
+        var ledger: usage_meter.Ledger = .{ .dir = self.db.dir, .data = try usage_meter.load(self.a, self.db.dir, now) };
+        const current = ledger.snapshot();
+        const engine = for (try entry.repo.providers(self.a)) |provider| {
+            const at = state.queue_budget.engineAt(provider, now, 0, current) orelse continue;
+            if (at <= now) break provider;
+        } else return error.ReviewerCoolingDown;
+        var tools = self.local(entry.repo);
+        tools.meter = &ledger;
+        tools.telemetry = .{ .dir = self.db.dir, .scope = .{
+            .repo = entry.repo.name,
+            .pr = pr.number,
+            .head = target,
+            .mode = .preview,
+            .stage = .audit,
+        } };
+        const raw = try invokeReviewer(tools, engine, reviewerProfile(entry.repo, engine), core.schema, input.prompt);
+        try self.out("{s}\n", .{try io.json(self.a, .{
+            .repo = entry.repo.name,
+            .pr = pr.number,
+            .merged_commit = merged,
+            .target_branch = pr.baseRefName,
+            .target_head = target,
+            .limited_files = input.limited_files,
+            .review = try input.review(self.a, raw),
+        })});
     }
 
     fn reviewOptions(a: A, args: []const []const u8, allow_publish: bool) !core.ReviewOptions {
@@ -2352,8 +2445,9 @@ const Main = struct {
             return launchd.manage(self.local(null).command(&env), self.home, self.env.get("PATH") orelse "/usr/bin:/bin", self.db.path, label, eq(u8, cmd, "install"));
         }
         const is_tick = eq(u8, cmd, "tick") and params.len == 0;
+        const is_audit = eq(u8, cmd, "audit");
         const followup_preview = eq(u8, cmd, "followup") and params.len == 2 and eq(u8, params[1], "--dry-run");
-        const uses_providers = is_tick or followup_preview or eq(u8, cmd, "run-once") or eq(u8, cmd, "usage");
+        const uses_providers = is_tick or is_audit or followup_preview or eq(u8, cmd, "run-once") or eq(u8, cmd, "usage");
         const batch_lock = if (uses_providers) self.db.batchLock() catch |err| {
             if (err == error.AlreadyRunning and is_tick) return;
             return err;
@@ -2366,6 +2460,10 @@ const Main = struct {
         defer lock.close();
         if (is_tick) return self.scheduledTick(lock);
         var state = try self.db.load();
+        if (is_audit) {
+            lock.unlock();
+            return self.auditMerged(&state, params);
+        }
         if (eq(u8, cmd, "add")) return self.add(&state, params);
         if (eq(u8, cmd, "followup")) return self.followupCommand(&state, params);
         if (eq(u8, cmd, "defaults")) return self.defaults(&state, params);
@@ -3073,4 +3171,39 @@ test "reviewer cooldown applies to the remaining ensemble" {
     try std.testing.expect(!ReviewWorker.remainingLimited(engines, .claude, queue.engineBit(.codex)));
     try std.testing.expect(ReviewWorker.remainingLimited(engines, .claude, queue.engineBit(.claude)));
     try std.testing.expect(ReviewWorker.remainingLimited(engines, .claude, queue.engineBit(.kimi)));
+}
+
+test "queuing a finished head retries insufficient evidence and leaves deliberate silence alone" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var scratch = t.tmpDir(.{});
+    defer scratch.cleanup();
+    const path = try scratch.dir.realpathAlloc(a, ".");
+    try scratch.dir.chmod(0o700);
+    var db = try store.Store.open(a, path);
+    defer db.dir.close();
+    const app: Main = .{ .a = a, .db = db, .env = undefined, .home = path, .scratch = try a.dupeZ(u8, path), .scratch_dir = scratch.dir };
+    const head = "a" ** 40;
+    var jobs = [_]core.Job{.{ .number = 7, .head = head, .phase = .complete, .verdict = .{
+        .head = head,
+        .event = .COMMENT,
+        .complete = true,
+        .at = 1,
+        .publication = .local,
+        .disposition = .no_material_change,
+    } }};
+    var entries = [_]core.Entry{.{ .repo = .{ .name = "example/repo", .login = "reviewer" }, .jobs = &jobs }};
+    var state: store.State = .{ .entries = &entries };
+    const pull: core.Pull = .{ .number = 7, .headRefOid = head, .isDraft = false };
+
+    try t.expectEqual(.complete, (try app.enqueuePinnedPull(&state, &entries[0], pull, null)).phase);
+    jobs[0].verdict.?.disposition = .insufficient_evidence;
+    jobs[0].verdict.?.complete = false;
+    const queued = try app.enqueuePinnedPull(&state, &entries[0], pull, null);
+    try t.expectEqual(.pending, queued.phase);
+    try t.expect(queued.followup and queued.verdict == null);
+    const second = try app.enqueuePinnedPull(&state, &entries[0], pull, null);
+    try t.expectEqual(queued.followup_id, second.followup_id);
 }
