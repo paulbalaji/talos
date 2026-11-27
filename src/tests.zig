@@ -1,4 +1,5 @@
 const std = @import("std");
+const adaptive = @import("adaptive.zig");
 const core = @import("core.zig");
 const io = @import("io.zig");
 const store = @import("store.zig");
@@ -37,6 +38,7 @@ const Fake = struct {
     late_comments: ?[]const core.Reply = null,
     snapshot_threads: []const core.Thread = &.{},
     source_limited: bool = false,
+    pinned_snapshot: ?core.Snapshot = null,
     optional_source: []const u8 = "",
     previous_delta: []const u8 = "",
     historical_coverage_reasons: []const []const u8 = &.{},
@@ -81,6 +83,7 @@ const Fake = struct {
 
     pub fn snapshot(self: *Fake, _: core.Pull, threads: []const core.Thread) !core.Snapshot {
         self.snapshot_threads = threads;
+        if (self.pinned_snapshot) |snapshot_value| return snapshot_value;
         const required = "Diff in src/watch.rs";
         return .{
             .merge_base = base,
@@ -578,6 +581,65 @@ test "effective diff changes and human conversation comments trigger review" {
     try t.expect(job.legacyDiscussionChanged(repo.login, discussion, &.{ earlier, manual }));
 }
 
+test "description-only rereview reuses a proven source plan and suppresses repeat approval" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var configured = repo;
+    configured.approvals = true;
+    const patch = "diff --git a/watch.rs b/watch.rs\n--- a/watch.rs\n+++ b/watch.rs\n@@ -1 +1 @@\n-old source\n+new source\n";
+    const evidence = "Merge-base diff:\n" ++ patch;
+    var fake: Fake = .{
+        .a = a,
+        .result = clean,
+        .pinned_snapshot = .{
+            .merge_base = base,
+            .evidence = evidence,
+            .diff = .{ .patch = patch, .start = evidence.len - patch.len, .end = evidence.len },
+            .source_tree = "d" ** 40,
+        },
+    };
+    var job: core.Job = .{ .number = 42, .head = head };
+    const prior = (try core.run(a, &fake, configured, &job, .scheduled)).?;
+    try t.expectEqual(.APPROVE, prior.event);
+    try t.expectEqual(.verified, job.verdict.?.publication);
+    try t.expectEqual(.posted, job.verdict.?.disposition);
+    try t.expect(job.last_review.?.clean_source != null);
+
+    fake.target.body = "Clarify deployment sequencing.";
+    job.observeReviewInput(try core.ReviewInput.init(a, configured, fake.target, base, .{}), false, configured.approvals);
+    try t.expectEqual(.pending, job.phase);
+    const followup = (try core.run(a, &fake, configured, &job, .scheduled)).?;
+    const plan = followup.explanation.?.coverage.coverage_plan.?;
+    try t.expectEqual(.discussion, plan.scope);
+    try t.expectEqual(@as(usize, 1), plan.reused_source_units);
+    try t.expectEqual(@as(usize, 0), plan.planned_source_units);
+    try t.expect(std.mem.indexOf(u8, fake.prompt_text, "Clarify deployment sequencing.") != null);
+    try t.expect(std.mem.indexOf(u8, fake.prompt_text, "+new source") == null);
+    try t.expectEqual(.already_published, job.verdict.?.disposition);
+    try t.expectEqual(@as(usize, 1), fake.posts);
+
+    // A commit message amendment may change the SHA without changing any source.
+    fake.target.headRefOid = changed;
+    var amended_job: core.Job = .{ .number = 42, .head = changed, .last_review = job.last_review };
+    const amended = (try core.prepare(a, &fake, configured, &amended_job, .scheduled)).?;
+    try t.expectEqual(.discussion, amended.coverage_plan.?.scope);
+    const amended_review = (try core.finish(a, &fake, configured, &amended_job, amended, &.{
+        .{ .engine = .codex, .review = try core.parseReview(a, clean) },
+    })).?;
+    try t.expectEqualStrings(changed, amended_review.commit_id);
+    try t.expectEqual(.verified, amended_review.explanation.?.publication);
+    try t.expectEqual(@as(usize, 2), fake.posts);
+
+    fake.target.headRefOid = head;
+    fake.target.body = "Clarify the new branch's sequence.";
+    fake.pinned_snapshot.?.merge_base = changed;
+    job.observeReviewInput(try core.ReviewInput.init(a, configured, fake.target, changed, .{}), false, configured.approvals);
+    const rebased = (try core.prepare(a, &fake, configured, &job, .scheduled)).?;
+    try t.expectEqual(.full, rebased.coverage_plan.?.scope);
+    try t.expect(std.mem.indexOf(u8, rebased.context, "+new source") != null);
+}
+
 test "standalone thanks neither invalidates an approval nor wakes a finished review" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
@@ -861,7 +923,14 @@ test "draft findings publish while clean draft approvals wait until ready" {
     try t.expectEqual(.COMMENT, with_issue.posted_result.?.event);
     try t.expect(!issue_job.awaiting_ready);
 
-    var covered: Fake = .{ .a = a, .target = draft, .result = clean };
+    const patch = "diff --git a/watch.rs b/watch.rs\n--- a/watch.rs\n+++ b/watch.rs\n@@ -1 +1 @@\n-old source\n+new source\n";
+    const pinned: core.Snapshot = .{
+        .merge_base = base,
+        .evidence = patch,
+        .diff = .{ .patch = patch, .start = 0, .end = patch.len },
+        .source_tree = "d" ** 40,
+    };
+    var covered: Fake = .{ .a = a, .target = draft, .result = clean, .pinned_snapshot = pinned };
     var job: core.Job = .{ .number = 42, .head = head };
     const result = (try core.run(a, &covered, configured, &job, .scheduled)).?;
     try t.expectEqual(.local, result.explanation.?.publication);
@@ -875,11 +944,135 @@ test "draft findings publish while clean draft approvals wait until ready" {
     const ready_input = try core.ReviewInput.init(a, configured, fixture_pull, base, .{});
     job.observeReviewInput(ready_input, false, true);
     try t.expectEqual(.pending, job.phase);
-    _ = try core.run(a, &covered, configured, &job, .scheduled);
+    const published = (try core.run(a, &covered, configured, &job, .scheduled)).?;
     try t.expectEqual(@as(usize, 1), covered.posts);
+    try t.expectEqual(@as(usize, 1), covered.reviews_run);
     try t.expectEqual(.APPROVE, covered.posted_result.?.event);
+    const plan = published.explanation.?.coverage.coverage_plan.?;
+    try t.expectEqual(.publication, plan.scope);
+    try t.expectEqual(@as(usize, 0), plan.planned_sections);
+    try t.expectEqual(plan.required_source_units, plan.reused_source_units);
     job.observeReviewInput(ready_input, false, true);
     try t.expectEqual(.complete, job.phase);
+
+    var edited: Fake = .{ .a = a, .target = draft, .result = clean, .pinned_snapshot = pinned };
+    var edited_job: core.Job = .{ .number = 42, .head = head };
+    _ = try core.run(a, &edited, configured, &edited_job, .scheduled);
+    edited.target.isDraft = false;
+    edited.target.body = "Updated rollout plan.";
+    edited_job.observeReviewInput(try core.ReviewInput.init(a, configured, edited.target, base, .{}), false, true);
+    const edited_result = (try core.run(a, &edited, configured, &edited_job, .scheduled)).?;
+    try t.expectEqual(.discussion, edited_result.explanation.?.coverage.coverage_plan.?.scope);
+    try t.expectEqual(@as(usize, 2), edited.reviews_run);
+
+    // A new thread at publication time invalidates the no-thread proof.
+    var late: Fake = .{ .a = a, .target = draft, .result = clean, .pinned_snapshot = pinned };
+    var late_job: core.Job = .{ .number = 42, .head = head };
+    _ = try core.run(a, &late, configured, &late_job, .scheduled);
+    late.target.isDraft = false;
+    late.thread_reads = 0;
+    late.late_discussion = &.{.{
+        .id = "late",
+        .isResolved = false,
+        .isOutdated = false,
+        .path = "watch.rs",
+        .line = 1,
+        .replies = &.{.{ .author = .{ .login = "automation[bot]" }, .body = "Failure in rollout signal.", .url = "late" }},
+    }};
+    late_job.observeReviewInput(ready_input, false, true);
+    try t.expectError(error.ThreadsChanged, core.run(a, &late, configured, &late_job, .scheduled));
+    try t.expectEqual(@as(usize, 0), late.posts);
+}
+
+test "overflow source sections retain full diff coverage without claiming to assess threads" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var configured = repo;
+    configured.approvals = true;
+    const header = "diff --git a/watch.rs b/watch.rs\n--- a/watch.rs\n+++ b/watch.rs\n";
+    const other = "diff --git a/other.rs b/other.rs\n--- a/other.rs\n+++ b/other.rs\n";
+    const first = "@@ -1 +1 @@\n+" ++ "a" ** 22_000 ++ "\n";
+    const last = "@@ -20 +20 @@\n+" ++ "b" ** 50_000 ++ "\n";
+    const prefix = "Merge-base diff:\n";
+    const replies = [_]core.Reply{.{
+        .author = .{ .login = "reviewer" },
+        .body = "Complete thread context. " ++ "c" ** 2_270,
+        .url = "replies",
+    }} ** 17;
+    const thread: core.Thread = .{ .id = "open-thread", .isResolved = false, .isOutdated = false, .path = "watch.rs", .line = 1, .replies = &replies };
+    const ignored =
+        \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":[],"non_blocking_threads":[{"id":"open-thread","reason":"An unsupported conclusion from a source-only pass."}]}
+    ;
+    const verified =
+        \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":[],"non_blocking_threads":[{"id":"open-thread","reason":"A checked conclusion from the section that has the thread."}]}
+    ;
+    const blocked =
+        \\{"complete":true,"summary":"Static review.","findings":[],"existing_open_findings":["open-thread"],"non_blocking_threads":[]}
+    ;
+    const cases = [_]struct { response: []const u8, event: core.Event, early_overflow: bool = false, only_source: bool = false }{
+        .{ .response = clean, .event = .COMMENT },
+        .{ .response = verified, .event = .APPROVE, .early_overflow = true },
+        .{ .response = blocked, .event = .COMMENT },
+        .{ .response = verified, .event = .COMMENT, .only_source = true },
+    };
+    for (cases) |case| {
+        const patch = if (case.only_source) header ++ last ++ other ++ last else if (case.early_overflow) other ++ last ++ header ++ first else header ++ first ++ other ++ last;
+        const evidence = try std.mem.concat(a, u8, &.{ prefix, patch[0..22_000] });
+        var fake: Fake = .{
+            .a = a,
+            .discussion = &.{thread},
+            .pinned_snapshot = .{
+                .merge_base = base,
+                .evidence = evidence,
+                .diff = .{ .patch = patch, .start = prefix.len, .end = evidence.len },
+                .limited = true,
+                .coverage_reasons = &.{core.diff_byte_limit_reason},
+            },
+        };
+        var job: core.Job = .{ .number = 42, .head = head };
+        const prepared = (try core.prepare(a, &fake, configured, &job, .scheduled)).?;
+        try t.expectEqual(@as(usize, 2), prepared.sections.len);
+        try t.expectEqual(case.only_source, prepared.snap.limited);
+        try t.expectEqual(@as(usize, 2), prepared.coverage_plan.?.planned_source_units);
+        const thread_index: usize = if (case.early_overflow) 1 else 0;
+        const source_index = 1 - thread_index;
+        try t.expectEqual(case.only_source, prepared.sections[thread_index].source_only);
+        try t.expect(prepared.sections[source_index].source_only);
+        try t.expectEqual(!case.only_source, std.mem.indexOf(u8, try core.screenPrompt(a, prepared), "Complete thread context.") != null);
+        try t.expect(std.mem.indexOf(u8, prepared.sections[source_index].context, "Complete thread context.") == null);
+        if (case.early_overflow) try t.expectEqualStrings(other ++ last, prepared.sections[0].patch);
+
+        const plan: adaptive.Plan = .{
+            .repo = configured,
+            .providers = prepared.engines,
+            .prepared = prepared,
+            .screen = .{ .ask_model = false, .floor = .{} },
+            .start_limit = 2,
+            .progress = .{ .fingerprint = @splat(0), .sections = .{ .finished_mask = 0, .checkpoint = try .capture(a, configured, prepared) } },
+        };
+        var outcomes: [2]adaptive.SectionOutcome = undefined;
+        for (&outcomes, 0..) |*outcome, index| {
+            const raw = if (index == thread_index) case.response else ignored;
+            const results = try a.dupe(core.ReviewerResult, &.{.{ .engine = .codex, .review = try core.parseReview(a, raw) }});
+            const progress: core.RouteProgress = .{ .fingerprint = @splat(0), .results = results };
+            outcome.* = .{
+                .task = .{ .index = index, .progress = progress },
+                .review = .{ .progress = progress, .report = .{
+                    .mode = .fixed,
+                    .suggested = .{},
+                    .applied = .{},
+                    .providers = &.{.codex},
+                    .screen_ms = 0,
+                    .review_ms = 0,
+                } },
+            };
+        }
+        const merged = try adaptive.mergeParallelSections(a, plan, &outcomes);
+        const result = (try core.finish(a, &fake, configured, &job, prepared, merged.review_results.?)).?;
+        try t.expectEqual(case.event, result.event);
+        try t.expectEqual(@as(usize, @intFromBool(case.event == .APPROVE)), fake.posts);
+    }
 }
 
 test "publishes one commit-bound comment, verifies it, and deduplicates a second review" {
@@ -1162,11 +1355,15 @@ test "v0 registration upgrades without its checkout and preserves publication in
     const a = allocator.allocator();
     const path = try io.temp(a);
     defer std.fs.deleteTreeAbsolute(path) catch {};
+    {
+        var legacy = try std.fs.openDirAbsolute(path, .{});
+        defer legacy.close();
+        try io.write(legacy, "state.json",
+            \\{"version":1,"entries":[{"repo":{"name":"example/repo","checkout":"/missing/v0/checkout","login":"reviewer","comments":true,"approvals":true},"jobs":[{"number":42,"head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","phase":"uncertain","event":"COMMENT","receipt":55}]}]}
+        );
+    }
     var db = try store.Store.open(a, path);
     defer db.dir.close();
-    try io.write(db.dir, "state.json",
-        \\{"version":1,"entries":[{"repo":{"name":"example/repo","checkout":"/missing/v0/checkout","login":"reviewer","comments":true,"approvals":true},"jobs":[{"number":42,"head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","phase":"uncertain","event":"COMMENT","receipt":55}]}]}
-    );
     const state = try db.load();
     try t.expectEqual(@as(u32, 128), state.entries[0].repo.cache_mib);
     try t.expectEqual(@as(u16, 7), state.entries[0].repo.cache_idle_days);
@@ -1177,7 +1374,7 @@ test "v0 registration upgrades without its checkout and preserves publication in
     const upgraded = try db.load();
     try t.expectEqual(core.Phase.uncertain, upgraded.entries[0].jobs[0].phase);
     try t.expectEqual(@as(?u64, 55), upgraded.entries[0].jobs[0].receipt);
-    const data = try db.dir.readFileAlloc(a, "state.json", 4096);
+    const data = try io.json(a, upgraded);
     try t.expect(std.mem.indexOf(u8, data, "checkout") == null);
 }
 

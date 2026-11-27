@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("core.zig");
 const io = @import("io.zig");
+const queue = @import("queue.zig");
 const stack = @import("stack.zig");
 const store = @import("store.zig");
 const telemetry = @import("telemetry.zig");
@@ -14,6 +15,7 @@ const history_limit = 160;
 const legacy_file_limit = 256;
 
 const Attempt = struct {
+    id: []const u8,
     engine: core.Engine,
     model: []const u8,
     stage: telemetry.Stage,
@@ -63,6 +65,7 @@ fn pairAttempts(a: A, events: []const telemetry.Event, now: i64) ![]Attempt {
         const started = pair.start orelse pair.finish.?;
         const latest = pair.finish orelse started;
         row.* = .{
+            .id = latest.id,
             .engine = latest.engine,
             .model = latest.model,
             .stage = latest.scope.stage,
@@ -85,7 +88,8 @@ fn pairAttempts(a: A, events: []const telemetry.Event, now: i64) ![]Attempt {
     }
     std.mem.sort(Attempt, attempts, {}, struct {
         fn newer(_: void, left: Attempt, right: Attempt) bool {
-            return left.at > right.at;
+            if (left.at != right.at) return left.at > right.at;
+            return std.mem.order(u8, left.id, right.id) == .lt;
         }
     }.newer);
     return attempts;
@@ -101,6 +105,56 @@ const FinishedPass = struct {
     duration_ms: ?u64,
     outcome: []const u8,
 };
+const JobWait = enum {
+    paused,
+    stack,
+    stack_publication,
+    retry,
+    github_cooldown,
+    provider_cooldown,
+    more_providers,
+    unavailable,
+    receipt_exhausted,
+};
+const VerdictSummary = struct {
+    event: core.Event,
+    coverage_complete: ?bool,
+    publication: []const u8,
+    at: ?i64,
+    github_review_id: ?u64,
+    disposition: ?core.PublicationDisposition,
+    coverage_plan: ?core.CoveragePlan,
+
+    fn fromResult(event: core.Event, detail: ?core.Explanation) VerdictSummary {
+        return .{
+            .event = event,
+            .coverage_complete = if (detail) |d| d.coverage.complete else null,
+            .publication = if (detail) |d| @tagName(d.publication) else "local",
+            .at = if (detail) |d| d.at else null,
+            .github_review_id = if (detail) |d| d.github_review_id else null,
+            .disposition = if (detail) |d| d.disposition else null,
+            .coverage_plan = if (detail) |d| d.coverage.coverage_plan else null,
+        };
+    }
+
+    fn fromReceipt(receipt: core.VerdictReceipt) VerdictSummary {
+        return .{
+            .event = receipt.event,
+            .coverage_complete = receipt.complete,
+            .publication = @tagName(receipt.publication),
+            .at = receipt.at,
+            .github_review_id = receipt.github_review_id,
+            .disposition = receipt.disposition,
+            .coverage_plan = receipt.coverage_plan,
+        };
+    }
+};
+const Availability = struct {
+    now: i64,
+    paused: bool,
+    budget: queue.Budget = .{},
+    usage: usage.Snapshot = .{},
+};
 const JobRow = struct {
     repo: []const u8,
     number: u32,
@@ -115,14 +169,23 @@ const JobRow = struct {
     active_providers: []const ActiveProvider,
     last_pass: ?FinishedPass,
     next_at: i64,
+    eligible_at: ?i64,
+    wait: ?JobWait,
     attempts: u8,
     last_error: ?[]const u8,
+    last_error_at: ?i64,
+    outcome: ?[]const u8,
+    verdict: ?VerdictSummary,
+    coverage_plan: ?core.CoveragePlan,
+    review_key: ?[]const u8,
+    route: ?@FieldType(core.Explanation, "route"),
     blocked_by: ?u32,
+    publication_blocked_by: ?u32,
     all_models: bool,
     stack: ?u32,
 };
 
-fn jobRow(a: A, entry: core.Entry, number: u32, attempts: []const Attempt, now: i64, paused: bool) !?JobRow {
+fn jobRow(a: A, entry: core.Entry, number: u32, attempts: []const Attempt, availability: Availability, result: ?core.Result) !?JobRow {
     var seen: ?core.Seen = null;
     for (entry.seen) |pull| {
         if (pull.number == number) {
@@ -142,22 +205,58 @@ fn jobRow(a: A, entry: core.Entry, number: u32, attempts: []const Attempt, now: 
         job = candidate;
     }
     if (job == null and seen == null) return null;
-    return try buildJobRow(a, entry, job, seen, attempts, now, paused);
+    var row = try buildJobRow(a, entry, job, seen, attempts, availability);
+    if (row.verdict != null) return row;
+    if (result) |saved| {
+        const head = row.head;
+        const run = row.review_key orelse "";
+        // A just-started follow-up can share the head of the previous
+        // verdict. Only attach metadata for this specific run.
+        if (io.eq(u8, saved.commit_id, head) and io.eq(u8, saved.followupId(), run)) {
+            if (saved.explanation == null or saved.explanation.?.publication != .preview) {
+                row.verdict = VerdictSummary.fromResult(saved.event, saved.explanation);
+            }
+        } else {
+            for (saved.history) |prior| {
+                const detail = prior.explanation orelse continue;
+                if (detail.publication == .preview or !io.eq(u8, prior.commit_id, head) or !io.eq(u8, detail.followup_id orelse "", run)) continue;
+                row.verdict = VerdictSummary.fromResult(prior.event, detail);
+                break;
+            }
+        }
+    }
+    return row;
 }
 
-fn buildJobRow(a: A, entry: core.Entry, job: ?core.Job, seen_: ?core.Seen, attempts: []const Attempt, now: i64, paused: bool) !JobRow {
+fn buildJobRow(a: A, entry: core.Entry, job: ?core.Job, seen_: ?core.Seen, attempts: []const Attempt, availability: Availability) !JobRow {
+    const now = availability.now;
     const seen = seen_ orelse core.Seen{ .number = job.?.number, .head = job.?.head };
     const head = if (job) |current| current.head else seen.head;
+    const review_key = if (job) |current| try core.followupId(a, current) else null;
     const progress = if (job) |current| current.route_progress else null;
-    const complete = if (progress) |p| p.sections.index else 0;
+    const report = if (job) |current| current.route_report else null;
+    const verdict: ?VerdictSummary = if (job) |current| verdict: {
+        if (current.verdict) |receipt| {
+            if (io.eq(u8, receipt.head, head)) break :verdict VerdictSummary.fromReceipt(receipt);
+        }
+        break :verdict null;
+    } else null;
+    const plan = if (progress) |p|
+        if (p.sections.checkpoint) |checkpoint| checkpoint.coverage_plan else null
+    else if (verdict) |saved|
+        saved.coverage_plan
+    else
+        null;
+    const final_sections = if (report) |completed| completed.diff_sections else 0;
+    const complete = if (progress) |p| p.sections.index else final_sections;
     var total: ?usize = null;
+    if (final_sections != 0) total = final_sections;
     if (progress) |p| if (p.sections.checkpoint) |checkpoint| {
         total = checkpoint.section_count;
     };
     var active: std.ArrayList(ActiveProvider) = .empty;
     var last_pass: ?FinishedPass = null;
-    if (job != null and job.?.phase == .pending) {
-        const review_key = try core.followupId(a, job.?);
+    if (job != null) {
         for (attempts) |attempt| {
             if (attempt.mode != .scheduled or
                 !io.eq(u8, attempt.repo, entry.repo.name) or attempt.number != seen.number or !io.eq(u8, attempt.head, head)) continue;
@@ -174,27 +273,51 @@ fn buildJobRow(a: A, entry: core.Entry, job: ?core.Job, seen_: ?core.Seen, attem
                 };
                 continue;
             }
-            if (!io.eq(u8, attempt.outcome, "running")) continue;
+            if (job.?.phase != .pending or !io.eq(u8, attempt.outcome, "running")) continue;
             if (total == null) total = attempt.section_count;
             try active.append(a, .{ .engine = attempt.engine, .model = attempt.model, .stage = attempt.stage, .section = attempt.section, .at = attempt.at });
         }
     }
-    var blocked: ?u32 = null;
+    var publication_blocked: ?u32 = null;
     var stack_number: ?u32 = null;
     if (stack.find(entry.stacks, seen.number)) |position| {
         const item = entry.stacks[position.stack_index];
         if (item.native) |native| stack_number = native.number;
-        if (stack.blocker(entry, item, position.member_index)) |block| blocked = block.number;
+        if (stack.blocker(entry, item, position.member_index)) |block| publication_blocked = block.number;
     }
+    const stack_wait = if (job) |current| current.phase == .pending and stack.analysisBlocked(entry, current) else false;
+    const blocked = if (stack_wait) publication_blocked else null;
     var last_error: ?[]const u8 = null;
+    var last_error_at: ?i64 = null;
     var errors = std.mem.reverseIterator(entry.errors);
     while (errors.next()) |entry_error| {
         if (entry_error.number == seen.number) {
             last_error = entry_error.detail;
+            last_error_at = entry_error.at;
             break;
         }
     }
     const phase = if (job) |current| @tagName(current.phase) else "baseline";
+    const eligible_at: ?i64 = if (job) |current|
+        if (!availability.paused and active.items.len == 0) availability.budget.eligibleAt(entry, current, now, 0, availability.usage) else null
+    else
+        null;
+    const wait: ?JobWait = wait: {
+        const current = job orelse break :wait null;
+        if (active.items.len != 0 or (current.phase != .pending and current.phase != .uncertain)) break :wait null;
+        if (current.phase == .uncertain and !current.schedulable()) break :wait .receipt_exhausted;
+        if (availability.paused) break :wait .paused;
+        if (stack_wait) {
+            if (current.analysis != null or (progress != null and progress.?.readyToPublish())) break :wait .stack_publication;
+            break :wait .stack;
+        }
+        if (progress) |p| if (p.needsAnotherProvider(entry.repo)) break :wait .more_providers;
+        const at = eligible_at orelse break :wait .unavailable;
+        if (at <= now) break :wait null;
+        if (at == current.next) break :wait .retry;
+        if (at == availability.budget.github.until) break :wait .github_cooldown;
+        break :wait .provider_cooldown;
+    };
     const stage = stage: {
         const current = job orelse break :stage "baseline";
         switch (current.phase) {
@@ -204,12 +327,13 @@ fn buildJobRow(a: A, entry: core.Entry, job: ?core.Job, seen_: ?core.Seen, attem
             .pending => {},
         }
         if (active.items.len != 0) break :stage @tagName(active.items[0].stage);
-        if (paused) break :stage "paused";
-        if (blocked != null) break :stage "blocked";
-        if (current.next > now) break :stage "retry";
+        if (availability.paused) break :stage "paused";
+        if (stack_wait) break :stage "blocked";
+        if (current.next > now or (eligible_at != null and eligible_at.? > now)) break :stage "retry";
         if (current.analysis != null) break :stage "publishing";
         if (progress) |p| {
             if (p.readyToPublish()) break :stage "publishing";
+            if (p.screen_waiting and p.decision == null) break :stage "screening";
             if (p.completion_requests != null and p.completion_requests.?.len != 0) break :stage "evidence";
             for (p.sections.pending) |task| {
                 if (task.progress.completion_requests != null and task.progress.completion_requests.?.len != 0) break :stage "evidence";
@@ -226,18 +350,64 @@ fn buildJobRow(a: A, entry: core.Entry, job: ?core.Job, seen_: ?core.Seen, attem
         .draft = seen.is_draft,
         .phase = phase,
         .stage = stage,
-        .percent = if (io.eq(u8, phase, "complete")) 100 else if (total) |count| if (count > 0) @intCast(@min(99, @as(u128, complete) * 100 / count)) else null else null,
+        .percent = if (total) |count| if (count > 0) @intCast(@min(100, @as(u128, complete) * 100 / count)) else null else null,
         .completed_sections = complete,
         .total_sections = total,
         .active_providers = active.items,
         .last_pass = last_pass,
         .next_at = if (job) |current| current.next else 0,
+        .eligible_at = eligible_at,
+        .wait = wait,
         .attempts = if (job) |current| current.attempts else 0,
         .last_error = last_error,
+        .last_error_at = last_error_at,
+        .outcome = if (job) |current| current.outcome else null,
+        .verdict = verdict,
+        .coverage_plan = plan,
+        .review_key = review_key,
+        .route = if (report) |completed| completed.applied.depth else if (progress) |p| if (p.decision) |d| d.depth else null else null,
         .blocked_by = blocked,
+        .publication_blocked_by = if (job != null and job.?.phase == .pending) publication_blocked else null,
         .stack = stack_number,
         .all_models = if (job) |current| current.options.all_models or (progress != null and progress.?.all_models) else false,
     };
+}
+
+test "queue rows distinguish durable publication, limited coverage and cooldown" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const entry: core.Entry = .{ .repo = .{ .name = "example/repo", .login = "reviewer" } };
+    var job: core.Job = .{ .number = 7, .head = "a" ** 40 };
+    var availability: Availability = .{ .now = 1000, .paused = false };
+    availability.budget.noteFailure(990, error.GitHubRateLimited);
+    const waiting = try buildJobRow(a, entry, job, null, &.{}, availability);
+    try t.expectEqual(@as(?i64, 1050), waiting.eligible_at);
+    try t.expectEqual(@as(?JobWait, .github_cooldown), waiting.wait);
+    try t.expectEqualStrings("retry", waiting.stage);
+
+    job.phase = .uncertain;
+    job.attempts = 100;
+    const unconfirmed = try buildJobRow(a, entry, job, null, &.{}, availability);
+    try t.expectEqual(@as(?JobWait, .receipt_exhausted), unconfirmed.wait);
+
+    job.phase = .complete;
+    job.verdict = .{
+        .head = job.head,
+        .event = .COMMENT,
+        .complete = false,
+        .at = 995,
+        .publication = .local,
+        .disposition = .insufficient_evidence,
+    };
+    const saved = try buildJobRow(a, entry, job, null, &.{}, availability);
+    try t.expectEqual(@as(?bool, false), saved.verdict.?.coverage_complete);
+    try t.expectEqualStrings("local", saved.verdict.?.publication);
+    try t.expectEqual(@as(?core.PublicationDisposition, .insufficient_evidence), saved.verdict.?.disposition);
+    try t.expectEqual(@as(?usize, null), saved.percent);
+    job.head = "b" ** 40;
+    try t.expect((try buildJobRow(a, entry, job, null, &.{}, availability)).verdict == null);
 }
 
 const HistoryRow = struct {
@@ -251,6 +421,7 @@ const HistoryRow = struct {
     route: ?@FieldType(core.Explanation, "route"),
     complete: ?bool,
     review_key: ?[]const u8,
+    disposition: ?core.PublicationDisposition,
 };
 
 const HistoryKey = struct { repo: []const u8, number: u32, head: []const u8, run: []const u8 };
@@ -273,38 +444,9 @@ fn historyKey(row: HistoryRow) HistoryKey {
     return .{ .repo = row.repo, .number = row.number, .head = row.head, .run = row.review_key orelse "" };
 }
 
-const LegacyFile = struct { repo: []const u8, number: u32, changed_at: i64 };
-fn compareFiles(_: void, left: LegacyFile, right: LegacyFile) std.math.Order {
-    return std.math.order(left.changed_at, right.changed_at);
-}
-
-fn legacyHistory(a: A, db: store.Store, entries: []const core.Entry, since: i64, rows: *std.ArrayList(HistoryRow), index: *HistoryIndex) !bool {
-    var latest = std.PriorityQueue(LegacyFile, void, compareFiles).init(a, {});
-    defer latest.deinit();
-    var truncated = false;
-    for (entries) |entry| {
-        const path = try db.repoPath(entry.repo.name, "results");
-        var results = db.dir.openDir(path, .{ .iterate = true, .no_follow = true }) catch |err| switch (err) {
-            error.FileNotFound => continue,
-            else => return err,
-        };
-        defer results.close();
-        var files = results.iterate();
-        while (try files.next()) |file| {
-            if (file.kind != .file or !std.mem.endsWith(u8, file.name, ".json")) continue;
-            const number = std.fmt.parseUnsigned(u32, file.name[0 .. file.name.len - ".json".len], 10) catch continue;
-            const stat = results.statFile(file.name) catch continue;
-            const changed_at: i64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_s));
-            if (changed_at < since) continue;
-            if (latest.count() == legacy_file_limit) {
-                truncated = true;
-                if (latest.peek().?.changed_at >= changed_at) continue;
-                _ = latest.remove();
-            }
-            try latest.add(.{ .repo = entry.repo.name, .number = number, .changed_at = changed_at });
-        }
-    }
-    while (latest.removeOrNull()) |file| {
+fn legacyHistory(a: A, db: store.Store, since: i64, rows: *std.ArrayList(HistoryRow), index: *HistoryIndex) !bool {
+    const files = try db.listResults(since, legacy_file_limit + 1);
+    for (files[0..@min(files.len, legacy_file_limit)]) |file| {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         var local = db;
@@ -314,10 +456,10 @@ fn legacyHistory(a: A, db: store.Store, entries: []const core.Entry, since: i64,
         try addLegacy(a, rows, index, file, result.commit_id, result.event, result.explanation, since, file.changed_at);
         for (result.history) |prior| try addLegacy(a, rows, index, file, prior.commit_id, prior.event, prior.explanation, since, 0);
     }
-    return truncated;
+    return files.len > legacy_file_limit;
 }
 
-fn addLegacy(a: A, rows: *std.ArrayList(HistoryRow), index: *HistoryIndex, file: LegacyFile, head: []const u8, event: core.Event, detail: ?core.Explanation, since: i64, fallback: i64) !void {
+fn addLegacy(a: A, rows: *std.ArrayList(HistoryRow), index: *HistoryIndex, file: store.ResultFile, head: []const u8, event: core.Event, detail: ?core.Explanation, since: i64, fallback: i64) !void {
     const at = if (detail) |explanation| explanation.at else fallback;
     if (at < since) return;
     const key = if (detail) |explanation| explanation.followup_id else null;
@@ -333,6 +475,7 @@ fn addLegacy(a: A, rows: *std.ArrayList(HistoryRow), index: *HistoryIndex, file:
         .route = if (detail) |explanation| explanation.route else null,
         .complete = if (detail) |explanation| explanation.coverage.complete else null,
         .review_key = if (key) |value| try a.dupe(u8, value) else null,
+        .disposition = if (detail) |explanation| explanation.disposition else null,
     };
     try index.put(a, historyKey(row), {});
     try rows.append(a, row);
@@ -340,7 +483,7 @@ fn addLegacy(a: A, rows: *std.ArrayList(HistoryRow), index: *HistoryIndex, file:
 
 const History = struct { rows: []const HistoryRow = &.{}, truncated: bool = false };
 
-fn getHistory(a: A, db: store.Store, entries: []const core.Entry, since: i64, now: i64) !History {
+fn getHistory(a: A, db: store.Store, since: i64, now: i64) !History {
     var rows: std.ArrayList(HistoryRow) = .empty;
     var index: HistoryIndex = .empty;
     defer index.deinit(a);
@@ -357,11 +500,12 @@ fn getHistory(a: A, db: store.Store, entries: []const core.Entry, since: i64, no
             .route = verdict.route,
             .complete = verdict.complete,
             .review_key = verdict.review_id,
+            .disposition = verdict.disposition,
         };
         const slot = try index.getOrPut(a, historyKey(row));
         if (!slot.found_existing) try rows.append(a, row);
     }
-    const limited = try legacyHistory(a, db, entries, since, &rows, &index);
+    const limited = try legacyHistory(a, db, since, &rows, &index);
     std.mem.sort(HistoryRow, rows.items, {}, struct {
         fn newer(_: void, left: HistoryRow, right: HistoryRow) bool {
             return left.at > right.at;
@@ -370,19 +514,45 @@ fn getHistory(a: A, db: store.Store, entries: []const core.Entry, since: i64, no
     return .{ .rows = rows.items, .truncated = limited or verdicts.len >= telemetry.max_query_events };
 }
 
-const RepoRow = struct { name: []const u8, paused: bool, last_scan_at: i64, next_scan_at: i64 };
+const RepoRow = struct {
+    name: []const u8,
+    paused: bool,
+    last_scan_at: i64,
+    next_scan_at: i64,
+    scan_attempts: u8,
+    scan_error: ?[]const u8,
+};
 const StackMemberRow = struct { number: u32, draft: bool, phase: []const u8, blocked_by: ?u32 };
 const StackRow = struct { repo: []const u8, number: ?u32, name: []const u8, members: []const StackMemberRow };
 
 pub fn stateJson(a: A, db: store.Store, include_history: bool, now: i64) ![]const u8 {
     const state = try db.load();
+    const ledger = try usage.load(a, db.dir, now);
     const attempts = try pairAttempts(a, try telemetry.read(a, db.dir, .{ .since = now - active_attempt_seconds, .limit = 2048, .now = now }), now);
     var repos: std.ArrayList(RepoRow) = .empty;
     var jobs: std.ArrayList(JobRow) = .empty;
     var stacks: std.ArrayList(StackRow) = .empty;
     for (state.entries) |entry| {
         const paused = try db.paused(entry.repo.name);
-        try repos.append(a, .{ .name = entry.repo.name, .paused = paused, .last_scan_at = entry.last_scan, .next_scan_at = entry.next_scan });
+        const availability: Availability = .{ .now = now, .paused = paused, .budget = state.queue_budget, .usage = ledger };
+        var scan_error: ?[]const u8 = null;
+        if (entry.scan_attempts > 0) {
+            var errors = std.mem.reverseIterator(entry.errors);
+            while (errors.next()) |issue| {
+                if (issue.at < entry.last_scan) break;
+                if (issue.number != null) continue;
+                scan_error = issue.detail;
+                break;
+            }
+        }
+        try repos.append(a, .{
+            .name = entry.repo.name,
+            .paused = paused,
+            .last_scan_at = entry.last_scan,
+            .next_scan_at = entry.next_scan,
+            .scan_attempts = entry.scan_attempts,
+            .scan_error = scan_error,
+        });
         for (entry.jobs) |job| {
             var seen: ?core.Seen = null;
             for (entry.seen) |pull| {
@@ -391,7 +561,7 @@ pub fn stateJson(a: A, db: store.Store, include_history: bool, now: i64) ![]cons
                     break;
                 }
             }
-            try jobs.append(a, try buildJobRow(a, entry, job, seen, attempts, now, paused));
+            try jobs.append(a, try buildJobRow(a, entry, job, seen, attempts, availability));
         }
         for (try stack.statuses(a, entry)) |item| {
             const members = try a.alloc(StackMemberRow, item.members.len);
@@ -404,13 +574,14 @@ pub fn stateJson(a: A, db: store.Store, include_history: bool, now: i64) ![]cons
             try stacks.append(a, .{ .repo = entry.repo.name, .number = item.native_number, .name = item.name, .members = members });
         }
     }
-    const history = if (include_history) try getHistory(a, db, state.entries, now - detail_days * day_seconds, now) else History{};
+    const history = if (include_history) try getHistory(a, db, now - detail_days * day_seconds, now) else History{};
     return io.json(a, .{
         .at = now,
         .repos = repos.items,
         .jobs = jobs.items,
         .stacks = stacks.items,
         .history = history.rows[0..@min(history.rows.len, history_limit)],
+        .history_truncated = history.truncated or history.rows.len > history_limit,
     });
 }
 
@@ -441,10 +612,31 @@ const Bucket = struct {
     model: []const u8,
     totals: Totals = .{},
     failures: usize = 0,
-    measured: usize = 0,
+    durations: std.ArrayList(u64) = .empty,
     duration_ms: u64 = 0,
 };
-const ProviderRow = struct { engine: core.Engine, model: []const u8, attempts: usize, reported: usize, failures: usize, input_tokens: ?u64, output_tokens: ?u64, mean_duration_ms: ?u64 };
+const ProviderRow = struct {
+    engine: core.Engine,
+    model: []const u8,
+    attempts: usize,
+    reported: usize,
+    failures: usize,
+    input_tokens: ?u64,
+    output_tokens: ?u64,
+    mean_duration_ms: ?u64,
+    measured: usize,
+    p50_duration_ms: ?u64,
+    p95_duration_ms: ?u64,
+};
+const InvocationOutcome = enum { success, failed, timed_out, rate_limited, interrupted, running };
+
+fn percentile(sorted: []const u64, percent: usize) ?u64 {
+    if (sorted.len == 0) return null;
+    const rank = std.math.divCeil(usize, sorted.len * percent, 100) catch unreachable;
+    return sorted[rank - 1];
+}
+
+const ReviewCoverage = struct { complete: usize = 0, limited: usize = 0, unknown: usize = 0 };
 const DayRow = struct { day: []const u8, attempts: usize, reported: usize, input_tokens: ?u64, output_tokens: ?u64 };
 const ModelRow = struct { engine: core.Engine, model: []const u8, participations: usize = 0, input_tokens: ?u64 = null, output_tokens: ?u64 = null };
 
@@ -492,6 +684,7 @@ pub fn metricsJson(a: A, db: store.Store, days: u32, offset: u32, now: i64) ![]c
     var stages: std.EnumArray(telemetry.Stage, usize) = .initFill(0);
     const Mode = @FieldType(telemetry.Scope, "mode");
     var modes: std.EnumArray(Mode, usize) = .initFill(0);
+    var outcomes: std.EnumArray(InvocationOutcome, usize) = .initFill(0);
     for (attempts) |attempt| {
         if (attempt.at < first or attempt.at > end) continue;
         totals.add(attempt);
@@ -511,9 +704,11 @@ pub fn metricsJson(a: A, db: store.Store, days: u32, offset: u32, now: i64) ![]c
             break :added item;
         };
         bucket.totals.add(attempt);
-        if (!io.eq(u8, attempt.outcome, "success") and !io.eq(u8, attempt.outcome, "running")) bucket.failures += 1;
+        const outcome = std.meta.stringToEnum(InvocationOutcome, attempt.outcome) orelse .failed;
+        outcomes.getPtr(outcome).* += 1;
+        if (outcome != .success and outcome != .running) bucket.failures += 1;
         if (attempt.duration_ms) |duration| {
-            bucket.measured += 1;
+            try bucket.durations.append(a, duration);
             bucket.duration_ms +|= duration;
         }
     }
@@ -526,16 +721,24 @@ pub fn metricsJson(a: A, db: store.Store, days: u32, offset: u32, now: i64) ![]c
         .output_tokens = day_totals.output_tokens,
     };
     const providers = try a.alloc(ProviderRow, buckets.items.len);
-    for (providers, buckets.items) |*provider, bucket| provider.* = .{
-        .engine = bucket.engine,
-        .model = bucket.model,
-        .attempts = bucket.totals.attempts,
-        .reported = bucket.totals.reported,
-        .failures = bucket.failures,
-        .input_tokens = bucket.totals.input_tokens,
-        .output_tokens = bucket.totals.output_tokens,
-        .mean_duration_ms = if (bucket.measured == 0) null else bucket.duration_ms / bucket.measured,
-    };
+    for (providers, buckets.items) |*provider, *bucket| {
+        const measured = bucket.durations.items;
+        std.mem.sort(u64, measured, {}, std.sort.asc(u64));
+        provider.* = .{
+            .engine = bucket.engine,
+            .model = bucket.model,
+            .attempts = bucket.totals.attempts,
+            .reported = bucket.totals.reported,
+            .failures = bucket.failures,
+            .input_tokens = bucket.totals.input_tokens,
+            .output_tokens = bucket.totals.output_tokens,
+            .mean_duration_ms = if (measured.len == 0) null else bucket.duration_ms / measured.len,
+            .measured = measured.len,
+            .p50_duration_ms = percentile(measured, 50),
+            .p95_duration_ms = percentile(measured, 95),
+        };
+        bucket.durations.deinit(a);
+    }
     std.mem.sort(ProviderRow, providers, {}, struct {
         fn most(_: void, left: ProviderRow, right: ProviderRow) bool {
             return left.attempts > right.attempts;
@@ -558,15 +761,31 @@ pub fn metricsJson(a: A, db: store.Store, days: u32, offset: u32, now: i64) ![]c
         const count = modes.get(mode);
         if (count != 0) try mode_rows.append(a, .{ .mode = mode, .attempts = count });
     }
-    const state = try db.load();
-    const history = try getHistory(a, db, state.entries, first, end);
+    const OutcomeCount = struct { outcome: InvocationOutcome, attempts: usize };
+    var outcome_rows: std.ArrayList(OutcomeCount) = .empty;
+    for (std.meta.tags(InvocationOutcome)) |outcome| {
+        const count = outcomes.get(outcome);
+        if (count != 0) try outcome_rows.append(a, .{ .outcome = outcome, .attempts = count });
+    }
+    const history = try getHistory(a, db, first, end);
     const Depth = @FieldType(core.Explanation, "route");
     var routes: std.EnumArray(Depth, usize) = .initFill(0);
     var verdict_count: usize = 0;
+    var published: usize = 0;
+    var heads: HistoryIndex = .empty;
+    defer heads.deinit(a);
+    var coverage: ReviewCoverage = .{};
     for (history.rows) |item| {
         if (item.at > end) continue;
         if (io.eq(u8, item.publication, "pending") or io.eq(u8, item.publication, "preview")) continue;
         verdict_count += 1;
+        published += @intFromBool(io.eq(u8, item.publication, "verified"));
+        const slot = try heads.getOrPut(a, .{ .repo = item.repo, .number = item.number, .head = item.head, .run = "" });
+        if (!slot.found_existing) {
+            if (item.complete) |complete| {
+                if (complete) coverage.complete += 1 else coverage.limited += 1;
+            } else coverage.unknown += 1;
+        }
         if (item.route) |route| {
             routes.getPtr(route).* += 1;
         }
@@ -589,6 +808,10 @@ pub fn metricsJson(a: A, db: store.Store, days: u32, offset: u32, now: i64) ![]c
         .cache_write_input_tokens = totals.cache_write_input_tokens,
         .reasoning_output_tokens = totals.reasoning_output_tokens,
         .review_count = verdict_count,
+        .review_published = published,
+        .reviewed_heads = heads.count(),
+        .coverage = coverage,
+        .outcomes = outcome_rows.items,
         .series = series,
         .providers = providers,
         .models = models.items,
@@ -605,8 +828,14 @@ const ReviewUsage = struct { head: []const u8, review_key: ?[]const u8, mode: @F
 pub fn reviewJson(a: A, db: store.Store, name: []const u8, number: u32, now: i64) ![]const u8 {
     var state = try db.load();
     const entry = state.find(name) orelse return error.UnknownRepository;
-    const attempts = try pairAttempts(a, try telemetry.read(a, db.dir, .{ .repo = entry.repo.name, .pr = number, .since = now - detail_days * day_seconds, .limit = telemetry.max_query_events, .now = now }), now);
-    const job = try jobRow(a, entry.*, number, attempts, now, try db.paused(entry.repo.name));
+    const events = try telemetry.read(a, db.dir, .{
+        .repo = entry.repo.name,
+        .pr = number,
+        .since = now - detail_days * day_seconds,
+        .limit = telemetry.max_query_events,
+        .now = now,
+    });
+    const attempts = try pairAttempts(a, events, now);
     const result: ?core.Result = result: {
         const raw = db.readResult(entry.repo.name, number) catch |err| switch (err) {
             error.NoLocalReview => break :result null,
@@ -614,6 +843,12 @@ pub fn reviewJson(a: A, db: store.Store, name: []const u8, number: u32, now: i64
         };
         break :result try io.parse(a, core.Result, raw);
     };
+    const job = try jobRow(a, entry.*, number, attempts, .{
+        .now = now,
+        .paused = try db.paused(entry.repo.name),
+        .budget = state.queue_budget,
+        .usage = try usage.load(a, db.dir, now),
+    }, result);
     var groups: std.ArrayList(ReviewUsage) = .empty;
     var totals: Totals = .{};
     for (attempts) |attempt| {
@@ -634,6 +869,7 @@ pub fn reviewJson(a: A, db: store.Store, name: []const u8, number: u32, now: i64
         .attempts = attempts[0..@min(attempts.len, 180)],
         .usage = totals,
         .review_usage = groups.items[0..@min(groups.items.len, 40)],
+        .activity_truncated = events.len >= telemetry.max_query_events or attempts.len > 180 or groups.items.len > 40,
     });
 }
 
@@ -676,7 +912,7 @@ test "pending rows surface the most recently finished pass for the current sched
     previous_head.at = 999;
     previous_head.scope.head = "a" ** 40;
     const attempts = try pairAttempts(a, &.{ slow, fast, fast_finished, slow_finished, preview, previous_head }, 1000);
-    const result = try buildJobRow(a, entry, job, null, attempts, 1000, false);
+    const result = try buildJobRow(a, entry, job, null, attempts, .{ .now = 1000, .paused = false });
     const latest = result.last_pass.?;
     try t.expectEqual(@as(i64, 990), latest.finished_at);
     try t.expectEqual(@as(?usize, 4), latest.section);
@@ -708,6 +944,7 @@ test "metrics pair starts and finishes and account for advisor models separately
     finished.kind = .finished;
     finished.at = now;
     finished.outcome = .success;
+    finished.duration_ms = 10_000;
     finished.tokens = .{ .input = 160, .output = 25 };
     finished.model_usage = &.{
         .{ .model = "opus", .tokens = .{ .input = 100, .output = 15 } },
@@ -721,9 +958,11 @@ test "metrics pair starts and finishes and account for advisor models separately
     unreported.model = "kimi";
     unreported.tokens = null;
     unreported.model_usage = &.{};
+    unreported.outcome = .timed_out;
+    unreported.duration_ms = null;
     try telemetry.append(a, db.dir, unreported);
     var verdict: telemetry.Verdict = .{
-        .at = now,
+        .at = now - 1,
         .repo = scope.repo,
         .pr = scope.pr,
         .head = scope.head,
@@ -736,11 +975,20 @@ test "metrics pair starts and finishes and account for advisor models separately
     verdict.publication = .verified;
     verdict.github_review_id = 55;
     try telemetry.recordVerdict(db.dir, verdict);
+    verdict.at = now;
+    verdict.review_id = "follow-up";
+    verdict.publication = .local;
+    verdict.github_review_id = null;
+    verdict.complete = true;
+    try telemetry.recordVerdict(db.dir, verdict);
 
     const Summary = struct {
         attempts: usize,
         reported: usize,
         review_count: usize,
+        review_published: usize,
+        reviewed_heads: usize,
+        coverage: ReviewCoverage,
         input_tokens: ?u64,
         output_tokens: ?u64,
         models: []const ModelRow,
@@ -749,13 +997,24 @@ test "metrics pair starts and finishes and account for advisor models separately
     const result = try io.parse(a, Summary, try metricsJson(a, db, 7, 0, now));
     try t.expectEqual(@as(usize, 2), result.attempts);
     try t.expectEqual(@as(usize, 1), result.reported);
-    try t.expectEqual(@as(usize, 1), result.review_count);
+    try t.expectEqual(@as(usize, 2), result.review_count);
+    try t.expectEqual(@as(usize, 1), result.review_published);
+    try t.expectEqual(@as(usize, 1), result.reviewed_heads);
+    try t.expectEqual(ReviewCoverage{ .complete = 1 }, result.coverage);
     try t.expectEqual(@as(?u64, 160), result.input_tokens);
     try t.expectEqual(@as(?u64, 25), result.output_tokens);
     try t.expectEqual(@as(usize, 2), result.models.len);
     try t.expectEqual(@as(?u64, 160), result.models[0].input_tokens.? + result.models[1].input_tokens.?);
     for (result.providers) |profile| {
-        if (profile.engine == .kimi) try t.expect(profile.input_tokens == null);
+        if (profile.engine == .kimi) {
+            try t.expect(profile.input_tokens == null);
+            try t.expectEqual(@as(?u64, null), profile.p95_duration_ms);
+            try t.expectEqual(@as(usize, 1), profile.failures);
+        } else {
+            try t.expectEqual(@as(usize, 1), profile.measured);
+            try t.expectEqual(@as(?u64, 10_000), profile.p50_duration_ms);
+            try t.expectEqual(@as(?u64, 10_000), profile.p95_duration_ms);
+        }
     }
 }
 

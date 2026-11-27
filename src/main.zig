@@ -89,6 +89,9 @@ const Local = struct {
     counts: ?*queue.TickCounts = null,
     meter: ?*usage_meter.Ledger = null,
     telemetry: ?telemetry.Recorder = null,
+    pass_store: ?store.Store = null,
+    slots: ?*runner.ProviderSlots = null,
+    started: ?*std.atomic.Value(u32) = null,
 
     fn forStage(self: Local, stage: telemetry.Stage, depth: ?routing.Depth) Local {
         var tools = self;
@@ -252,10 +255,8 @@ const Adapter = struct {
             const base = if (merged_pin) member.diff_base else pin.baseRefOid;
             var ancestor_pr = pin.pull();
             ancestor_pr.baseRefOid = base;
-            const digest = digest: {
-                if (merged_pin or stack.samePin(member.pin, pin)) {
-                    if (member.digest) |stored| break :digest stored;
-                }
+            const stored_digest = if (merged_pin or stack.samePin(member.pin, pin)) member.digest else null;
+            const digest = stored_digest orelse digest: {
                 const snapshot_value = try self.git_source.snapshot(ancestor_pr, &.{}, &.{});
                 break :digest try stack.Digest.make(self.db.a, snapshot_value.evidence, try self.ancestorReview(pin));
             };
@@ -266,6 +267,7 @@ const Adapter = struct {
                 .state = @tagName(pin.state),
                 .diff_excerpt = digest.diff,
                 .review_excerpt = digest.findings,
+                .stored_digest = stored_digest != null,
             };
         }
         return .{ .pins = pins, .ancestors = ancestors, .native = item.native };
@@ -311,7 +313,9 @@ const Adapter = struct {
     pub fn saveStackContext(self: *Adapter, pr: core.Pull, snap: core.Snapshot, payload: core.Payload) !void {
         const position = stack.find(self.entry.stacks, pr.number) orelse return;
         const member = &self.entry.stacks[position.stack_index].members[position.member_index];
-        member.digest = try stack.Digest.make(self.db.a, snap.evidence, payload);
+        var digest = try stack.Digest.make(self.db.a, snap.evidence, payload);
+        digest.diff = try self.db.a.dupe(u8, digest.diff);
+        member.digest = digest;
     }
 
     pub fn anchor(self: *Adapter, _: core.Pull, _: core.Snapshot, path: []const u8, line: u32) !bool {
@@ -366,6 +370,14 @@ const Adapter = struct {
     pub fn confirmResult(self: *Adapter, number: u32, head: []const u8, followup_id: []const u8, event: core.Event, id: u64) !void {
         try self.db.confirmResult(self.repo.name, number, head, followup_id, event, id);
     }
+
+    pub fn saveResultAndState(self: *Adapter, number: u32, candidate: core.Result) !void {
+        return self.db.saveResultAndState(self.repo.name, number, candidate, self.state);
+    }
+
+    pub fn confirmResultAndState(self: *Adapter, number: u32, head: []const u8, followup_id: []const u8, event: core.Event, id: u64) !void {
+        return self.db.confirmResultAndState(self.repo.name, number, head, followup_id, event, id, self.state);
+    }
 };
 
 fn runReviewer(tools: Local, repo: core.Repo, engine: core.Engine, prompt: []const u8) ![]const u8 {
@@ -383,7 +395,10 @@ fn invokeReviewer(tools: Local, engine: core.Engine, profile: runner.Profile, sc
         .schema = schema,
         .meter = tools.meter,
         .telemetry = tools.telemetry,
+        .pass_store = tools.pass_store,
+        .slots = tools.slots,
         .starts = if (tools.counts) |counts| &counts.reviewer_starts else null,
+        .started = tools.started,
     };
     return reviewer.review(prompt);
 }
@@ -391,7 +406,9 @@ fn invokeReviewer(tools: Local, engine: core.Engine, profile: runner.Profile, sc
 const ReviewBatch = struct {
     starts_left: u32,
     receipts_left: u32,
+    carried_deficit: u32 = 0,
     meter: ?*usage_meter.Ledger = null,
+    slots: runner.ProviderSlots = .{},
     deferred_repo: ?usize = null,
     workers: [queue.parallel_jobs]*ReviewWorker = undefined,
     len: usize = 0,
@@ -406,12 +423,28 @@ const ReviewBatch = struct {
     fn deinit(self: *ReviewBatch) void {
         for (self.workers[0..self.len]) |work| {
             if (work.thread) |thread| thread.join();
-            work.arena.deinit();
+            work.destroy();
         }
     }
 
     fn deferRepo(self: *ReviewBatch, index: usize) void {
         if (self.deferred_repo == null) self.deferred_repo = index;
+    }
+
+    fn renewBudget(self: *ReviewBatch, limit: u32) void {
+        var unspent: u32 = 0;
+        for (self.workers[0..self.len]) |work| {
+            unspent += work.reservation - work.started.load(.monotonic);
+        }
+        self.starts_left = limit -| unspent;
+        self.carried_deficit = unspent -| limit;
+        self.receipts_left = limit;
+    }
+
+    fn releaseStarts(self: *ReviewBatch, unused: u32) void {
+        const retired = @min(self.carried_deficit, unused);
+        self.carried_deficit -= retired;
+        self.starts_left += unused - retired;
     }
 };
 
@@ -495,6 +528,16 @@ const ReviewWorker = struct {
     route_outcome: ?adaptive.Outcome = null,
     policy: queue.Budget = .{},
     rate_limits: u8 = 0,
+    reservation: u32 = 0,
+    scratch_root: ?[]const u8 = null,
+    waiting_for_ancestor: bool = false,
+    started: std.atomic.Value(u32) = .init(0),
+    parent_started: ?*std.atomic.Value(u32) = null,
+
+    fn destroy(self: *ReviewWorker) void {
+        self.arena.deinit();
+        std.heap.page_allocator.destroy(self);
+    }
 
     fn jobKey(a: A, repo: core.Repo, job: core.Job) ![32]u8 {
         const encoded = try io.json(a, .{ .repo = repo, .job = job });
@@ -516,6 +559,12 @@ const ReviewWorker = struct {
             return true;
         }
         return false;
+    }
+
+    fn publicationBlocked(self: *const ReviewWorker, budget: queue.Budget) bool {
+        return self.waiting_for_ancestor or stack.blocked(self.adapter.entry.*, self.job.*) or
+            stack.ancestorEvidenceChanged(self.adapter.entry.*, self.prepared.inherited) or
+            !budget.canScan(std.time.timestamp());
     }
 
     pub fn available(self: *ReviewWorker, engine: core.Engine) bool {
@@ -624,7 +673,7 @@ const ReviewWorker = struct {
 
     fn analyzeSingle(self: *ReviewWorker) !core.ReviewResults {
         const a = self.arena.allocator();
-        const scratch = try io.temp(a);
+        const scratch = if (self.scratch_root) |root| try io.tempIn(a, root) else try io.temp(a);
         defer std.fs.deleteTreeAbsolute(scratch) catch {};
         var dir = try std.fs.openDirAbsolute(scratch, .{});
         defer dir.close();
@@ -637,6 +686,9 @@ const ReviewWorker = struct {
             .counts = &self.counts,
             .meter = self.batch.meter,
             .telemetry = self.adapter.tools.telemetry,
+            .pass_store = if (self.adapter.tools.telemetry != null) self.adapter.db else null,
+            .slots = &self.batch.slots,
+            .started = self.parent_started orelse &self.started,
         };
         if (self.plan) |plan| {
             if (self.tools.telemetry) |*recorder| {
@@ -666,6 +718,8 @@ const ReviewWorker = struct {
                 .prepared = section.plan.prepared,
                 .plan = section.plan,
                 .policy = self.policy,
+                .scratch_root = self.scratch_root,
+                .parent_started = &self.started,
             };
             if (worker.adapter.tools.telemetry) |*recorder| recorder.scope.section = section.index + 1;
             if (count == 1) {
@@ -956,7 +1010,7 @@ const Main = struct {
     }
 
     fn adapter(self: Main, entry: *core.Entry, state: *const store.State, gh_env: *std.process.EnvMap) !Adapter {
-        const repo = entry.repo;
+        const repo = try io.parse(self.a, core.Repo, try io.json(self.a, entry.repo));
         const tools = self.local(repo);
         gh_env.* = try tools.githubEnv();
         return .{
@@ -1225,32 +1279,15 @@ const Main = struct {
         const limit = state.queue_budget.limit;
         var batch: ReviewBatch = .{ .starts_left = limit -| counts.reviewer_starts, .receipts_left = limit, .meter = self.meter };
         defer batch.deinit();
-
-        var repos: [queue.active_repos]queue.RepoJobs = undefined;
-        var active: usize = 0;
-        const first = state.queue_budget.next_repo % state.entries.len;
-        // Give each eligible repo a turn before filling its second and third slots.
-        for (0..state.entries.len) |offset| {
-            const index = (first + offset) % state.entries.len;
-            var lane: queue.RepoJobs = .{ .index = index };
-            if (!try self.admit(state, counts, &batch, &lane, active < repos.len)) continue;
-            repos[active] = lane;
-            active += 1;
-        }
-        for (1..queue.jobs_per_repo) |_| {
-            for (repos[0..active]) |*lane| _ = try self.admit(state, counts, &batch, lane, true);
-        }
-        if (batch.deferred_repo) |index| state.queue_budget.next_repo = index;
-        if (counts.jobs != 0) {
-            state.queue_budget.last_tick = counts.*;
-            try self.db.save(state);
-        }
+        batch.slots.setLimit(limit);
+        var window_limit = limit;
+        var window = try std.time.Timer.start();
+        const interval = 15 * std.time.ns_per_s;
+        try self.admitReady(state, counts, &batch);
 
         while (batch.pending != 0) {
-            // launchd runs one tick at a time. Keep scanning on its normal
-            // cadence, and leave the state lock open to operator commands.
             lock.unlock();
-            batch.completed.timedWait(15 * std.time.ns_per_s) catch {};
+            batch.completed.timedWait(interval -| window.read()) catch {};
             try lock.lock(.exclusive);
 
             var cycle = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -1262,25 +1299,86 @@ const Main = struct {
             const pending = batch.pending;
             try fresh.finishReady(&current, counts, &batch);
             try fresh.scanDue(&current, counts);
-            if (pending != batch.pending) {
+            batch.slots.setLimit(current.queue_budget.limit);
+            const replenish = window.read() >= interval;
+            if (replenish) {
+                window_limit = current.queue_budget.limit;
+                batch.renewBudget(window_limit);
+                window.reset();
+            }
+            if (current.queue_budget.limit < window_limit) {
+                batch.starts_left = 0;
+                batch.receipts_left = @min(batch.receipts_left, current.queue_budget.limit);
+            }
+            const finished = pending != batch.pending;
+            if (replenish or finished) try fresh.admitReady(&current, counts, &batch);
+            if (finished) {
                 current.queue_budget.last_tick = counts.*;
                 try fresh.db.save(&current);
             }
         }
     }
 
-    fn finishReady(self: Main, state: *store.State, counts: *queue.TickCounts, batch: *ReviewBatch) !void {
-        for (batch.workers[0..batch.len]) |work| {
-            const thread = work.thread orelse continue;
-            if (!work.done.load(.acquire)) continue;
-            thread.join();
-            work.thread = null;
-            batch.pending -= 1;
-            counts.reviewer_starts += work.counts.reviewer_starts;
-            if (work.plan) |plan| {
-                const reserved = plan.start_limit * @as(u32, @intCast(@max(1, work.section_plans.len)));
-                batch.starts_left += reserved - work.counts.reviewer_starts;
+    fn admitReady(self: Main, state: *store.State, counts: *queue.TickCounts, batch: *ReviewBatch) !void {
+        if (state.entries.len == 0) return;
+        var repos: [queue.active_repos]queue.RepoJobs = undefined;
+        var active: usize = 0;
+        for (batch.workers[0..batch.len]) |worker| {
+            const index = for (state.entries, 0..) |entry, i| {
+                if (std.ascii.eqlIgnoreCase(entry.repo.name, worker.adapter.repo.name)) break i;
+            } else continue;
+            const lane = for (repos[0..active]) |*prior| {
+                if (prior.index == index) break prior;
+            } else new: {
+                repos[active] = .{ .index = index };
+                active += 1;
+                break :new &repos[active - 1];
+            };
+            lane.add(worker.prepared.pr.number);
+        }
+
+        batch.deferred_repo = null;
+        const before = counts.jobs;
+        const first = state.queue_budget.next_repo % state.entries.len;
+        // Give each eligible repo a turn before filling its second and third slots.
+        each_repo: for (0..state.entries.len) |offset| {
+            const index = (first + offset) % state.entries.len;
+            for (repos[0..active]) |prior| {
+                if (prior.index == index) continue :each_repo;
             }
+            var lane: queue.RepoJobs = .{ .index = index };
+            if (!try self.admit(state, counts, batch, &lane, active < repos.len)) continue;
+            repos[active] = lane;
+            active += 1;
+        }
+        for (1..queue.jobs_per_repo) |_| {
+            for (repos[0..active]) |*lane| {
+                if (lane.len < queue.jobs_per_repo) _ = try self.admit(state, counts, batch, lane, true);
+            }
+        }
+        if (batch.deferred_repo) |index| state.queue_budget.next_repo = index;
+        if (counts.jobs != before) {
+            state.queue_budget.last_tick = counts.*;
+            try self.db.save(state);
+        }
+    }
+
+    fn finishReady(self: Main, state: *store.State, counts: *queue.TickCounts, batch: *ReviewBatch) !void {
+        var i: usize = 0;
+        while (i < batch.len) {
+            const work = batch.workers[i];
+            if (!work.done.load(.acquire)) {
+                i += 1;
+                continue;
+            }
+            const thread = work.thread.?;
+            thread.join();
+            batch.len -= 1;
+            batch.workers[i] = batch.workers[batch.len];
+            batch.pending -= 1;
+            defer work.destroy();
+            counts.reviewer_starts += work.counts.reviewer_starts;
+            batch.releaseStarts(work.reservation - work.counts.reviewer_starts);
             for (std.meta.tags(core.Engine)) |engine| {
                 if (work.rate_limits & queue.engineBit(engine) == 0) continue;
                 const err = switch (engine) {
@@ -1292,77 +1390,115 @@ const Main = struct {
             }
             if (!try work.rebind(self.a, state)) continue;
             self.finishJob(state, work) catch |err| switch (err) {
-                error.ReviewerCoolingDown, error.ProviderBudgetReached => {
-                    if (work.plan == null) batch.starts_left += queue.reviewerCost(work.adapter.repo) - work.counts.reviewer_starts;
-                },
+                error.ReviewerBusy, error.ReviewerCoolingDown, error.ProviderBudgetReached => {},
                 else => try self.jobFailed(state, work.adapter.entry, work.job, err),
             };
+            if (work.counts.reviewer_starts == 0 and work.job.phase == .pending) {
+                // A saturated provider or an evidence-only step must not
+                // send this job through GitHub preparation in a tight loop.
+                work.job.next = @max(work.job.next, std.time.timestamp() + 15);
+            }
+            // Finish can adopt strings from the pinned snapshot. Keep the
+            // current state usable after releasing the worker's arena.
+            work.job.* = try io.parse(self.a, core.Job, try io.json(self.a, work.job.*));
         }
     }
 
     fn admit(self: Main, state: *store.State, counts: *queue.TickCounts, batch: *ReviewBatch, lane: *queue.RepoJobs, has_slot: bool) !bool {
-        // Reconcile finished jobs and cooldowns before reserving more work.
-        try self.finishReady(state, counts, batch);
         const entry = &state.entries[lane.index];
         if (try self.db.paused(entry.repo.name)) return false;
         const allow_fresh_routed = retainedCount(state) + batch.pending < queue.parallel_jobs;
         const decision = state.queue_budget.pick(entry, std.time.timestamp(), batch.starts_left, batch.receipts_left, lane.selected(), batch.limited.load(.monotonic), batch.usageSnapshot(), allow_fresh_routed);
-        if (decision.budget_deferred or (!has_slot and decision.job != null)) batch.deferRepo(lane.index);
+        if (decision.budget_deferred or ((!has_slot or batch.len == batch.workers.len) and decision.job != null)) batch.deferRepo(lane.index);
         const job = decision.job orelse return false;
-        if (!has_slot) return false;
+        if (!has_slot or batch.len == batch.workers.len) return false;
         lane.add(job.number);
 
         // Reserve the full ensemble before touching GitHub. Deduplicated
         // jobs still cost lookups and consume a slot for this tick.
+        const reservation = if (job.phase == .uncertain) @as(u32, 0) else queue.reviewerCost(entry.repo);
         if (job.phase == .uncertain) {
             batch.receipts_left -= 1;
             counts.receipt_checks += 1;
         } else {
-            batch.starts_left -= queue.reviewerCost(entry.repo);
+            batch.starts_left -= reservation;
         }
         counts.jobs += 1;
         state.queue_budget.next_repo = batch.deferred_repo orelse (lane.index + 1) % state.entries.len;
         self.startJob(state, entry, job, batch) catch |err| switch (err) {
-            // Refund model starts. Keep the PR slot charged for GitHub work.
-            error.ReviewerCoolingDown => batch.starts_left += queue.reviewerCost(entry.repo),
+            error.ReviewerCoolingDown => batch.starts_left += reservation,
             else => try self.jobFailed(state, entry, job, err),
         };
         return true;
     }
 
     fn startJob(self: Main, state: *store.State, entry: *core.Entry, job: *core.Job, batch: *ReviewBatch) !void {
-        // Each adapter keeps its own file anchors. Only the coordinator uses
-        // Git and GitHub, so snapshots may share the per-repo cache and refs.
-        const work = try self.a.create(ReviewWorker);
+        const work = try std.heap.page_allocator.create(ReviewWorker);
         work.* = .{ .job = job, .batch = batch };
+        var launched = false;
+        defer if (!launched) work.destroy();
+        var prep = self;
+        prep.a = work.arena.allocator();
+        prep.db.a = prep.a;
+        const prepared = prep.prepareWorker(self.a, state, entry, job, work);
+        launched = work.thread != null;
+        if (!launched) job.* = try io.parse(self.a, core.Job, try io.json(self.a, job.*));
+        try prepared;
+    }
+
+    fn prepareWorker(self: Main, state_allocator: A, state: *store.State, entry: *core.Entry, job: *core.Job, work: *ReviewWorker) !void {
+        // Preparation is coordinated, but its inputs and outputs survive
+        // loading a new arena for the next scheduling round.
+        const batch = work.batch;
         work.adapter = try self.adapter(entry, state, &work.gh_env);
+        work.scratch_root = try std.fs.path.join(self.a, &.{ self.db.path, "review-scratch" });
+        work.waiting_for_ancestor = stack.blocked(entry.*, job.*);
+        const repo = work.adapter.repo;
         if (job.route_progress) |saved| {
-            if (saved.sections.checkpoint) |checkpoint| work.adapter.diff_priority = checkpoint.diff_priority;
+            if (saved.sections.checkpoint) |checkpoint| {
+                work.adapter.diff_priority = try io.parse(self.a, []const []const u8, try io.json(self.a, checkpoint.diff_priority));
+            }
         }
-        work.prepared = (try core.prepare(self.a, &work.adapter, entry.repo, job, .scheduled)) orelse return;
+        work.prepared = (try core.prepare(self.a, &work.adapter, repo, job, .scheduled)) orelse return;
+        work.prepared.options = try io.parse(self.a, core.ReviewOptions, try io.json(self.a, work.prepared.options));
+        if (work.prepared.inherited.pins.len != 0) {
+            work.prepared.inherited = try io.parse(self.a, stack.Context, try io.json(self.a, work.prepared.inherited));
+        }
+        if (work.prepared.reused_results) |results| {
+            if (try self.db.paused(repo.name)) return;
+            if (work.publicationBlocked(state.queue_budget)) {
+                try self.keepAnalysis(state, work, results);
+                try self.db.save(state);
+                return;
+            }
+            work.adapter.db.a = state_allocator;
+            _ = try core.finish(state_allocator, &work.adapter, entry.repo, job, work.prepared, results);
+            return;
+        }
         work.prepared.all_models = work.prepared.options.all_models or
-            (entry.repo.routing_mode == .adaptive and work.prepared.options.allowRouting() and
-                (routing.messageVerificationChanged(entry.repo.name, work.adapter.files) or
+            (repo.routing_mode == .adaptive and work.prepared.options.allowRouting() and
+                (routing.messageVerificationChanged(repo.name, work.adapter.files) or
                     stack.inheritsAllModels(work.prepared.inherited, entry.jobs)));
         work.adapter.tools.telemetry = .{ .dir = self.db.dir, .scope = .{
-            .repo = entry.repo.name,
+            .repo = repo.name,
             .pr = job.number,
-            .head = job.head,
+            .head = work.prepared.pr.headRefOid,
             .review_id = try core.followupId(self.a, job.*),
             .focus = work.prepared.options.focus,
             .additional_focuses = work.prepared.options.additional_focuses,
             .section_count = if (work.prepared.sections.len != 0) work.prepared.sections.len else null,
         } };
         if (job.analysis) |saved| {
-            if (try saved.matches(self.a, entry.repo, work.prepared)) {
-                if (try self.db.paused(entry.repo.name)) return;
+            if (try saved.matches(self.a, repo, work.prepared)) {
+                if (try self.db.paused(repo.name) or work.publicationBlocked(state.queue_budget)) return;
                 work.prepared.route_depth = saved.route_depth;
                 work.prepared.synthesis_provider = saved.synthesis_provider;
                 work.prepared.synthesis_summary = saved.synthesis_summary;
                 work.prepared.additional_evidence_limited = saved.additional_evidence_limited;
                 work.prepared.evidence_requests = saved.evidence_requests;
                 work.prepared.onchain_observations = saved.onchain_observations;
-                _ = try core.finish(self.a, &work.adapter, entry.repo, job, work.prepared, saved.results);
+                work.adapter.db.a = state_allocator;
+                _ = try core.finish(state_allocator, &work.adapter, entry.repo, job, work.prepared, saved.results);
                 return;
             }
             job.analysis = null;
@@ -1371,16 +1507,17 @@ const Main = struct {
         }
         work.policy = state.queue_budget;
         {
-            var progress = try self.resumeReview(entry.repo, job, &work.prepared);
+            var progress = try self.resumeReview(repo, job, &work.prepared);
+            progress = try io.parse(self.a, core.RouteProgress, try io.json(self.a, progress));
             if (work.prepared.onchain_available and work.prepared.snap.onchain_reads.len != 0) progress.onchain_reads = work.prepared.snap.onchain_reads;
-            const automatically_routed = entry.repo.routing_mode != .fixed and work.prepared.options.allowRouting();
+            const automatically_routed = repo.routing_mode != .fixed and work.prepared.options.allowRouting();
             const scoped_review = (work.prepared.snap.registry_logo_only or work.prepared.snap.relayer_promotion or
                 (work.prepared.onchain_available and work.prepared.snap.onchain_reads.len != 0)) and !work.prepared.snap.limited;
             var screen: routing.Screen = if (automatically_routed and !scoped_review)
                 routing.inspect(work.adapter.files, work.prepared.snap.limited)
             else
                 .{ .floor = .{}, .ask_model = false };
-            if (automatically_routed and entry.repo.routing_mode == .adaptive and work.prepared.snap.limited) {
+            if (automatically_routed and repo.routing_mode == .adaptive and work.prepared.snap.limited) {
                 // Keep the risk floor and use screening to request missing source.
                 screen.ask_model = true;
             }
@@ -1398,16 +1535,17 @@ const Main = struct {
                 screen.ask_model = automatically_routed and work.prepared.rereview and screen.floor.depth != .multi;
             }
             const plan: adaptive.Plan = .{
-                .repo = entry.repo,
-                .providers = try entry.repo.providers(self.a),
+                .repo = repo,
+                .providers = try repo.providers(self.a),
                 .prepared = work.prepared,
                 .screen = screen,
                 .progress = progress,
-                .start_limit = queue.reviewerCost(entry.repo),
+                .start_limit = queue.reviewerCost(repo),
             };
             const has_section = work.prepared.sections.len == 0 or progress.sections.index < work.prepared.sections.len;
-            if (has_section and work.prepared.sections.len > 1 and work.prepared.all_models and
-                !work.prepared.context_update and !work.prepared.onchain_available)
+            if (has_section and work.prepared.sections.len > 1 and
+                !work.prepared.context_update and !work.prepared.onchain_available and
+                (!plan.screen.ask_model or !progress.screen_waiting))
             {
                 try self.prepareSectionWindow(work, plan);
             } else {
@@ -1415,11 +1553,13 @@ const Main = struct {
                 work.plan = try self.prepareReviewEvidence(&work.adapter, plan, section);
             }
         }
-        if (!state.queue_budget.canReview(entry.repo, job.route_progress, std.time.timestamp(), batch.limited.load(.monotonic), batch.usageSnapshot()))
+        if (!state.queue_budget.canReview(repo, job.route_progress, std.time.timestamp(), batch.limited.load(.monotonic), batch.usageSnapshot()))
             return error.ReviewerCoolingDown;
-        work.job_key = try ReviewWorker.jobKey(self.a, entry.repo, job.*);
+        work.job_key = try ReviewWorker.jobKey(self.a, repo, job.*);
         work.thread = try std.Thread.spawn(.{}, ReviewWorker.analyze, .{work});
-        batch.starts_left -= work.plan.?.start_limit * @as(u32, @intCast(work.section_plans.len -| 1));
+        const extra = work.plan.?.start_limit * @as(u32, @intCast(work.section_plans.len -| 1));
+        work.reservation = work.plan.?.start_limit + extra;
+        batch.starts_left -= extra;
         batch.pending += 1;
         batch.workers[batch.len] = work;
         batch.len += 1;
@@ -1428,7 +1568,9 @@ const Main = struct {
     fn prepareSectionWindow(self: Main, work: *ReviewWorker, initial: adaptive.Plan) !void {
         var root = initial;
         root.progress.screen_waiting = false;
-        root.progress.decision = routing.all_lenses;
+        if (root.progress.decision == null) {
+            root.progress.decision = if (root.screen.floor.depth == .light) .{} else root.screen.floor;
+        }
         const sections = &root.progress.sections;
         if (sections.finished_mask == null) {
             // Older checkpoints have a contiguous prefix and one active section.
@@ -1457,8 +1599,8 @@ const Main = struct {
                 occupied += 1;
                 break :new .{
                     .fingerprint = root.progress.fingerprint,
-                    .all_models = true,
-                    .decision = routing.all_lenses,
+                    .all_models = root.progress.all_models,
+                    .decision = root.progress.decision,
                     .screen_waiting = false,
                 };
             };
@@ -1513,7 +1655,7 @@ const Main = struct {
         const prior_checkpoint = if (saved) |prior| prior.sections.checkpoint else null;
         var checkpoint: ?core.SectionCheckpoint = if (prepared.sections.len != 0) try .capture(self.a, repo, prepared.*) else null;
         const same_source = if (prior_checkpoint) |prior|
-            if (checkpoint) |current| eq(u8, &prior.source, &current.source) else false
+            if (checkpoint) |current| prior.sameSource(current) else false
         else
             false;
         const fingerprint = if (same_source) saved.?.fingerprint else try core.SavedAnalysis.key(self.a, repo, prepared.*);
@@ -1556,12 +1698,12 @@ const Main = struct {
                 work.job.route_report = report;
                 work.job.route_report.?.providers = try self.a.dupe(core.Engine, report.providers);
                 work.job.route_progress = null;
-                if (report.diff_sections != 0 and !state.queue_budget.canScan(std.time.timestamp())) {
+                if (report.diff_sections != 0 and work.publicationBlocked(state.queue_budget)) {
                     return self.keepSectionReview(state, work, outcome.progress, report.diff_sections);
                 }
                 return self.finishReviews(state, work, outcome.review_results orelse outcome.progress.results) catch |err| {
                     if (report.diff_sections != 0 and work.job.phase == .pending) {
-                        if (err == error.ThreadsChanged or err == error.GitHubRateLimited) {
+                        if (err == error.ThreadsChanged or err == error.TargetChanged or err == error.GitHubRateLimited) {
                             try self.keepSectionReview(state, work, outcome.progress, report.diff_sections);
                             if (err == error.ThreadsChanged) return;
                         }
@@ -1594,7 +1736,7 @@ const Main = struct {
 
     fn finishReviews(self: Main, state: *store.State, work: *ReviewWorker, reviews: []const core.ReviewerResult) !void {
         if (try self.db.paused(work.adapter.repo.name)) return;
-        if (!state.queue_budget.canScan(std.time.timestamp())) {
+        if (work.publicationBlocked(state.queue_budget)) {
             try self.keepAnalysis(state, work, reviews);
             try self.db.save(state);
             return;
@@ -1980,6 +2122,8 @@ const Main = struct {
         defer log_retention.maintain(self.a, self.db.dir, std.time.nanoTimestamp()) catch |err|
             std.log.warn("diagnostic log maintenance failed ({s})", .{@errorName(err)});
         const result: anyerror!void = tick: {
+            self.cleanReviewScratch() catch |err| break :tick err;
+            self.db.recoverPasses(std.time.timestamp()) catch |err| break :tick err;
             var state = self.db.load() catch |err| break :tick err;
             break :tick self.withUsage(&state, lock, null);
         };
@@ -1987,6 +2131,19 @@ const Main = struct {
             std.log.err("{s}", .{@errorName(err)});
             return error.ScheduledTickFailed;
         };
+    }
+
+    fn cleanReviewScratch(self: Main) !void {
+        self.db.dir.makeDir("review-scratch") catch |err| if (err != error.PathAlreadyExists) return err;
+        var dir = try self.db.dir.openDir("review-scratch", .{ .iterate = true, .no_follow = true });
+        defer dir.close();
+        var paths = dir.iterate();
+        while (try paths.next()) |entry| {
+            // The provider batch lock covers the whole tick, so these
+            // private directories can only belong to an interrupted tick.
+            if (entry.kind == .directory and entry.name.len == "pass-XXXXXX".len and
+                std.mem.startsWith(u8, entry.name, "pass-")) try dir.deleteTree(entry.name);
+        }
     }
 
     fn dashboardCommand(self: Main, args: []const []const u8) !void {
@@ -2807,21 +2964,23 @@ test "review workers overlap and use separate scratch directories" {
     try env.put("HOME", path);
     try env.put("PATH", "/usr/bin:/bin");
     var batch: ReviewBatch = .{ .starts_left = 2, .receipts_left = 2 };
-    var workers: [2]ReviewWorker = undefined;
+    var workers: [2]*ReviewWorker = undefined;
     defer batch.deinit();
-    for (&workers, [_][]const u8{ "one", "two" }) |*work, name| {
+    for (&workers, [_][]const u8{ "one", "two" }) |*slot, name| {
         try writeExecutable(dir, name, program);
         const repo: core.Repo = .{ .name = "test/repo", .login = "test", .codex = try dir.realpathAlloc(a, name) };
+        const work = try std.heap.page_allocator.create(ReviewWorker);
         work.* = .{ .job = undefined, .batch = &batch };
+        slot.* = work;
         work.adapter.repo = repo;
         work.adapter.tools = .{ .a = a, .env = &env, .scratch = path, .scratch_dir = dir, .programs = Programs.fromRepo(repo) };
         work.prepared.engines = &.{.codex};
         work.prepared.context = "review";
-        work.thread = try std.Thread.spawn(.{}, ReviewWorker.analyze, .{work});
         batch.workers[batch.len] = work;
         batch.len += 1;
+        work.thread = try std.Thread.spawn(.{}, ReviewWorker.analyze, .{work});
     }
-    for (&workers) |*work| {
+    for (workers) |work| {
         work.thread.?.join();
         work.thread = null;
         const results = try work.result;
@@ -2833,6 +2992,22 @@ test "review workers overlap and use separate scratch directories" {
     try t.expect(!eq(u8, one, two));
     try t.expectError(error.FileNotFound, std.fs.accessAbsolute(one, .{}));
     try t.expectError(error.FileNotFound, std.fs.accessAbsolute(two, .{}));
+}
+
+test "finishing workers repay outstanding reservations after a budget reduction" {
+    const t = std.testing;
+    var batch: ReviewBatch = .{ .starts_left = 0, .receipts_left = 0 };
+    var worker: ReviewWorker = .{ .job = undefined, .batch = &batch, .reservation = 6 };
+    worker.started.store(2, .monotonic);
+    batch.workers[0] = &worker;
+    batch.len = 1;
+
+    batch.renewBudget(2);
+    try t.expectEqual(0, batch.starts_left);
+    batch.releaseStarts(1);
+    try t.expectEqual(0, batch.starts_left);
+    batch.releaseStarts(2);
+    try t.expectEqual(1, batch.starts_left);
 }
 
 test "providers in one review overlap and clean up their own scratch" {

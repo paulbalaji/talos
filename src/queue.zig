@@ -1,5 +1,6 @@
 const std = @import("std");
 const core = @import("core.zig");
+const stack = @import("stack.zig");
 const usage = @import("usage.zig");
 const workflow = @import("review_workflow.zig");
 
@@ -151,8 +152,8 @@ pub const Budget = struct {
         return @max(if (quota_at > now) quota_at else 0, self.providerRetry(engine));
     }
 
-    fn eligibleAt(self: Budget, entry: core.Entry, job: core.Job, now: i64, limited: u8, current: usage.Snapshot) ?i64 {
-        if (!job.schedulable() or entry.stackBlocked(job)) return null;
+    pub fn eligibleAt(self: Budget, entry: core.Entry, job: core.Job, now: i64, limited: u8, current: usage.Snapshot) ?i64 {
+        if (!job.schedulable() or stack.analysisBlocked(entry, job)) return null;
         var at = @max(job.next, self.github.until);
         if (job.phase != .uncertain and job.analysis == null) {
             if (job.route_progress) |progress| {

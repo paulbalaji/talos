@@ -41,7 +41,7 @@ pub const FullPass = struct {
 
 fn unavailable(err: anyerror) bool {
     return switch (err) {
-        error.ProviderBudgetReached, error.CodexRateLimited, error.ClaudeRateLimited, error.KimiRateLimited => true,
+        error.ReviewerBusy, error.ProviderBudgetReached, error.CodexRateLimited, error.ClaudeRateLimited, error.KimiRateLimited => true,
         else => false,
     };
 }
@@ -133,7 +133,8 @@ pub fn run(a: io.A, reviewer: anytype, plan: Plan) !Outcome {
     var outcome = try runSection(a, reviewer, scoped);
     if (outcome.report == null) return outcome;
     const section_outcome = outcome;
-    try mergeSection(a, &outcome.progress.sections, section_outcome, plan.prepared.context_update);
+    const kind: SectionKind = if (plan.prepared.context_update) .discussion_update else if (plan.prepared.sections[plan.progress.sections.index].source_only) .source_only else .full;
+    try mergeSection(a, &outcome.progress.sections, section_outcome, kind);
     const progress = &outcome.progress;
     const sections = &progress.sections;
     sections.index += 1;
@@ -149,7 +150,9 @@ pub fn run(a: io.A, reviewer: anytype, plan: Plan) !Outcome {
     return outcome;
 }
 
-fn mergeSection(a: io.A, sections: *core.SectionProgress, outcome: Outcome, context_update: bool) !void {
+const SectionKind = enum { full, source_only, discussion_update };
+
+fn mergeSection(a: io.A, sections: *core.SectionProgress, outcome: Outcome, kind: SectionKind) !void {
     const section_report = outcome.report.?;
     const progress = outcome.progress;
     const results = outcome.review_results orelse progress.results;
@@ -159,7 +162,7 @@ fn mergeSection(a: io.A, sections: *core.SectionProgress, outcome: Outcome, cont
             break;
         }
     }
-    sections.results = try combineSections(a, sections.results, results, context_update);
+    sections.results = try combineSections(a, sections.results, results, kind);
     sections.evidence_limited = sections.evidence_limited or outcome.evidence_limited;
     for ([_][]const core.EvidenceRequest{ progress.evidence_requests, progress.completion_requests orelse &.{} }) |requests| {
         for (requests) |request| {
@@ -196,7 +199,8 @@ pub fn mergeParallelSections(a: io.A, plan: Plan, responses: []const SectionOutc
         const review = response.review;
         progress.review_ms +|= review.progress.review_ms -| response.task.progress.review_ms;
         if (review.report != null) {
-            try mergeSection(a, sections, review, false);
+            const kind: SectionKind = if (plan.prepared.sections[response.task.index].source_only) .source_only else .full;
+            try mergeSection(a, sections, review, kind);
             sections.finished_mask.? |= sectionBit(response.task.index);
             sections.index += 1;
         } else {
@@ -236,10 +240,15 @@ pub fn resetSection(progress: *core.RouteProgress) void {
     progress.rejected_synthesizers = 0;
 }
 
-fn combineSections(a: io.A, earlier: []const core.ReviewerResult, current: []const core.ReviewerResult, context_update: bool) ![]const core.ReviewerResult {
+fn combineSections(a: io.A, earlier: []const core.ReviewerResult, current: []const core.ReviewerResult, kind: SectionKind) ![]const core.ReviewerResult {
     var results: std.ArrayList(core.ReviewerResult) = .empty;
     try results.appendSlice(a, earlier);
-    for (current) |pass| {
+    for (current) |response| {
+        var pass = response;
+        if (kind == .source_only) {
+            pass.review.existing_open_findings = &.{};
+            pass.review.non_blocking_threads = null;
+        }
         const combined = for (results.items) |*result| {
             if (result.engine == pass.engine) break result;
         } else added: {
@@ -251,7 +260,7 @@ fn combineSections(a: io.A, earlier: []const core.ReviewerResult, current: []con
             break :added result;
         };
         const review = &combined.review;
-        const fresh_assessment = context_update and pass.review.complete;
+        const fresh_assessment = kind == .discussion_update and pass.review.complete;
         if (fresh_assessment) {
             var still_open: std.ArrayList([]const u8) = .empty;
             for (review.existing_open_findings) |id| {
@@ -304,6 +313,7 @@ fn runSection(a: io.A, reviewer: anytype, plan: Plan) !Outcome {
     var outcome: Outcome = .{ .progress = plan.progress };
     const progress = &outcome.progress;
     if (progress.screen_waiting) try screen(a, reviewer, plan, progress);
+    if (progress.screen_waiting) return outcome;
 
     const applied = appliedDecision(plan, progress.*);
     if (applied.depth == .light) {
@@ -495,6 +505,11 @@ fn completeReviews(a: io.A, reviewer: anytype, plan: Plan, progress: *core.Route
             const result = &results[recipient.index];
             const bit = core.providerBit(result.engine);
             const raw = response catch |err| switch (err) {
+                error.ReviewerBusy => {
+                    progress.completion_done &= ~bit;
+                    deferred = true;
+                    continue;
+                },
                 error.ProviderBudgetReached => continue,
                 error.OutOfMemory => return err,
                 else => {
@@ -572,6 +587,8 @@ fn screen(a: io.A, reviewer: anytype, plan: Plan, progress: *core.RouteProgress)
         return;
     }
     const prompt = try core.screenPrompt(a, plan.prepared);
+    const initial_starts = reviewer.starts();
+    var busy = false;
     if (prompt.len <= core.review_context_limit) {
         for (plan.providers) |engine| {
             if (reviewer.starts() >= plan.start_limit) break;
@@ -580,6 +597,7 @@ fn screen(a: io.A, reviewer: anytype, plan: Plan, progress: *core.RouteProgress)
             var timer = try std.time.Timer.start();
             const raw = reviewer.routeReview(engine, model, core.screen_schema, prompt) catch |err| {
                 progress.screen_ms +|= timer.read() / std.time.ns_per_ms;
+                if (err == error.ReviewerBusy) busy = true;
                 if (unavailable(err)) continue;
                 break;
             };
@@ -594,6 +612,11 @@ fn screen(a: io.A, reviewer: anytype, plan: Plan, progress: *core.RouteProgress)
             progress.decision = decision;
             return;
         }
+    }
+    if (busy and reviewer.starts() == initial_starts) {
+        // Capacity can free up during the next scheduler admission.
+        progress.screen_waiting = true;
+        return;
     }
     // Unsupported models, invalid responses and exhausted screening quota
     // all fall through to the full review.
@@ -647,6 +670,7 @@ const MockReviewer = struct {
     prompts: [5][]const u8 = undefined,
     count: u32 = 0,
     unavailable_engine: ?core.Engine = null,
+    busy_engine: ?core.Engine = null,
     screen_enabled: bool = true,
     screen_rate_limit: bool = false,
     screen_output: ?[]const u8 = null,
@@ -665,6 +689,7 @@ const MockReviewer = struct {
     }
 
     pub fn routeReview(self: *MockReviewer, engine: core.Engine, model: ?[]const u8, schema: []const u8, prompt: []const u8) ![]const u8 {
+        if (self.busy_engine == engine) return error.ReviewerBusy;
         self.calls[self.count] = engine;
         self.prompts[self.count] = prompt;
         self.count += 1;
@@ -903,6 +928,47 @@ test "completion never repeats a request and retains incomplete findings through
     try t.expectEqual(@as(u8, 1), repeated.report.?.evidence_passes);
     try t.expect(!repeated.progress.results[0].review.complete);
     try t.expectEqual(@as(usize, 1), repeated.progress.results[0].review.findings.len);
+}
+
+test "provider capacity defers screening and completion without consuming an attempt" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var busy: MockReviewer = .{ .busy_engine = .codex };
+    var plan = sample_plan;
+    const screened = try run(a, &busy, plan);
+    try t.expect(screened.progress.screen_waiting and screened.report == null and screened.failure == null);
+    try t.expectEqual(@as(u32, 0), busy.count);
+
+    var fallback_plan = plan;
+    fallback_plan.repo.light_models = &.{ .{ .engine = .codex, .model = "small" }, .{ .engine = .claude, .model = "small" } };
+    fallback_plan.start_limit = 1;
+    var malformed_fallback: MockReviewer = .{ .busy_engine = .codex, .screen_enabled = false };
+    const full_review = try run(a, &malformed_fallback, fallback_plan);
+    try t.expect(!full_review.progress.screen_waiting);
+    try t.expectEqual(.regular, full_review.progress.decision.?.depth);
+    try t.expectEqualSlices(core.Engine, &.{.claude}, malformed_fallback.calls[0..malformed_fallback.count]);
+
+    var first = try core.parseReview(a, requesting_result);
+    const requests = first.evidence_requests;
+    first.complete = false;
+    plan.progress.screen_waiting = false;
+    plan.progress.decision = .{};
+    plan.progress.results = &.{.{ .engine = .codex, .review = first }};
+    plan.progress.completion_requests = requests;
+    plan.completion_evidence = .{ .source = "caller evidence", .provided = requests };
+    const deferred = try run(a, &busy, plan);
+    try t.expect(deferred.report == null and deferred.failure == null);
+    try t.expectEqual(@as(u8, 0), deferred.progress.completion_done);
+    try t.expectEqual(@as(u8, 0), deferred.progress.completion_attempted);
+    try t.expectEqual(@as(u32, 0), busy.count);
+
+    plan.progress = deferred.progress;
+    var available: MockReviewer = .{};
+    const finished = try run(a, &available, plan);
+    try t.expectEqual(@as(u32, 1), available.count);
+    try t.expectEqual(@as(u8, 1), finished.report.?.evidence_passes);
 }
 
 test "a clean completion cannot clear a material source request left out of the batch" {

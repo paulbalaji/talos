@@ -109,6 +109,7 @@ pub const Ancestor = struct {
     state: []const u8,
     diff_excerpt: []const u8,
     review_excerpt: []const u8,
+    stored_digest: bool = false,
 };
 
 pub const Context = struct {
@@ -122,6 +123,16 @@ pub fn inheritsAllModels(context: Context, jobs: []const core.Job) bool {
     for (context.pins[0 .. context.pins.len - 1]) |pin| {
         if (!pin.reviewable()) continue;
         const job = matchingJob(jobs, pin) orelse continue;
+        if (job.phase == .pending) {
+            if (job.options.all_models) return true;
+            if (job.route_progress) |progress| {
+                if (progress.all_models) {
+                    const base = progress.base orelse continue;
+                    if (io.eq(u8, base.oid, pin.baseRefOid) and io.eq(u8, base.ref, pin.baseRefName)) return true;
+                }
+            }
+            continue;
+        }
         const report = job.route_report orelse continue;
         const input = job.review_input orelse continue;
         if (job.phase == .complete and report.all_models and io.eq(u8, input.base.oid, pin.baseRefOid))
@@ -1014,6 +1025,102 @@ pub fn blocked(entry: core.Entry, job: core.Job) bool {
     const item = entry.stacks[position.stack_index];
     const member = item.members[position.member_index];
     return !io.eq(u8, member.pin.headRefOid, job.head) or blocker(entry, item, position.member_index) != null;
+}
+
+pub fn ancestorEvidenceChanged(entry: core.Entry, context: Context) bool {
+    for (context.ancestors) |ancestor| {
+        const position = find(entry.stacks, ancestor.number) orelse return true;
+        const member = entry.stacks[position.stack_index].members[position.member_index];
+        const base = if (member.pin.state == .MERGED) member.diff_base else member.pin.baseRefOid;
+        if (!io.eq(u8, member.pin.headRefOid, ancestor.head) or !io.eq(u8, base, ancestor.base) or
+            !io.eq(u8, @tagName(member.pin.state), ancestor.state)) return true;
+        if (member.digest) |current| {
+            if (!io.eq(u8, current.diff, ancestor.diff_excerpt) or !io.eq(u8, current.findings, ancestor.review_excerpt)) return true;
+        } else if (ancestor.stored_digest) return true;
+    }
+    return false;
+}
+
+// Independent analysis can precede the parent's verdict only when each
+// comparison base is the exact head pin of the preceding native member.
+// Once source is ready, the publication dependency takes precedence again.
+pub fn analysisBlocked(entry: core.Entry, job: core.Job) bool {
+    if (!blocked(entry, job)) return false;
+    if (job.analysis != null) return true;
+    if (job.route_progress) |progress| if (progress.readyToPublish()) return true;
+    const position = find(entry.stacks, job.number) orelse return true;
+    const item = entry.stacks[position.stack_index];
+    if (item.native == null or position.member_index == 0) return true;
+    const prefix = item.members[0 .. position.member_index + 1];
+    if (!io.eq(u8, prefix[prefix.len - 1].pin.headRefOid, job.head)) return true;
+    for (prefix, 0..) |member, index| {
+        if (!member.pin.valid() or !member.pin.reviewable()) return true;
+        if (index > 0 and !linked(entry.repo.name, prefix[index - 1].pin, member.pin)) return true;
+    }
+    return false;
+}
+
+test "only exact native stack pins can analyze ahead of an ancestor verdict" {
+    const t = std.testing;
+    const native: NativeRef = .{ .id = "PRS_parallel_analysis", .number = 24 };
+    var parent = fixture_parent;
+    parent.nativeStack = native;
+    var child = fixture_child;
+    child.nativeStack = native;
+    var members = [_]Member{
+        .{ .pin = parent, .diff_base = parent.baseRefOid },
+        .{ .pin = child, .diff_base = child.baseRefOid },
+    };
+    var stacks = [_]Stack{.{ .name = "native", .automatic = true, .native = native, .members = &members }};
+    var jobs = [_]core.Job{
+        .{ .number = parent.number, .head = parent.headRefOid },
+        .{ .number = child.number, .head = child.headRefOid },
+    };
+    const entry: core.Entry = .{ .repo = fixture_repo, .stacks = &stacks, .jobs = &jobs };
+    try t.expect(blocked(entry, jobs[1]));
+    try t.expect(!analysisBlocked(entry, jobs[1]));
+
+    jobs[1].route_progress = .{
+        .fingerprint = @splat(0),
+        .sections = .{ .index = 1, .checkpoint = .{ .source = @splat(0), .discussion = @splat(0), .section_count = 1, .diff_priority = &.{} } },
+    };
+    try t.expect(analysisBlocked(entry, jobs[1]));
+    jobs[0].phase = .complete;
+    try t.expect(!analysisBlocked(entry, jobs[1]));
+
+    jobs[0].phase = .pending;
+    jobs[1].route_progress = null;
+    members[1].pin.baseRefOid = updated_head;
+    try t.expect(analysisBlocked(entry, jobs[1]));
+    members[1].pin = child;
+    stacks[0].native = null;
+    try t.expect(analysisBlocked(entry, jobs[1]));
+    jobs[1].phase = .uncertain;
+    try t.expect(!analysisBlocked(entry, jobs[1]));
+}
+
+test "publication detects changed ancestor evidence at an unchanged Git pin" {
+    const t = std.testing;
+    var members = [_]Member{.{ .pin = fixture_parent, .diff_base = fixture_parent.baseRefOid }};
+    var stacks = [_]Stack{.{ .name = "stack", .members = &members }};
+    const entry: core.Entry = .{ .repo = fixture_repo, .stacks = &stacks };
+    var ancestors = [_]Ancestor{.{
+        .number = fixture_parent.number,
+        .head = fixture_parent.headRefOid,
+        .base = fixture_parent.baseRefOid,
+        .state = "OPEN",
+        .diff_excerpt = "pinned source",
+        .review_excerpt = "first verdict",
+    }};
+    const context: Context = .{ .ancestors = &ancestors };
+    try t.expect(!ancestorEvidenceChanged(entry, context));
+    members[0].digest = .{ .diff = "pinned source", .findings = "first verdict" };
+    try t.expect(!ancestorEvidenceChanged(entry, context));
+    members[0].digest.?.findings = "material follow-up";
+    try t.expect(ancestorEvidenceChanged(entry, context));
+    members[0].digest = null;
+    ancestors[0].stored_digest = true;
+    try t.expect(ancestorEvidenceChanged(entry, context));
 }
 
 pub const MemberStatus = struct {
