@@ -601,7 +601,8 @@ function renderQueue() {
 function renderRepos() {
   const repos = list(snapshot?.repos);
   byId("repo-count").textContent = count(repos.length);
-  const rows = repos.map((repo) => ({ ...repo, label: repo.paused ? "Paused" : repo.scan_attempts > 0 ? "Scan delayed" : repo.last_scan_at > 0 ?
+  const rows = repos.map((repo) => ({ ...repo, label: repo.paused ? "Paused" : repo.scan_error === "GitHubIdentityFailed" ?
+    "GitHub error" : repo.scan_attempts > 0 ? "Scan delayed" : repo.last_scan_at > 0 ?
     age(repo.last_scan_at, snapshot.at) : "Awaiting first scan" }));
   update("repos", rows, () => {
     const nodes = document.createDocumentFragment();

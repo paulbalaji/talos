@@ -26,6 +26,7 @@ talos add OWNER/REPO                   # Track this repo with your default revie
 talos run-once OWNER/REPO 123          # Preview this PR, including a baselined PR
 talos install                         # Start the macOS scheduler
 talos status                          # See scans, queue, errors, and cache sizes
+talos scan                            # Refresh discovery for enabled repositories
 ```
 
 | Do this | Run |

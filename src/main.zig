@@ -37,6 +37,7 @@ const usage =
     \\talos [--home DIR] metrics [--days DAYS] [--offset DAYS]
     \\talos [--home DIR] dashboard [install|remove] [--port PORT]
     \\talos [--home DIR] queue OWNER/REPO PR [--all-maxxing] [--mode MODE ...] [--prompt TEXT [--publish]]
+    \\talos [--home DIR] scan [OWNER/REPO PR]
     \\talos [--home DIR] followup THREAD_URL [--dry-run | --merge-when-ready]
     \\talos [--home DIR] followup status [--json]
     \\talos [--home DIR] followup pause|resume THREAD_URL
@@ -1149,7 +1150,7 @@ const Main = struct {
                 } else |err| {
                     state.queue_budget.noteFailure(std.time.timestamp(), err);
                     entry.scan_attempts +|= 1;
-                    entry.next_scan = now + core.delay(entry.scan_attempts);
+                    entry.next_scan = now + scanRetryDelay(entry.*, err);
                     try entry.problem(self.a, now, null, @errorName(err));
                 }
                 changed = true;
@@ -1159,6 +1160,52 @@ const Main = struct {
                 try self.db.save(state);
             }
         }
+    }
+
+    fn scanRetryDelay(entry: core.Entry, err: anyerror) i64 {
+        const backoff = core.delay(entry.scan_attempts);
+        return if (err == error.GitHubIdentityFailed) @min(backoff, entry.repo.interval) else backoff;
+    }
+
+    fn scanNow(self: Main, state: *store.State, args: []const []const u8) !void {
+        if (args.len == 2) return self.scanReviewNow(state, args[0], try prNumber(args[1]));
+        if (args.len != 0) return error.Usage;
+        var counts: queue.TickCounts = .{ .at = std.time.timestamp() };
+        var worker = self;
+        worker.counts = &counts;
+        var enabled: usize = 0;
+        for (state.entries) |*entry| {
+            if (try self.db.paused(entry.repo.name)) continue;
+            entry.next_scan = 0;
+            enabled += 1;
+        }
+        try worker.scanDue(state, &counts);
+        var scanned: usize = 0;
+        for (state.entries) |entry| {
+            if (entry.last_scan >= counts.at and !try self.db.paused(entry.repo.name)) scanned += 1;
+        }
+        try self.out("Scanned {d} of {d} enabled repositories.\n", .{ scanned, enabled });
+    }
+
+    fn scanReviewNow(self: Main, state: *store.State, name: []const u8, number: u32) !void {
+        const entry = state.find(name) orelse return error.UnknownRepository;
+        if (try self.db.paused(entry.repo.name)) return error.RepoPaused;
+        if (!state.queue_budget.canScan(std.time.timestamp())) return error.GitHubRateLimited;
+        const tools = self.local(entry.repo);
+        const env = try tools.githubEnv();
+        const client = try tools.gh(&env, entry.repo.name);
+        if (!std.ascii.eqlIgnoreCase(entry.repo.login, try client.identity())) return error.GitHubIdentityChanged;
+        const pull = try client.pull(number);
+        if (!core.isReviewable(pull)) return error.PullRequestNotReady;
+        for (entry.jobs) |*job| {
+            if (job.number != number or !eq(u8, job.head, pull.headRefOid)) continue;
+            if (job.phase == .complete) {
+                try self.refreshReviewInput(entry.repo, client, job, pull);
+                try self.db.save(state);
+            }
+            return self.out("{s} #{d} at {s} is {s}.\n", .{ entry.repo.name, number, job.head, @tagName(job.phase) });
+        }
+        return error.NoMatchingReviewJob;
     }
 
     fn followupService(self: Main, state: *store.State, repo: core.Repo, env: *std.process.EnvMap) !FollowupService {
@@ -2464,6 +2511,7 @@ const Main = struct {
             lock.unlock();
             return self.auditMerged(&state, params);
         }
+        if (eq(u8, cmd, "scan")) return self.scanNow(&state, params);
         if (eq(u8, cmd, "add")) return self.add(&state, params);
         if (eq(u8, cmd, "followup")) return self.followupCommand(&state, params);
         if (eq(u8, cmd, "defaults")) return self.defaults(&state, params);
@@ -3171,6 +3219,12 @@ test "reviewer cooldown applies to the remaining ensemble" {
     try std.testing.expect(!ReviewWorker.remainingLimited(engines, .claude, queue.engineBit(.codex)));
     try std.testing.expect(ReviewWorker.remainingLimited(engines, .claude, queue.engineBit(.claude)));
     try std.testing.expect(ReviewWorker.remainingLimited(engines, .claude, queue.engineBit(.kimi)));
+}
+
+test "an unavailable GitHub identity does not delay the next scan past the repo interval" {
+    const entry: core.Entry = .{ .repo = .{ .name = "test/repo", .login = "reviewer", .interval = 180 }, .scan_attempts = 7 };
+    try std.testing.expectEqual(180, Main.scanRetryDelay(entry, error.GitHubIdentityFailed));
+    try std.testing.expectEqual(core.delay(7), Main.scanRetryDelay(entry, error.GitHubRateLimited));
 }
 
 test "queuing a finished head retries insufficient evidence and leaves deliberate silence alone" {
