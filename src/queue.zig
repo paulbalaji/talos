@@ -153,7 +153,7 @@ pub const Budget = struct {
     }
 
     pub fn eligibleAt(self: Budget, entry: core.Entry, job: core.Job, now: i64, limited: u8, current: usage.Snapshot) ?i64 {
-        if (!job.schedulable() or stack.analysisBlocked(entry, job)) return null;
+        if (!job.schedulable() or entry.isIgnored(job.number) or stack.analysisBlocked(entry, job)) return null;
         var at = @max(job.next, self.github.until);
         if (job.phase != .uncertain and job.analysis == null) {
             if (job.route_progress) |progress| {

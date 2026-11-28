@@ -46,6 +46,7 @@ const usage =
     \\talos [--home DIR] unstack OWNER/REPO NAME
     \\talos [--home DIR] run-once [OWNER/REPO [PR [--mode MODE ...] [--prompt TEXT]]]
     \\talos [--home DIR] audit OWNER/REPO MERGED_PR
+    \\talos [--home DIR] ignore|unignore OWNER/REPO PR
     \\talos [--home DIR] pause|resume OWNER/REPO
     \\talos [--home DIR] install|remove [--label dev.talos.NAME]
     \\talos [--home DIR] tick
@@ -353,6 +354,7 @@ const Adapter = struct {
     }
 
     pub fn post(self: *Adapter, number: u32, payload: core.Payload) !u64 {
+        if (self.entry.isIgnored(number)) return error.IgnoredPullRequest;
         return self.github_client.post(number, payload);
     }
 
@@ -554,6 +556,7 @@ const ReviewWorker = struct {
 
     fn rebind(self: *ReviewWorker, a: A, state: *store.State) !bool {
         const entry = state.find(self.adapter.repo.name) orelse return false;
+        if (entry.isIgnored(self.prepared.pr.number)) return false;
         for (entry.jobs) |*job| {
             if (job.number != self.prepared.pr.number or !eq(u8, job.head, self.prepared.pr.headRefOid)) continue;
             if (!eq(u8, &self.job_key, &(try jobKey(a, entry.repo, job.*)))) return false;
@@ -1095,7 +1098,7 @@ const Main = struct {
             const index = entry.discussion_cursor % entry.jobs.len;
             entry.discussion_cursor = (index + 1) % entry.jobs.len;
             const job = &entry.jobs[index];
-            if (job.phase != .complete) continue;
+            if (job.phase != .complete or entry.isIgnored(job.number)) continue;
             for (pulls) |pull| {
                 if (pull.number != job.number or !core.isReviewable(pull) or !eq(u8, pull.headRefOid, job.head)) continue;
                 self.refreshReviewInput(entry.repo, client, job, pull) catch |err| {
@@ -1191,6 +1194,7 @@ const Main = struct {
 
     fn scanReviewNow(self: Main, state: *store.State, name: []const u8, number: u32) !void {
         const entry = state.find(name) orelse return error.UnknownRepository;
+        if (entry.isIgnored(number)) return error.IgnoredPullRequest;
         if (try self.db.paused(entry.repo.name)) return error.RepoPaused;
         if (!state.queue_budget.canScan(std.time.timestamp())) return error.GitHubRateLimited;
         const tools = self.local(entry.repo);
@@ -1307,6 +1311,10 @@ const Main = struct {
         var candidate: ?*followup.Job = null;
         for (state.followups) |*job| {
             if (!job.active() or job.paused or job.next > now or try self.db.paused(job.source.repo)) continue;
+            if (job.pr) |number| {
+                const entry = state.find(job.source.repo) orelse continue;
+                if (entry.isIgnored(number)) continue;
+            }
             if (candidate == null or job.next < candidate.?.next) candidate = job;
         }
         const job = candidate orelse return;
@@ -1867,7 +1875,7 @@ const Main = struct {
         if (all_models or args.len == 2) {
             const number = try prNumber(args[1]);
             const count = try self.enqueueStack(state, entry, number, all_models, rerun);
-            return self.out("Queued {s} GitHub stack #{d} with {d} open PRs{s}\n", .{ entry.repo.name, number, count, if (all_models) " for all-model review" else "" });
+            return self.out("Queued {s} GitHub stack #{d} with {d} eligible PRs{s}\n", .{ entry.repo.name, number, count, if (all_models) " for all-model review" else "" });
         }
         const name = args[1];
         var members: [stack.max_members]u32 = undefined;
@@ -1904,6 +1912,7 @@ const Main = struct {
     }
 
     fn enqueuePinnedPull(self: Main, state: *store.State, entry: *core.Entry, pull: core.Pull, options: ?core.ReviewOptions) !core.Job {
+        if (entry.isIgnored(pull.number)) return error.IgnoredPullRequest;
         var retry_completed = false;
         if (options == null) {
             for (entry.jobs) |job| {
@@ -1945,6 +1954,7 @@ const Main = struct {
     }
 
     fn choose(self: Main, entry: *core.Entry, number: u32) !core.Pull {
+        if (entry.isIgnored(number)) return error.IgnoredPullRequest;
         const tools = self.local(entry.repo);
         const env = try tools.githubEnv();
         const gh = try tools.gh(&env, entry.repo.name);
@@ -1957,9 +1967,11 @@ const Main = struct {
     fn auditMerged(self: Main, state: *store.State, args: []const []const u8) !void {
         if (args.len != 2) return error.Usage;
         const entry = state.find(args[0]) orelse return error.UnknownRepository;
+        const number = try prNumber(args[1]);
+        if (entry.isIgnored(number)) return error.IgnoredPullRequest;
         var env: std.process.EnvMap = undefined;
         var service = try self.followupService(state, entry.repo, &env);
-        const pr = try service.client.pull(try prNumber(args[1]));
+        const pr = try service.client.pull(number);
         if (!eq(u8, pr.state, "MERGED")) return error.AuditRequiresMergedPull;
         const merged = (pr.mergeCommit orelse return error.AuditMergeCommitMissing).oid;
         if (!core.validOid(merged) or !core.validOid(pr.headRefOid)) return error.InvalidCommit;
@@ -2187,9 +2199,10 @@ const Main = struct {
             } else {
                 try self.out("  Git cache unavailable ({s})\n", .{cache_error.?});
             }
+            for (entry.ignored_pulls) |number| try self.out("  #{d} ignored\n", .{number});
             var queued: usize = 0;
             for (entry.jobs) |job| {
-                if (job.phase == .complete) continue;
+                if (job.phase == .complete or entry.isIgnored(job.number)) continue;
                 queued += 1;
                 try self.out("  #{d} {s} {s}, attempts {d}, next {s}\n", .{
                     job.number,                       job.head[0..@min(job.head.len, 10)], @tagName(job.phase), job.attempts,
@@ -2323,6 +2336,7 @@ const Main = struct {
                 error.AlreadyRunning => .{ .status = .conflict, .message = "Talos is saving queue changes. Try again in a moment." },
                 error.DashboardTargetChanged => .{ .status = .conflict, .message = "The repository or PR changed during lookup. Try again." },
                 error.DashboardStackMemberChanged, error.GitHubStackChanged => .{ .status = .conflict, .message = "The stack changed during lookup. Check the PR again." },
+                error.IgnoredPullRequest => .{ .status = .conflict, .message = "Talos is ignoring this pull request." },
                 error.PublicationUnconfirmed => .{ .status = .conflict, .message = "Talos is confirming an existing GitHub review." },
                 error.PullRequestNotReady, error.NoOpenStackMembers => .{ .status = .unprocessable_entity, .message = "There are no open PR heads to queue." },
                 error.GitHubPullFailed, error.GitHubStackFailed, error.GitHubTargetMismatch => .{ .status = .bad_gateway, .message = "GitHub could not load that PR or stack." },
@@ -2369,6 +2383,7 @@ const Main = struct {
     fn dashboardQueueTarget(self: Main, name: []const u8, number: u32) ![]const u8 {
         var state = try self.db.load();
         const entry = state.find(name) orelse return error.UnknownRepository;
+        if (entry.isIgnored(number)) return error.IgnoredPullRequest;
         var request_app = try self.dashboardLookup();
         defer std.fs.deleteTreeAbsolute(request_app.scratch) catch {};
         defer request_app.scratch_dir.close();
@@ -2439,7 +2454,7 @@ const Main = struct {
                     .number = input.number,
                     .kind = input.kind,
                     .count = count,
-                    .message = try io.fmt(self.a, "Queued stack #{d} with {d} open PRs.", .{ input.number, count }),
+                    .message = try io.fmt(self.a, "Queued stack #{d} with {d} eligible PRs.", .{ input.number, count }),
                 });
             },
         }
@@ -2519,6 +2534,17 @@ const Main = struct {
         if (is_audit) {
             lock.unlock();
             return self.auditMerged(&state, params);
+        }
+        if (eq(u8, cmd, "ignore") or eq(u8, cmd, "unignore")) {
+            if (params.len != 2) return error.Usage;
+            const entry = state.find(params[0]) orelse return error.UnknownRepository;
+            const number = try prNumber(params[1]);
+            const ignored = eq(u8, cmd, "ignore");
+            if (entry.isIgnored(number) != ignored) {
+                try entry.setIgnored(self.a, number, ignored);
+                try self.db.save(&state);
+            }
+            return self.out("{s} {s} #{d}\n", .{ if (ignored) "Ignoring" else "Review enabled for", entry.repo.name, number });
         }
         if (eq(u8, cmd, "scan")) return self.scanNow(&state, params);
         if (eq(u8, cmd, "add")) return self.add(&state, params);
@@ -3324,4 +3350,23 @@ test "queuing a finished head retries insufficient evidence and leaves deliberat
     prior.commit_id = "c" ** 40;
     try db.saveResultAndState(entries[0].repo.name, pull.number, prior, &state);
     try t.expectEqual(.complete, (try app.enqueuePinnedPull(&state, &entries[0], pull, null)).phase);
+}
+
+test "a worker admitted before an ignore cannot finish or post its review" {
+    const t = std.testing;
+    const a = t.allocator;
+    const repo: core.Repo = .{ .name = "example/repo", .login = "reviewer" };
+    const head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    var jobs = [_]core.Job{.{ .number = 42, .head = head }};
+    var entries = [_]core.Entry{.{ .repo = repo, .jobs = &jobs, .ignored_pulls = &.{42} }};
+    var state: store.State = .{ .entries = &entries };
+    var worker: ReviewWorker = undefined;
+    worker.adapter.repo = repo;
+    worker.prepared.pr.number = 42;
+    worker.prepared.pr.headRefOid = head;
+    worker.job_key = try ReviewWorker.jobKey(a, repo, jobs[0]);
+    try t.expect(!try worker.rebind(a, &state));
+
+    worker.adapter.entry = &entries[0];
+    try t.expectError(error.IgnoredPullRequest, worker.adapter.post(42, undefined));
 }

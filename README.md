@@ -54,6 +54,7 @@ talos scan                            # Refresh discovery for enabled repositori
 | Keep the dashboard available on macOS | `talos dashboard install` |
 | Set a provider’s starts per UTC day | `talos usage codex 40` |
 | Show or set the review budget per tick | `talos queue-budget` or `talos queue-budget 3` |
+| Exclude or re-enable a PR | `talos ignore OWNER/REPO 123` or `talos unignore OWNER/REPO 123` |
 | Pause or resume reviews for a repo | `talos pause OWNER/REPO` or `talos resume OWNER/REPO` |
 | Run one scheduler pass | `talos tick` |
 | Remove the macOS scheduler | `talos remove` |
@@ -108,6 +109,8 @@ A new thread containing only automated replies does not invalidate an in-flight 
 If a rereview finds an issue after an approval, its comment flags the earlier approval for a person to reassess. On upgrade, Talos uses newer human replies to catch up completed reviews. It tracks resolution changes from the first successful scan.
 
 Rereviews update the local verdict. Talos posts new actionable findings, an approval for a commit that does not already have one from the configured GitHub account, or a warning when an earlier approval needs reassessing. See summaries and coverage details in `talos result`. A custom review with `--publish` can post its requested summary.
+
+`talos ignore OWNER/REPO 123` excludes a PR from discovery, manual reviews, stack reviews, and publication across new commits and restarts. To see ignored PRs, use `talos status OWNER/REPO` or switch the dashboard to All jobs. Existing results stay available. After `talos unignore OWNER/REPO 123`, you can queue a review immediately.
 
 `talos status OWNER/REPO` shows up to five completed jobs still tracked and links to verified GitHub reviews. `talos result OWNER/REPO 123` prints the last saved local candidate and up to seven previous verdict explanations, including after the PR closes. The explanation records the head and base, reviewer-specific gaps, requested evidence, approval blockers, and the GitHub review ID after readback. Older local candidates keep their original JSON fields. A review reconciled from GitHub can have a receipt without a local candidate.
 
