@@ -215,7 +215,7 @@ const Adapter = struct {
             remaining -= encoded.len - 2;
             try excerpts.appendSlice(a, excerpt);
             if (provided_excerpt.complete) {
-                try provided.append(a, provided_excerpt.request);
+                try provided.appendSlice(a, provided_excerpt.requests);
             } else limited = true;
         }
         if (supplement_result.omissions.len != 0) {
@@ -2991,19 +2991,22 @@ test "completion fits encoded excerpts and leaves room for later small requests"
     const fitted = try Adapter.fitEvidence(a, .{
         .evidence = large ++ small,
         .excerpts = &.{
-            .{ .request = .{ .path = "large.zig", .start_line = null, .end_line = null }, .start_offset = 0, .end_offset = large.len },
-            .{ .request = .{ .path = "small.zig", .start_line = null, .end_line = null }, .start_offset = large.len, .end_offset = large.len + small.len },
+            .{ .requests = &.{.{ .path = "large.zig", .start_line = null, .end_line = null }}, .start_offset = 0, .end_offset = large.len },
+            .{ .requests = &.{
+                .{ .path = "small.zig", .start_line = 1, .end_line = 2 },
+                .{ .path = "small.zig", .start_line = null, .end_line = null, .line_contains = "keep(" },
+            }, .start_offset = large.len, .end_offset = large.len + small.len },
         },
     }, 11);
     try t.expect(fitted.limited);
     try t.expectEqualStrings(small, fitted.source);
-    try t.expectEqual(@as(usize, 1), fitted.provided.len);
+    try t.expectEqual(@as(usize, 2), fitted.provided.len);
     try t.expectEqualStrings("small.zig", fitted.provided[0].path);
 
     const clipped = try Adapter.fitEvidence(a, .{
         .evidence = small,
         .excerpts = &.{.{
-            .request = .{ .path = "small.zig", .start_line = null, .end_line = null },
+            .requests = &.{.{ .path = "small.zig", .start_line = null, .end_line = null }},
             .start_offset = 0,
             .end_offset = small.len,
             .complete = false,
