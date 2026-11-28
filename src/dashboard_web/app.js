@@ -227,6 +227,8 @@ function hideTooltip() {
 function revealTooltip(anchor, title, rows, point = null) {
   hideTooltip();
   const tip = byId("dashboard-tooltip");
+  const host = anchor.closest("dialog[open]") || document.body;
+  if (tip.parentElement !== host) host.append(tip);
   tip.classList.toggle("progress-tooltip", anchor.classList.contains("job-progress"));
   const grid = element("dl");
   const liveRows = [];
@@ -362,6 +364,14 @@ function phaseLabel(status) {
   return output;
 }
 
+function passSection(item) {
+  return item.section != null ? `Section ${item.section}` : "";
+}
+
+function timedPass(label, at) {
+  return at > 0 ? (now) => phrase([label, `${duration(Math.max(0, now - at * 1000))} elapsed`]) : label;
+}
+
 function progressLabel(job, inspect = true) {
   const wrap = element("div", "job-progress");
   const percent = Number.isFinite(job.percent) ? Math.max(0, Math.min(100, Math.round(job.percent))) : null;
@@ -390,15 +400,11 @@ function progressLabel(job, inspect = true) {
   const active = list(job.active_providers);
   const recent = job.last_pass;
   if (inspect && (active.length || recent)) {
-    const stage = (item) => phrase([item.section != null && `Section ${item.section}`, humanize(item.stage)]);
+    const stage = (item) => phrase([passSection(item), humanize(item.stage)]);
     wrap.dataset.reviewKey = `${keyOf(job.repo, job.number)}:${job.head}:progress`;
-    return tooltipFor(wrap, `PR #${job.number}`, active.length ? active.map((item) => {
-      const label = stage(item);
-      return [
-        item.model || humanize(item.engine),
-        item.at > 0 ? (now) => phrase([label, `${duration(Math.max(0, now - item.at * 1000))} elapsed`]) : label,
-      ];
-    }) : [[
+    return tooltipFor(wrap, `PR #${job.number}`, active.length ? active.map((item) => [
+      item.model || humanize(item.engine), timedPass(stage(item), item.at),
+    ]) : [[
       `Last pass · ${recent.model || humanize(recent.engine)}`,
       phrase([stage(recent), Number.isFinite(recent.duration_ms) && duration(recent.duration_ms), humanize(recent.outcome)]),
     ]]);
@@ -423,42 +429,52 @@ function providerLabel(engine, model, calls = 1, compact = false) {
   }
   const quantity = calls > 1 ? ` ×${calls}` : "";
   const text = element("span", "provider-name");
-  if (compact) label.title = phrase([name, model]);
   if (compact && hasIcon && model) {
-    text.append(element("span", "sr-only", `${name} `), document.createTextNode(`${model}${quantity}`));
+    text.append(element("span", "sr-only", `${name} `), document.createTextNode(model));
   } else {
-    text.textContent = name + quantity;
+    text.textContent = name;
     if (model) text.append(element("span", "provider-model", ` · ${model}`));
   }
   label.append(text);
+  if (quantity) label.append(element("span", "provider-count", quantity.trim()));
   return label;
 }
 
-function providersLabel(values, allModels) {
-  if (!values.length) return element("span", "minor", allModels ? "All models" : "—");
+function providersLabel(job) {
+  const values = list(job.active_providers);
+  if (!values.length) return element("span", "minor", job.all_models ? "All models" : "—");
   const group = element("div", "providers");
-  const names = new Map();
+  const providers = new Map();
   for (const item of values) {
     const key = `${item.engine}:${item.model || ""}`;
-    if (names.has(key)) names.get(key).count += 1;
-    else names.set(key, { ...item, count: 1 });
+    if (!providers.has(key)) providers.set(key, []);
+    providers.get(key).push(item);
   }
-  for (const item of names.values()) group.append(providerLabel(item.engine, item.model, item.count, true));
+  for (const [key, passes] of providers) {
+    const { engine, model } = passes[0];
+    const label = providerLabel(engine, model, passes.length, true);
+    label.classList.add("inspectable");
+    label.dataset.reviewKey = `${keyOf(job.repo, job.number)}:${job.head}:provider:${key}`;
+    const rows = passes.map((item, index) => [
+      passSection(item) || `Pass ${index + 1}`,
+      timedPass(humanize(item.stage) || "Running", item.at),
+    ]);
+    group.append(tooltipFor(label, phrase([humanize(engine), model, plural(passes.length, "active pass", "active passes")]), rows));
+  }
   return group;
 }
 
 function reviewKey(item, head = null, showDetails = true, stack = null) {
   const wrap = element("div", "review-key");
-  const label = element("button", "review-link", `#${item.number}`);
+  const title = showDetails && item.title;
+  const label = element("button", "review-link");
   label.type = "button";
-  label.setAttribute("aria-label", `Review details for ${item.repo} #${item.number}`);
+  label.setAttribute("aria-label", `Review details for ${item.repo} #${item.number}${title ? ` ${title}` : ""}`);
+  label.append(element("span", "review-number", `#${item.number}`));
+  if (title) label.append(element("span", "review-title", title));
   label.dataset.reviewKey = phrase([keyOf(item.repo, item.number), head, item.at]);
   label.addEventListener("click", () => openReview(item.repo, item.number, head, item.at ?? null, item.review_id ?? null, item.review_key ?? null));
-  if (showDetails && item.title) {
-    const line = element("div", "review-keyline");
-    line.append(label, element("span", "review-title", item.title));
-    wrap.append(line);
-  } else wrap.append(label);
+  wrap.append(label);
   if (showDetails) {
     const metadata = element("span", "review-repo", phrase([item.repo, item.draft && "Draft"]));
     if (stack) {
@@ -557,7 +573,7 @@ function renderQueue() {
     stateUnavailable ? "Queue unavailable. Retrying…" : "Loading queue…";
   update("queue", statuses.length ? statuses : [empty], () => {
     replace(byId("queue-results"), renderTable(["Pull request", "State", "Progress", "Reviewers"], statuses.map(([job, status, stack]) => [
-      reviewKey(job, null, true, stack), phaseLabel(status), progressLabel(job), providersLabel(list(job.active_providers), job.all_models),
+      reviewKey(job, null, true, stack), phaseLabel(status), progressLabel(job), providersLabel(job),
     ]), empty, statuses.map(([, , stack]) => stack ? `linked-row ${stack.accent}` : "")));
   });
 
@@ -964,8 +980,9 @@ function planSummary(plan) {
 }
 
 function renderCoverage(coverage, blockers) {
-  const section = element("section", "detail-section");
-  section.append(element("h3", null, coverage.complete ? "Coverage complete" : "Coverage limited"));
+  const section = element("details", "detail-section review-coverage");
+  section.dataset.detailId = "coverage";
+  section.append(element("summary", null, coverage.complete ? "Coverage complete" : "Coverage limited"));
   if (coverage.coverage_plan) {
     const summary = planSummary(coverage.coverage_plan);
     if (summary) section.append(element("p", "detail-meta", summary));
@@ -987,6 +1004,121 @@ function renderCoverage(coverage, blockers) {
   }
   if (blockers.length) section.append(element("p", "chart-guide", `Approval blockers · ${blockers.map(humanize).join(", ")}`));
   return section;
+}
+
+function appendReviewInline(parent, text) {
+  // Review text is untrusted. Render the syntax emitted by Talos with DOM nodes.
+  const inline = /\\([\\\[\]`*_])|&(lt|gt|amp|#64);|`([^`\n]+)`|\[((?:\\.|[^\]\\\n])+)\]\((https:\/\/github\.com\/[^()\s]+)\)|\*\*(P[0-3]\.)\*\*/g;
+  const entities = { lt: "<", gt: ">", amp: "&", "#64": "@" };
+  let offset = 0;
+  for (const part of text.matchAll(inline)) {
+    parent.append(text.slice(offset, part.index));
+    if (part[1]) parent.append(part[1]);
+    else if (part[2]) parent.append(entities[part[2]]);
+    else if (part[3]) parent.append(element("code", null, part[3]));
+    else if (part[6]) parent.append(element("strong", null, part[6]));
+    else {
+      const link = element("a");
+      link.href = part[5];
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      appendReviewInline(link, part[4]);
+      parent.append(link);
+    }
+    offset = part.index + part[0].length;
+  }
+  parent.append(text.slice(offset));
+}
+
+function reviewProse(text) {
+  const content = element("div", "review-prose");
+  for (const block of text.trim().split(/\n\s*\n/)) {
+    let bullets;
+    for (const line of block.split("\n")) {
+      if (!line.trim()) continue;
+      if (line.startsWith("- ")) {
+        if (!bullets) {
+          bullets = element("ul");
+          content.append(bullets);
+        }
+        const item = element("li");
+        appendReviewInline(item, line.slice(2));
+        bullets.append(item);
+      } else {
+        bullets = null;
+        const paragraph = element("p");
+        appendReviewInline(paragraph, line);
+        content.append(paragraph);
+      }
+    }
+  }
+  return content;
+}
+
+function findingCards(comments) {
+  const notes = [];
+  for (const comment of comments) {
+    let note;
+    for (const block of (comment.body || "").trim().split(/\n\s*\n/)) {
+      const mark = /^\*\*(P[0-3])\.\*\*\s*/.exec(block);
+      if (mark || !note) {
+        note = { comment, severity: mark?.[1], body: mark ? block.slice(mark[0].length) : block };
+        notes.push(note);
+      } else note.body += `\n\n${block}`;
+    }
+  }
+  const section = element("section", "detail-section");
+  const heading = element("header", "review-section-heading");
+  heading.append(element("h3", null, "Findings"), element("span", "minor", count(notes.length)));
+  const cards = element("ul", "review-findings");
+  for (const { comment, severity, body } of notes) {
+    const card = element("li", "review-finding");
+    if (severity) card.dataset.severity = severity;
+    const header = element("header", "review-finding-head");
+    header.append(element("code", "finding-location", `${comment.path}${comment.line ? `:${comment.line}` : ""}`));
+    if (severity) header.append(element("span", "review-severity", severity));
+    card.append(header, reviewProse(body));
+    cards.append(card);
+  }
+  section.append(heading, cards);
+  return section;
+}
+
+function savedVerdictCard(result) {
+  const explanation = result.explanation;
+  const coverage = explanation?.coverage;
+  const blockers = list(explanation?.blockers);
+  const publication = publicationStatus({ publication: explanation?.publication,
+    disposition: explanation?.disposition, complete: coverage?.complete });
+  const verifiedApproval = publication.key === "published" && result.event === "APPROVE";
+  const hasFindings = blockers.includes("new_findings") || blockers.includes("open_findings") || list(result.comments).length > 0;
+  const title = hasFindings ? "Concerns found" : verifiedApproval ? "Approved" :
+    coverage?.complete === false ? "Coverage limited" : "Review saved";
+  const card = element("div", "review-verdict-card");
+  card.dataset.tone = hasFindings || coverage?.complete === false ? "warning" : verifiedApproval ? "good" : "neutral";
+  const header = element("header", "review-verdict-head");
+  const meta = element("div", "review-verdict-meta");
+  if (result.commit_id) meta.append(element("code", null, result.commit_id.slice(0, 10)));
+  if (explanation?.route) meta.append(element("span", null, humanize(explanation.route)));
+  if (explanation?.at) meta.append(element("span", null, date(explanation.at)));
+  header.append(element("strong", "review-verdict-title", title), meta);
+  card.append(header);
+  if (publication.label || result.event) {
+    const status = element("div", "review-verdict-publication");
+    const label = element("span", "phase-text", publication.label || "Saved locally");
+    label.dataset.tone = publication.tone || "";
+    status.append(label);
+    if (result.event && !verifiedApproval) status.append(element("span", null, humanize(result.event)));
+    if (publication.reason) status.append(element("span", null, publication.reason));
+    card.append(status);
+  }
+  if (result.body) {
+    const text = result.body.replace(/^(?:Review|Focused review|Performance review|Reliability review|Security review|Simplicity review) of `[a-f0-9]{10}`\.\s*/, "");
+    if (text) card.append(reviewProse(text));
+  } else if (!Object.hasOwn(result, "body")) {
+    card.append(element("p", "review-verdict-publication", "This earlier verdict retains its summary only."));
+  }
+  return card;
 }
 
 function usagePhrase(data) {
@@ -1031,31 +1163,18 @@ function renderDetail(data, target) {
       holder.append(element("p", "detail-note", `Publication waits on stack PR #${job.publication_blocked_by}.`));
     }
     if (Number.isFinite(job.percent) || job.total_sections > 0) holder.append(progressLabel(job, false));
-    const active = list(job.active_providers);
-    if (active.length) holder.append(providersLabel(active, job.all_models));
+    if (list(job.active_providers).length) holder.append(providersLabel(job));
   }
 
   if (result) {
     const section = element("section", "detail-section");
     const explanation = result.explanation;
-    const status = historyStatus({ ...result, publication: explanation?.publication,
-      disposition: explanation?.disposition, complete: explanation?.coverage?.complete });
     const older = job?.head && (job.head !== result.commit_id ||
       (job.review_key || "") !== (result.explanation?.followup_id || ""));
     section.append(element("h3", null, older ? "Previous saved verdict" : "Saved verdict"));
-    section.append(element("p", "detail-meta", phrase([
-      status, result.commit_id?.slice(0, 10), humanize(explanation?.route), explanation?.at && date(explanation.at),
-      explanation?.disposition !== "posted" && humanize(explanation?.disposition),
-    ])));
-    if (result.body) section.append(element("p", "detail-body-text", result.body));
-    else if (!Object.hasOwn(result, "body")) section.append(element("p", "chart-guide", "This earlier verdict retains its summary only."));
-    for (const comment of list(result.comments)) {
-      const item = element("div", "finding");
-      item.append(element("p", "finding-location", `${comment.path}${comment.line ? `:${comment.line}` : ""}`));
-      item.append(element("p", "detail-body-text", comment.body));
-      section.append(item);
-    }
+    section.append(savedVerdictCard(result));
     holder.append(section);
+    if (list(result.comments).length) holder.append(findingCards(result.comments));
     if (explanation?.coverage) holder.append(renderCoverage(explanation.coverage, list(explanation.blockers)));
   } else {
     const section = element("section", "detail-section");
@@ -1438,7 +1557,23 @@ byId("queue-focuses").addEventListener("change", ({ target, currentTarget }) => 
 byId("history-search").addEventListener("input", renderHistory);
 byId("history-filter").addEventListener("change", renderHistory);
 byId("metrics-range").addEventListener("change", refreshMetrics);
-byId("review-dialog").addEventListener("close", () => {
+const reviewDialog = byId("review-dialog");
+let pressedBackdrop = false;
+function hitReviewBackdrop(event) {
+  if (event.target !== reviewDialog) return false;
+  const bounds = reviewDialog.getBoundingClientRect();
+  return event.clientX < bounds.left || event.clientX >= bounds.right ||
+    event.clientY < bounds.top || event.clientY >= bounds.bottom;
+}
+reviewDialog.addEventListener("pointerdown", (event) => { pressedBackdrop = hitReviewBackdrop(event); });
+reviewDialog.addEventListener("click", (event) => {
+  const dismiss = pressedBackdrop && hitReviewBackdrop(event);
+  pressedBackdrop = false;
+  if (dismiss) reviewDialog.close();
+});
+reviewDialog.addEventListener("close", () => {
+  pressedBackdrop = false;
+  if (reviewDialog.contains(tooltipAnchor)) hideTooltip();
   detailSelection = null;
   renderKeys.delete("detail");
 });
