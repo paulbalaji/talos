@@ -72,6 +72,15 @@ pub const Work = struct {
 
     pub fn read(self: *Work, head: []const u8, path: []const u8) !Blob {
         if (!core.validOid(head) or !allowed(path)) return error.FollowupPathDisallowed;
+        return self.readBlob(head, path);
+    }
+
+    pub fn readAudit(self: *Work, head: []const u8, path: []const u8) !Blob {
+        if (!core.validOid(head) or !core.validPath(path) or source.sensitive(path)) return error.FollowupPathDisallowed;
+        return self.readBlob(head, path);
+    }
+
+    fn readBlob(self: *Work, head: []const u8, path: []const u8) !Blob {
         const pathspec = try io.fmt(self.git.cmd.a, ":(literal){s}", .{path});
         const line = try self.call(&.{ "ls-tree", "-z", "--full-tree", head, "--", pathspec }, "");
         var records = std.mem.splitScalar(u8, line, 0);

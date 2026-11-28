@@ -14,6 +14,12 @@ pub const trim = std.mem.trim;
 const output_limit = 32 * 1024 * 1024;
 const output_check_ns = 50 * std.time.ns_per_ms;
 
+fn commandInstant() !std.time.Instant {
+    // Remote requests and subprocess leases age while the Mac sleeps.
+    if (builtin.os.tag == .macos) return .{ .timestamp = try std.posix.clock_gettime(.MONOTONIC_RAW) };
+    return std.time.Instant.now();
+}
+
 // Wake on child exit while still checking output growth and the deadline
 // on a timer. Kernels without exit notification use the regular poll loop.
 const ExitWatch = struct {
@@ -259,7 +265,7 @@ pub const Command = struct {
         try stdin.writeAll(input);
         try stdin.seekTo(0);
 
-        var timer = try std.time.Timer.start();
+        const started = try commandInstant();
         const pid = c.fork();
         if (pid < 0) return error.SpawnFailed;
         if (pid == 0) {
@@ -291,7 +297,8 @@ pub const Command = struct {
                 break;
             }
             if (result < 0 and std.posix.errno(-1) != .INTR) return error.WaitFailed;
-            const elapsed = timer.read();
+            const now = try commandInstant();
+            const elapsed = if (now.order(started) == .lt) 0 else now.since(started);
             if (elapsed >= deadline) return error.SubprocessTimeout;
             if (try stdout.getEndPos() > output_limit or try stderr.getEndPos() > output_limit)
                 return error.SubprocessOutputLimit;

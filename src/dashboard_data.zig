@@ -132,7 +132,7 @@ const VerdictSummary = struct {
             .publication = if (detail) |d| @tagName(d.publication) else "local",
             .at = if (detail) |d| d.at else null,
             .github_review_id = if (detail) |d| d.github_review_id else null,
-            .disposition = if (detail) |d| d.disposition else null,
+            .disposition = if (detail) |d| d.publicationReason() else null,
             .coverage_plan = if (detail) |d| d.coverage.coverage_plan else null,
         };
     }
@@ -424,8 +424,8 @@ const HistoryRow = struct {
     disposition: ?core.PublicationDisposition,
 };
 
-const HistoryKey = struct { repo: []const u8, number: u32, head: []const u8, run: []const u8 };
-const HistoryIndex = std.HashMapUnmanaged(HistoryKey, void, struct {
+const HistoryKey = struct { repo: []const u8, number: u32, head: []const u8, run: []const u8, at: i64 = 0 };
+const HistoryIndex = std.HashMapUnmanaged(HistoryKey, usize, struct {
     pub fn hash(_: @This(), key: HistoryKey) u64 {
         var digest = std.hash.Wyhash.init(key.number);
         digest.update(key.repo);
@@ -433,15 +433,16 @@ const HistoryIndex = std.HashMapUnmanaged(HistoryKey, void, struct {
         digest.update(key.head);
         digest.update(&.{0});
         digest.update(key.run);
+        digest.update(std.mem.asBytes(&key.at));
         return digest.final();
     }
     pub fn eql(_: @This(), left: HistoryKey, right: HistoryKey) bool {
-        return left.number == right.number and io.eq(u8, left.repo, right.repo) and io.eq(u8, left.head, right.head) and io.eq(u8, left.run, right.run);
+        return left.number == right.number and left.at == right.at and io.eq(u8, left.repo, right.repo) and io.eq(u8, left.head, right.head) and io.eq(u8, left.run, right.run);
     }
 }, std.hash_map.default_max_load_percentage);
 
 fn historyKey(row: HistoryRow) HistoryKey {
-    return .{ .repo = row.repo, .number = row.number, .head = row.head, .run = row.review_key orelse "" };
+    return .{ .repo = row.repo, .number = row.number, .head = row.head, .run = row.review_key orelse "", .at = row.at };
 }
 
 fn legacyHistory(a: A, db: store.Store, since: i64, rows: *std.ArrayList(HistoryRow), index: *HistoryIndex) !bool {
@@ -463,7 +464,11 @@ fn addLegacy(a: A, rows: *std.ArrayList(HistoryRow), index: *HistoryIndex, file:
     const at = if (detail) |explanation| explanation.at else fallback;
     if (at < since) return;
     const key = if (detail) |explanation| explanation.followup_id else null;
-    if (index.contains(.{ .repo = file.repo, .number = file.number, .head = head, .run = key orelse "" })) return;
+    const disposition = if (detail) |explanation| explanation.publicationReason() else null;
+    if (index.get(.{ .repo = file.repo, .number = file.number, .head = head, .run = key orelse "", .at = at })) |position| {
+        if (rows.items[position].disposition == null) rows.items[position].disposition = disposition;
+        return;
+    }
     const row: HistoryRow = .{
         .repo = file.repo,
         .number = file.number,
@@ -475,9 +480,9 @@ fn addLegacy(a: A, rows: *std.ArrayList(HistoryRow), index: *HistoryIndex, file:
         .route = if (detail) |explanation| explanation.route else null,
         .complete = if (detail) |explanation| explanation.coverage.complete else null,
         .review_key = if (key) |value| try a.dupe(u8, value) else null,
-        .disposition = if (detail) |explanation| explanation.disposition else null,
+        .disposition = disposition,
     };
-    try index.put(a, historyKey(row), {});
+    try index.put(a, historyKey(row), rows.items.len);
     try rows.append(a, row);
 }
 
@@ -503,7 +508,10 @@ fn getHistory(a: A, db: store.Store, since: i64, now: i64) !History {
             .disposition = verdict.disposition,
         };
         const slot = try index.getOrPut(a, historyKey(row));
-        if (!slot.found_existing) try rows.append(a, row);
+        if (!slot.found_existing) {
+            slot.value_ptr.* = rows.items.len;
+            try rows.append(a, row);
+        }
     }
     const limited = try legacyHistory(a, db, since, &rows, &index);
     std.mem.sort(HistoryRow, rows.items, {}, struct {
@@ -524,6 +532,15 @@ const RepoRow = struct {
 };
 const StackMemberRow = struct { number: u32, draft: bool, phase: []const u8, blocked_by: ?u32 };
 const StackRow = struct { repo: []const u8, number: ?u32, name: []const u8, members: []const StackMemberRow };
+const FollowupRow = struct {
+    repo: []const u8,
+    source_pr: u32,
+    source_url: []const u8,
+    draft: ?u32,
+    stage: []const u8,
+    note: []const u8,
+    paused: bool,
+};
 
 pub fn stateJson(a: A, db: store.Store, include_history: bool, now: i64) ![]const u8 {
     const state = try db.load();
@@ -575,11 +592,22 @@ pub fn stateJson(a: A, db: store.Store, include_history: bool, now: i64) ![]cons
         }
     }
     const history = if (include_history) try getHistory(a, db, now - detail_days * day_seconds, now) else History{};
+    const followups = try a.alloc(FollowupRow, state.followups.len);
+    for (followups, state.followups) |*row, job| row.* = .{
+        .repo = job.source.repo,
+        .source_pr = job.source.pr,
+        .source_url = try job.source.url(a),
+        .draft = job.pr,
+        .stage = @tagName(job.stage),
+        .note = job.note,
+        .paused = job.paused,
+    };
     return io.json(a, .{
         .at = now,
         .repos = repos.items,
         .jobs = jobs.items,
         .stacks = stacks.items,
+        .followups = followups,
         .history = history.rows[0..@min(history.rows.len, history_limit)],
         .history_truncated = history.truncated or history.rows.len > history_limit,
     });
@@ -782,6 +810,7 @@ pub fn metricsJson(a: A, db: store.Store, days: u32, offset: u32, now: i64) ![]c
         published += @intFromBool(io.eq(u8, item.publication, "verified"));
         const slot = try heads.getOrPut(a, .{ .repo = item.repo, .number = item.number, .head = item.head, .run = "" });
         if (!slot.found_existing) {
+            slot.value_ptr.* = 0;
             if (item.complete) |complete| {
                 if (complete) coverage.complete += 1 else coverage.limited += 1;
             } else coverage.unknown += 1;
@@ -841,7 +870,14 @@ pub fn reviewJson(a: A, db: store.Store, name: []const u8, number: u32, now: i64
             error.NoLocalReview => break :result null,
             else => return err,
         };
-        break :result try io.parse(a, core.Result, raw);
+        var saved = try io.parse(a, core.Result, raw);
+        if (saved.explanation) |*detail| detail.disposition = detail.publicationReason();
+        const history = try a.dupe(core.PastResult, saved.history);
+        for (history) |*prior| {
+            if (prior.explanation) |*detail| detail.disposition = detail.publicationReason();
+        }
+        saved.history = history;
+        break :result saved;
     };
     const job = try jobRow(a, entry.*, number, attempts, .{
         .now = now,

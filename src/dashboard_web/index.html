@@ -18,6 +18,7 @@
       <nav aria-label="Dashboard">
         <a href="#queue" data-view="queue" aria-current="page">Queue</a>
         <a href="#history" data-view="history">History</a>
+        <a href="#followups" data-view="followups">Follow-ups</a>
         <a href="#usage" data-view="usage">Usage</a>
       </nav>
       <p id="sync-state" class="sync-state" role="status">Connecting…</p>
@@ -49,7 +50,7 @@
             <button type="submit" class="button button-secondary">Find PR</button>
           </form>
           <p id="find-message" class="notice" role="status" hidden></p>
-          <div id="queue-results" class="table-wrap"></div>
+          <div id="queue-results" class="table-wrap" role="region" aria-label="Review queue results" tabindex="0"></div>
           <section id="stacks-panel" class="subsection" aria-labelledby="stack-title" hidden>
             <header class="section-heading">
               <h2 id="stack-title">Active stacks</h2>
@@ -102,7 +103,7 @@
               <h2 id="repo-title">Repositories</h2>
               <span id="repo-count" class="minor mono"></span>
             </header>
-            <ul id="repositories" class="repositories"></ul>
+            <ul id="repositories" class="repositories" aria-labelledby="repo-title" tabindex="0"></ul>
           </section>
         </aside>
       </div>
@@ -124,11 +125,17 @@
             <option value="">All verdicts</option>
             <option value="published">Published</option>
             <option value="local">Local only</option>
-            <option value="pending">Awaiting publication</option>
+            <option value="skipped">Decided not to publish</option>
+            <option value="pending">Checking publication</option>
           </select>
         </label>
       </div>
-      <div id="history-results" class="table-wrap"></div>
+      <div id="history-results" class="table-wrap" role="region" aria-label="Saved verdicts" tabindex="0"></div>
+    </section>
+
+    <section id="followups-view" aria-labelledby="followups-title" hidden>
+      <header class="page-heading"><h1 id="followups-title">Follow-ups</h1></header>
+      <div id="followup-results" class="table-wrap" role="region" aria-label="Tracked follow-ups" tabindex="0"></div>
     </section>
 
     <section id="usage-view" aria-labelledby="usage-title" hidden>
@@ -145,7 +152,7 @@
         </label>
       </header>
       <p id="metrics-notice" class="notice" role="status" hidden></p>
-      <div id="metrics-results" aria-live="off"></div>
+      <div id="metrics-results" role="region" aria-label="Usage breakdown" tabindex="0"></div>
     </section>
   </main>
 
