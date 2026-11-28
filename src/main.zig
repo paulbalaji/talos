@@ -1935,8 +1935,12 @@ const Main = struct {
             else => return err,
         };
         const saved = try io.parse(self.a, core.Result, raw);
-        if (!eq(u8, job.head, saved.commit_id) or !eq(u8, saved.followupId(), (try core.followupId(self.a, job)) orelse "")) return null;
+        // A discussion rereview can return to the reviewed input without
+        // saving a new verdict. Its new job key does not replace the last
+        // actual result for this head.
+        if (!eq(u8, job.head, saved.commit_id)) return null;
         const detail = saved.explanation orelse return null;
+        if (detail.publication != .local) return null;
         return detail.publicationReason();
     }
 
@@ -3276,4 +3280,45 @@ test "queuing a finished head retries insufficient evidence and leaves deliberat
     try t.expect(queued.followup and queued.verdict == null);
     const second = try app.enqueuePinnedPull(&state, &entries[0], pull, null);
     try t.expectEqual(queued.followup_id, second.followup_id);
+
+    // The input reverted before the follow-up ran. It kept the earlier
+    // same-head result and never saved a verdict under the new job key.
+    jobs[0].phase = .complete;
+    jobs[0].outcome = "review inputs returned to the reviewed state";
+    var prior: core.Result = .{
+        .commit_id = head,
+        .event = .COMMENT,
+        .body = "",
+        .comments = &.{},
+        .explanation = .{
+            .at = 1,
+            .followup_id = null,
+            .base = .fromPull(pull),
+            .merge_base = "b" ** 40,
+            .route = .regular,
+            .blockers = &.{.limited_coverage},
+            .coverage = .{
+                .complete = false,
+                .snapshot_limited = false,
+                .snapshot_reasons = &.{},
+                .supplemental_limited = true,
+                .truncated_threads = 0,
+                .omitted_findings = 0,
+                .reviewers = &.{},
+            },
+            .synthesis_provider = null,
+            .synthesis_summary = null,
+            .evidence_requests = &.{},
+            .onchain_observations = &.{},
+            .publication = .local,
+            .disposition = .insufficient_evidence,
+        },
+    };
+    try db.saveResultAndState(entries[0].repo.name, pull.number, prior, &state);
+    try t.expectEqual(.pending, (try app.enqueuePinnedPull(&state, &entries[0], pull, null)).phase);
+
+    jobs[0].phase = .complete;
+    prior.commit_id = "c" ** 40;
+    try db.saveResultAndState(entries[0].repo.name, pull.number, prior, &state);
+    try t.expectEqual(.complete, (try app.enqueuePinnedPull(&state, &entries[0], pull, null)).phase);
 }
