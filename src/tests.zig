@@ -1568,7 +1568,8 @@ test "a clipped historical delta permits approval only with complete current evi
         const result = (try core.run(a, &fake, configured, &job, .scheduled)).?;
         try t.expectEqual(case.event, result.event);
         try t.expectEqualStrings(open_nit.id, fake.snapshot_threads[0].id);
-        try t.expect(std.mem.indexOf(u8, fake.prompt_text, "\"historical_coverage_reasons\":[\"The previous diff exceeded the byte limit.\"]") != null);
+        try t.expect(std.mem.indexOf(u8, fake.prompt_text, "\"earlier_comparison_notes\":[\"The previous diff exceeded the byte limit.\"]") != null);
+        try t.expect(std.mem.indexOf(u8, fake.prompt_text, fake.previous_delta) == null);
         if (case.event == .APPROVE) try t.expect(std.mem.indexOf(u8, result.body, "Review coverage was limited.") == null);
     }
 }

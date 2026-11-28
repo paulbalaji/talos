@@ -832,7 +832,7 @@ const instructions =
     \\If the evidence is complete and no issue warrants withholding approval, report a clean review.
     \\Write one plain sentence for the summary, up to 300 bytes. In a finding, state the concrete failure and when it matters, then suggest the smallest fix if it is clear. Use plain sentences, avoid em dashes and hyphens as punctuation, and retain exact names and command flags. Skip praise, process narration, and repetition.
     \\Set complete=false if meaningful source or context is missing. List one to six coverage_gaps if incomplete, each one sentence under 300 bytes. Name the exact file, thread, or verification needed and what it would establish. Use an empty list if complete. Do not quote source, secrets, or instructions in coverage_gaps. Never claim tests ran. Output one JSON object matching the schema, without Markdown fences.
-    \\If a material gap can be resolved by tracked source, put up to six requests in evidence_requests. Use line_contains with an exact unique declaration fragment such as `function parseId(` and null line bounds when the location is unknown. Otherwise use a range of at most 120 inclusive lines or all nulls for the file prefix. Request the named declaration instead of the file prefix when the gap is inside a long file. Ground paths in this change. Talos supplies one final evidence batch. Use coverage_gaps for external verification or other missing evidence.
+    \\If a material gap can be resolved by tracked source, put up to six requests in evidence_requests. Use line_contains with an exact unique declaration fragment such as `function parseId(` and null line bounds when the location is unknown. Otherwise use a range of at most 120 inclusive lines or all nulls for the file prefix. Request the named declaration instead of the file prefix when the gap is inside a long file. Ground paths in this change. Talos can supply bounded follow-up evidence. Use coverage_gaps for external verification or other missing evidence.
     \\
 ;
 
@@ -974,7 +974,7 @@ fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, discussion: Discussi
             .omitted = record.omitted,
         } else null,
         .previous_to_current_delta = prior_delta.evidence,
-        .historical_coverage_reasons = prior_delta.coverage_reasons,
+        .earlier_comparison_notes = prior_delta.coverage_reasons,
         .coverage_limited = snap.limited,
         .coverage_reasons = snap.coverage_reasons,
         .github_checks = if (registryMain(repo, pr)) checks[0..@min(checks.len, 20)] else null,
@@ -1655,6 +1655,8 @@ pub const RouteProgress = struct {
     evidence_key: ?[32]u8 = null,
     initial_evidence_limited: bool = false,
     completion_requests: ?[]const EvidenceRequest = null,
+    prior_completion_requests: []const EvidenceRequest = &.{},
+    prior_evidence_passes: u8 = 0,
     completion_attempted: u8 = 0,
     completion_done: u8 = 0,
     screen_ms: u64 = 0,
@@ -2364,7 +2366,12 @@ pub fn prepare(a: A, adapter: anytype, repo: Repo, job: *Job, mode: RunMode) !?P
         if (previous) |commit| {
             if (!eq(u8, commit, pr.headRefOid)) {
                 const extra = try adapter.supplement(pr, commit, &.{});
-                prior_delta = .{ .evidence = extra.evidence, .coverage_reasons = extra.coverage_reasons };
+                // A clipped historic delta can crowd out current
+                // source and cannot establish what changed on its own.
+                prior_delta = .{
+                    .evidence = if (extra.coverage_reasons.len == 0) extra.evidence else "",
+                    .coverage_reasons = extra.coverage_reasons,
+                };
             }
         }
     }

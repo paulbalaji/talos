@@ -214,7 +214,9 @@ const Adapter = struct {
             }
             remaining -= encoded.len - 2;
             try excerpts.appendSlice(a, excerpt);
-            try provided.append(a, provided_excerpt.request);
+            if (provided_excerpt.complete) {
+                try provided.append(a, provided_excerpt.request);
+            } else limited = true;
         }
         if (supplement_result.omissions.len != 0) {
             const encoded = try io.json(a, supplement_result.omissions);
@@ -1703,6 +1705,7 @@ const Main = struct {
             const pinned = try live.reviewEvidence(plan.prepared.pr, progress.evidence_requests, adaptive.evidenceCapacity(section));
             plan.evidence = pinned.source;
             plan.evidence_limited = pinned.limited;
+            plan.evidence_provided = pinned.provided;
             var hash = std.crypto.hash.sha2.Sha256.init(.{});
             hash.update(pinned.source);
             hash.update(&.{@intFromBool(pinned.limited)});
@@ -1720,7 +1723,8 @@ const Main = struct {
         if (progress.completion_requests) |requests| {
             if (requests.len != 0) {
                 const capacity = try adaptive.completionCapacity(section, plan.evidence orelse "", progress.onchain_observations orelse &.{}, self.a);
-                plan.completion_evidence = try live.reviewEvidence(plan.prepared.pr, requests, capacity);
+                const combined = if (progress.prior_completion_requests.len == 0) requests else try std.mem.concat(self.a, core.EvidenceRequest, &.{ progress.prior_completion_requests, requests });
+                plan.completion_evidence = try live.reviewEvidence(plan.prepared.pr, combined, capacity);
             }
         }
         return plan;
@@ -1768,7 +1772,8 @@ const Main = struct {
                     outcome.progress.sections.evidence_requests
                 else
                     try std.mem.concat(self.a, core.EvidenceRequest, &.{
-                        outcome.progress.evidence_requests, outcome.progress.completion_requests orelse &.{},
+                        outcome.progress.evidence_requests,               outcome.progress.prior_completion_requests,
+                        outcome.progress.completion_requests orelse &.{},
                     });
                 work.prepared.onchain_observations = report.onchain_observations;
                 work.job.route_report = report;
@@ -2990,6 +2995,19 @@ test "completion fits encoded excerpts and leaves room for later small requests"
     try t.expectEqualStrings(small, fitted.source);
     try t.expectEqual(@as(usize, 1), fitted.provided.len);
     try t.expectEqualStrings("small.zig", fitted.provided[0].path);
+
+    const clipped = try Adapter.fitEvidence(a, .{
+        .evidence = small,
+        .excerpts = &.{.{
+            .request = .{ .path = "small.zig", .start_line = null, .end_line = null },
+            .start_offset = 0,
+            .end_offset = small.len,
+            .complete = false,
+        }},
+    }, 100);
+    try t.expect(clipped.limited);
+    try t.expectEqualStrings(small, clipped.source);
+    try t.expectEqual(@as(usize, 0), clipped.provided.len);
 }
 
 test "an in-flight review binds to the reloaded job and discards a superseded job" {

@@ -1010,7 +1010,7 @@ function renderCoverage(coverage, blockers) {
     const summary = planSummary(coverage.coverage_plan);
     if (summary) section.append(element("p", "detail-meta", summary));
   }
-  const gaps = [...list(coverage.snapshot_reasons), ...list(coverage.historical_reasons)];
+  const gaps = [...list(coverage.snapshot_reasons)];
   if (coverage.supplemental_limited) gaps.push("Some requested source excerpts were unavailable or exceeded the evidence budget.");
   if (coverage.truncated_open_threads > 0) gaps.push(plural(coverage.truncated_open_threads, "truncated open thread"));
   if (coverage.unassessed_thread) {
@@ -1024,6 +1024,9 @@ function renderCoverage(coverage, blockers) {
     const entries = element("ul", "coverage-list");
     for (const gap of new Set(gaps)) entries.append(element("li", null, gap));
     section.append(entries);
+  }
+  for (const reason of list(coverage.historical_reasons)) {
+    section.append(element("p", "detail-meta", `Earlier comparison · ${reason}`));
   }
   if (blockers.length) section.append(element("p", "chart-guide", `Approval blockers · ${blockers.map(humanize).join(", ")}`));
   return section;
