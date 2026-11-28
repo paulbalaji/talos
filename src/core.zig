@@ -338,6 +338,7 @@ pub const Snapshot = struct {
     onchain_reads: []const onchain.Request = &.{},
     diff: ?struct { patch: []const u8, start: usize, end: usize } = null,
     missing_changed_files: usize = 0,
+    checked_env_examples: usize = 0,
     base_sensitive: bool = false,
     source_tree: ?[]const u8 = null,
     diff_priority: []const []const u8 = &.{},
@@ -930,6 +931,9 @@ fn reviewPrompt(a: A, repo: Repo, pr: Pull, snap: Snapshot, discussion: Discussi
     var rendered: std.ArrayList(u8) = .empty;
     const writer = rendered.writer(a);
     try writer.print("{s}\n{s}", .{ instructions, schema });
+    if (snap.checked_env_examples != 0) {
+        try writer.print("\n\nTalos checked {d} modified .env.example files at the pinned merge base and head. Only comments or blank lines changed. Assignments are identical. The example file contents are withheld.", .{snap.checked_env_examples});
+    }
     if (snap.registry_logo_only)
         try writer.writeAll("\n\nThe pinned change is limited to static SVG replacements at existing registry logo paths and an optional patch changeset. Review the XML, viewBox, coordinate bounds, padding, and light or dark variant using the supplied source. A visual preference alone is not a defect. Check the regular review threads and require additional evidence if a concrete risk is unresolved.");
     if (snap.relayer_promotion)

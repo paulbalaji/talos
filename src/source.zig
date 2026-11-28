@@ -25,6 +25,7 @@ const delta_limit = 12 * 1024;
 const excerpt_blob_limit = 128 * 1024;
 const excerpt_source_limit = 512 * 1024;
 const excerpt_line_limit = 120;
+const whole_evidence_limit = 8 * 1024;
 const registry_diff_limit = 16 * 1024;
 const registry_pin_path = ".registryrc";
 const agent_image_diff_limit = 16 * 1024;
@@ -43,11 +44,18 @@ const agent_image_diff_order =
     \\rust/main/hyperlane-core
 ;
 
+const EvidenceExcerpt = struct {
+    requests: []const core.EvidenceRequest,
+    start_offset: usize,
+    end_offset: usize,
+    complete: bool = true,
+};
+
 pub const Supplement = struct {
     evidence: []const u8 = "",
     limited: bool = false,
     coverage_reasons: []const []const u8 = &.{},
-    excerpts: []const struct { request: core.EvidenceRequest, start_offset: usize, end_offset: usize, complete: bool = true } = &.{},
+    excerpts: []const EvidenceExcerpt = &.{},
     omissions: []const u8 = "",
 };
 
@@ -102,6 +110,45 @@ pub fn sensitive(path: []const u8) bool {
     const name = std.fs.path.basename(path);
     for (sensitive_names) |rule| if (rule.matches(name)) return true;
     return false;
+}
+
+fn templateAssignmentsUnchanged(before: []const u8, after: []const u8) bool {
+    var old = std.mem.splitScalar(u8, before, '\n');
+    var new = std.mem.splitScalar(u8, after, '\n');
+    while (true) {
+        const left = nextTemplateAssignment(&old) catch return false;
+        const right = nextTemplateAssignment(&new) catch return false;
+        if (left == null or right == null) return left == null and right == null;
+        if (!eq(u8, left.?, right.?)) return false;
+    }
+}
+
+fn nextTemplateAssignment(lines: *std.mem.SplitIterator(u8, .scalar)) error{InvalidTemplate}!?[]const u8 {
+    while (lines.next()) |raw| {
+        const line = io.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, line, '\r') != null or std.mem.endsWith(u8, line, "\\")) return error.InvalidTemplate;
+        if (line[0] == '#') continue;
+
+        const delimiter = std.mem.indexOfScalar(u8, line, '=') orelse return error.InvalidTemplate;
+        const name = io.trim(u8, line[0..delimiter], " \t");
+        if (name.len == 0 or (!std.ascii.isAlphabetic(name[0]) and name[0] != '_')) return error.InvalidTemplate;
+        for (name[1..]) |byte| {
+            if (!std.ascii.isAlphanumeric(byte) and byte != '_') return error.InvalidTemplate;
+        }
+        const value = io.trim(u8, line[delimiter + 1 ..], " \t");
+        if (value.len != 0 and (value[0] == '"' or value[0] == '\'')) {
+            const end = std.mem.indexOfScalarPos(u8, value, 1, value[0]) orelse return error.InvalidTemplate;
+            if (std.mem.indexOfScalar(u8, value[1..end], '\\') != null) return error.InvalidTemplate;
+            const suffix = io.trim(u8, value[end + 1 ..], " \t");
+            if (suffix.len != 0 and suffix[0] != '#') return error.InvalidTemplate;
+        } else {
+            const end = std.mem.indexOfScalar(u8, value, '#') orelse value.len;
+            if (std.mem.indexOfAny(u8, value[0..end], "\\\"'`") != null) return error.InvalidTemplate;
+        }
+        return raw;
+    }
+    return null;
 }
 
 fn shellQuote(a: A, value: []const u8) ![]const u8 {
@@ -261,12 +308,15 @@ pub const Git = struct {
         if (missing_threads != 0) try coverage.append(a, try io.fmt(a, "Current source excerpts were unavailable for {d} active review thread anchors.", .{missing_threads}));
         if (files.len >= 3000) try coverage.append(a, "GitHub reached its changed file limit.");
         var sensitive_count: usize = 0;
+        var checked_examples: usize = 0;
         var patch_count: usize = 0;
         var invalid_path_count: usize = 0;
         var candidates: std.ArrayList([]const u8) = .empty;
         for (files) |file| {
             if (sensitive(file.filename)) {
-                sensitive_count += 1;
+                if (try self.checkExample(path, merge_base, pr.headRefOid, file)) {
+                    checked_examples += 1;
+                } else sensitive_count += 1;
             } else if (file.patch == null) {
                 patch_count += 1;
             } else if (!core.validPath(file.filename)) {
@@ -352,11 +402,33 @@ pub const Git = struct {
             .onchain_reads = onchain_reads,
             .diff = .{ .patch = patch, .start = diff_start, .end = diff_end },
             .missing_changed_files = sensitive_count + patch_count + invalid_path_count,
+            .checked_env_examples = checked_examples,
             .base_sensitive = core.registryMain(self.object_cache.repo, pr) or image.optional_start != null,
             .source_tree = source_tree,
             .diff_priority = priorities,
             .thread_evidence = try a.dupe(u8, evidence.items[0 .. diff_start - "Merge-base diff:\n".len]),
         };
+    }
+
+    fn checkExample(self: Git, cache_path: []const u8, base: []const u8, head: []const u8, file: github.File) !bool {
+        const name = file.filename;
+        if (!eq(u8, std.fs.path.basename(name), ".env.example") or !core.validPath(name) or
+            !eq(u8, file.status, "modified") or file.previous_filename != null) return false;
+        const pathspec = try io.fmt(self.cmd.a, ":(literal){s}", .{name});
+        var source: [2][]const u8 = undefined;
+        for ([_][]const u8{ base, head }, &source) |commit, *text| {
+            const entry = self.gitWithin(cache_path, &.{ "ls-tree", "-z", "--full-tree", commit, "--", pathspec }, "", 20) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return false,
+            };
+            if (!std.mem.startsWith(u8, entry, "100644 blob ")) return false;
+            const oid = excerptOid(entry, name) catch return false;
+            text.* = self.pinnedText(cache_path, oid, whole_evidence_limit) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return false,
+            };
+        }
+        return templateAssignmentsUnchanged(source[0], source[1]);
     }
 
     fn warpCapacityRequests(self: Git, path: []const u8, pr: core.Pull, merge_base: []const u8, files: []const github.File) ![]const onchain.Request {
@@ -1002,21 +1074,46 @@ pub const Git = struct {
         }
         var remaining: usize = supplement_limit;
         var requests_incomplete = requests.len > max_requests;
-        var excerpts: std.ArrayList(std.meta.Child(@FieldType(Supplement, "excerpts"))) = .empty;
+        var excerpts: std.ArrayList(EvidenceExcerpt) = .empty;
         var omissions: std.ArrayList(u8) = .empty;
-        for (requests[0..@min(requests.len, max_requests)], 1..) |request, index| {
+        const bounded = requests[0..@min(requests.len, max_requests)];
+        var served: std.StaticBitSet(max_requests) = .initEmpty();
+        var tried_whole: std.StaticBitSet(max_requests) = .initEmpty();
+        for (bounded, 0..) |request, index| {
+            if (served.isSet(index)) continue;
             const start_offset = evidence.items.len;
+            var group: std.StaticBitSet(max_requests) = .initEmpty();
+            for (bounded[index..], index..) |candidate, position| {
+                if (eq(u8, candidate.path, request.path)) group.set(position);
+            }
+            const full = if (group.count() > 1 and !tried_whole.isSet(index)) full: {
+                tried_whole.setUnion(group);
+                break :full try self.appendSmallEvidence(cache_path, head, request.path, &evidence, &remaining);
+            } else false;
+            if (full) {
+                try appendSharedExcerpt(a, &excerpts, bounded, group, start_offset, evidence.items.len);
+                served.setUnion(group);
+                continue;
+            }
             if (self.appendExcerpt(cache_path, head, request, null, &evidence, &remaining)) |complete| {
                 requests_incomplete = requests_incomplete or !complete;
                 try excerpts.append(a, .{
-                    .request = request,
+                    .requests = bounded[index..][0..1],
                     .start_offset = start_offset,
                     .end_offset = evidence.items.len,
                     .complete = complete,
                 });
             } else |err| {
                 if (err == error.OutOfMemory) return err;
-                try omissions.writer(a).print("Evidence request {d} omitted ({s}).\n", .{ index, excerptOmission(err) });
+                if (!tried_whole.isSet(index) and
+                    (err == error.ExcerptAnchorAmbiguous or err == error.ExcerptAnchorMissing or err == error.ExcerptPastEnd) and
+                    try self.appendSmallEvidence(cache_path, head, request.path, &evidence, &remaining))
+                {
+                    try appendSharedExcerpt(a, &excerpts, bounded, group, start_offset, evidence.items.len);
+                    served.setUnion(group);
+                    continue;
+                }
+                try omissions.writer(a).print("Evidence request {d} for {s} omitted ({s}).\n", .{ index + 1, request.path, excerptOmission(err) });
                 requests_incomplete = true;
             }
         }
@@ -1032,6 +1129,25 @@ pub const Git = struct {
             .excerpts = excerpts.items,
             .omissions = omissions.items,
         };
+    }
+
+    fn appendSmallEvidence(self: Git, cache_path: []const u8, head: []const u8, name: []const u8, evidence: *std.ArrayList(u8), remaining: *usize) !bool {
+        if (!core.validPath(name) or sensitive(name) or remaining.* <= name.len + 160) return false;
+        const oid = self.pinnedOid(cache_path, head, name) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return false,
+        };
+        const limit = @min(whole_evidence_limit, remaining.* - name.len - 160);
+        const blob = self.pinnedText(cache_path, oid, limit) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return false,
+        };
+        const lines = std.mem.count(u8, blob, "\n") +
+            @intFromBool(blob.len != 0 and blob[blob.len - 1] != '\n');
+        const start = evidence.items.len;
+        try evidence.writer(self.cmd.a).print("\nComplete pinned head file {s} ({d} lines):\n{s}\n", .{ name, lines, blob });
+        remaining.* -= evidence.items.len - start;
+        return true;
     }
 
     fn appendExcerpt(self: Git, cache_path: []const u8, head: []const u8, request: core.EvidenceRequest, anchor_line: ?u32, evidence: *std.ArrayList(u8), remaining: *usize) !bool {
@@ -1116,6 +1232,13 @@ pub const Git = struct {
         return blobs;
     }
 };
+
+fn appendSharedExcerpt(a: A, excerpts: *std.ArrayList(EvidenceExcerpt), requests: []const core.EvidenceRequest, group: std.StaticBitSet(max_requests), start: usize, end: usize) !void {
+    const provided = try a.alloc(core.EvidenceRequest, group.count());
+    var positions = group.iterator(.{});
+    for (provided) |*request| request.* = requests[positions.next().?];
+    try excerpts.append(a, .{ .requests = provided, .start_offset = start, .end_offset = end });
+}
 
 fn scraperEvidenceRequests(files: []const github.File, diff: []const u8) []const core.EvidenceRequest {
     for (files) |file| {
@@ -1294,16 +1417,43 @@ fn excerptRange(start: ?u32, end: ?u32) !ExcerptRange {
     return .{ .start = first, .end = @min(last, limit), .clipped = last > limit };
 }
 
-fn anchoredRange(blob: []const u8, needle: []const u8) !ExcerptRange {
+fn identifierByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '$';
+}
+
+fn containsAnchor(text: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return false;
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, text, start, needle)) |position| {
+        const end = position + needle.len;
+        const left = position == 0 or !identifierByte(needle[0]) or !identifierByte(text[position - 1]);
+        const right = end == text.len or !identifierByte(needle[needle.len - 1]) or !identifierByte(text[end]);
+        if (left and right) return true;
+        start = position + 1;
+    }
+    return false;
+}
+
+fn anchoredLine(blob: []const u8, needle: []const u8) !u32 {
     var lines = std.mem.splitScalar(u8, blob, '\n');
     var line: u32 = 1;
     var anchor_index: ?u32 = null;
     while (lines.next()) |text| : (line += 1) {
-        if (std.mem.indexOf(u8, text, needle) == null) continue;
+        if (!containsAnchor(text, needle)) continue;
         if (anchor_index != null) return error.ExcerptAnchorAmbiguous;
         anchor_index = line;
     }
-    const match = anchor_index orelse return error.ExcerptAnchorMissing;
+    return anchor_index orelse return error.ExcerptAnchorMissing;
+}
+
+fn anchoredRange(blob: []const u8, needle: []const u8) !ExcerptRange {
+    const match = anchoredLine(blob, needle) catch |err| switch (err) {
+        error.ExcerptAnchorMissing => if (std.mem.startsWith(u8, needle, "fn ") and std.mem.endsWith(u8, needle, "("))
+            try anchoredLine(blob, needle[0 .. needle.len - 1])
+        else
+            return err,
+        else => return err,
+    };
     return excerptRange(@max(1, match -| 6), match +| 80);
 }
 
@@ -1578,10 +1728,12 @@ test "pinned source reads exact trees and prioritizes active review anchors in a
     const old_pin = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const new_pin = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     var commits: [2][]const u8 = undefined;
-    for (&commits, [_][]const u8{ "old behavior\n", "new behavior\n" }, [_][]const u8{ old_pin ++ "\n", new_pin ++ "\n" }) |*commit, content, pin| {
+    for (&commits, [_][]const u8{ "old behavior\n", "new behavior\n" }, [_][]const u8{ old_pin ++ "\n", new_pin ++ "\n" }, 0..) |*commit, content, pin, index| {
         const blob = io.trim(u8, try git.git(path, &.{ "hash-object", "-w", "--stdin" }, content), "\n");
         const pin_blob = io.trim(u8, try git.git(path, &.{ "hash-object", "-w", "--stdin" }, pin), "\n");
-        const input = try io.fmt(a, "100644 blob {s}\tcaller.zig\n100644 blob {s}\tchange.zig\n100644 blob {s}\t.env.local\n120000 blob {s}\tlinked.zig\n100644 blob {s}\t.registryrc\n", .{ unchanged, blob, secret, secret, pin_blob });
+        const example = try io.fmt(a, "# Example {d}\nFIXTURE=\"DO NOT PRESENT THIS VALUE\"\n", .{index});
+        const example_blob = io.trim(u8, try git.git(path, &.{ "hash-object", "-w", "--stdin" }, example), "\n");
+        const input = try io.fmt(a, "100644 blob {s}\tcaller.zig\n100644 blob {s}\tchange.zig\n100644 blob {s}\t.env.local\n120000 blob {s}\tlinked.zig\n100644 blob {s}\t.registryrc\n100644 blob {s}\t.env.example\n", .{ unchanged, blob, secret, secret, pin_blob, example_blob });
         const tree = io.trim(u8, try git.git(path, &.{"mktree"}, input), "\n");
         commit.* = io.trim(u8, try git.git(path, &.{ "commit-tree", tree, "-m", "fixture" }, ""), "\n");
     }
@@ -1595,12 +1747,30 @@ test "pinned source reads exact trees and prioritizes active review anchors in a
         .{ .path = "over-budget.zig", .start_line = 1, .end_line = null },
     });
     try t.expect(result.limited);
-    for ([_][]const u8{ "\n-old behavior\n+new behavior", "caller.zig, lines 2-2:\ncaller evidence", "invalid or sensitive path", "not a regular tracked file", "path absent at the pinned head", "range starts after the end", "request budget" }) |part| {
+    for ([_][]const u8{ "\n-old behavior\n+new behavior", "Complete pinned head file caller.zig (3 lines):", "invalid or sensitive path", "not a regular tracked file", "path absent at the pinned head", "request budget" }) |part| {
         try t.expect(std.mem.indexOf(u8, result.evidence, part) != null);
     }
-    for ([_][]const u8{ "skip too", "DO NOT PRESENT", "over-budget.zig" }) |part| {
+    try t.expectEqual(@as(usize, 1), result.excerpts.len);
+    try t.expectEqual(@as(usize, 2), result.excerpts[0].requests.len);
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, result.evidence, "caller evidence"));
+    for ([_][]const u8{ "DO NOT PRESENT", "over-budget.zig" }) |part| {
         try t.expect(std.mem.indexOf(u8, result.evidence, part) == null);
     }
+    const stale_range = try git.readSupplement(path, commits[1], null, &.{.{
+        .path = "caller.zig",
+        .start_line = 20,
+        .end_line = 30,
+    }});
+    try t.expect(!stale_range.limited);
+    try t.expect(std.mem.indexOf(u8, stale_range.evidence, "Complete pinned head file caller.zig (3 lines):") != null);
+    try t.expect(try git.checkExample(path, commits[0], commits[1], .{ .filename = ".env.example", .status = "modified" }));
+    try t.expect(!try git.checkExample(path, commits[0], commits[1], .{ .filename = ".env.local", .status = "modified" }));
+    const blocked_example = try git.readSupplement(path, commits[1], null, &.{
+        .{ .path = ".env.example", .start_line = 1, .end_line = 1 },
+        .{ .path = ".env.example", .start_line = 2, .end_line = 2 },
+    });
+    try t.expect(blocked_example.limited and blocked_example.excerpts.len == 0);
+    try t.expect(std.mem.indexOf(u8, blocked_example.evidence, "DO NOT PRESENT") == null);
     const pins = (try git.registryPins(path, commits[0], commits[1])).?;
     try t.expectEqualStrings(old_pin, pins.before);
     try t.expectEqualStrings(new_pin, pins.after);
@@ -1661,6 +1831,25 @@ test "pinned source reads exact trees and prioritizes active review anchors in a
     }, null, &evidence, &remaining));
     try t.expect(std.mem.indexOf(u8, evidence.items, "lines 20000-20000:\nlarge docs\n") != null);
     try t.expectEqual(@as(usize, 1), std.mem.count(u8, evidence.items, "large docs"));
+}
+
+test "example verification requires identical complete single-line assignments" {
+    const t = std.testing;
+    try t.expect(templateAssignmentsUnchanged("MODE=\"demo\"\n", "# example\nMODE=\"demo\"\n\n"));
+    try t.expect(!templateAssignmentsUnchanged("MODE=demo\n", "MODE=changed\n"));
+    try t.expect(!templateAssignmentsUnchanged("MODE=demo\n", "MODE=demo\nNEW=\n"));
+    try t.expect(!templateAssignmentsUnchanged("VALUE=\"\n# old\n\"\n", "VALUE=\"\n# new\n\"\n"));
+    try t.expect(!templateAssignmentsUnchanged("VALUE=`\n# old\n`\n", "VALUE=`\n# new\n`\n"));
+    try t.expect(!templateAssignmentsUnchanged("MODE=demo\n", "# escaped\\\nMODE=demo\n"));
+}
+
+test "pinned anchors distinguish identifier suffixes and Rust generics" {
+    const t = std.testing;
+    const code = "class CcsAuthError { }\nclass CcsAuth { }\n";
+    try t.expectEqual(@as(u32, 2), try anchoredLine(code, "class CcsAuth"));
+    const rust = "fn read_archive() {}\nfn read<T>() {}\nfn unrelated() { read(); }\n";
+    try t.expectEqual(@as(u32, 82), (try anchoredRange(rust, "fn read(")).end);
+    try t.expectError(error.ExcerptAnchorAmbiguous, anchoredRange(rust ++ "fn read<U>() {}\n", "fn read("));
 }
 
 test "source excerpts cap requested lines and preserve the last line without a newline" {
