@@ -3232,13 +3232,11 @@ test "queuing a finished head retries insufficient evidence and leaves deliberat
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var scratch = t.tmpDir(.{});
-    defer scratch.cleanup();
-    const path = try scratch.dir.realpathAlloc(a, ".");
-    try scratch.dir.chmod(0o700);
+    const path = try io.temp(a);
+    defer std.fs.deleteTreeAbsolute(path) catch {};
     var db = try store.Store.open(a, path);
     defer db.dir.close();
-    const app: Main = .{ .a = a, .db = db, .env = undefined, .home = path, .scratch = try a.dupeZ(u8, path), .scratch_dir = scratch.dir };
+    const app: Main = .{ .a = a, .db = db, .env = undefined, .home = path, .scratch = path, .scratch_dir = db.dir };
     const head = "a" ** 40;
     var jobs = [_]core.Job{.{ .number = 7, .head = head, .phase = .complete, .verdict = .{
         .head = head,
