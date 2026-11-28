@@ -1106,6 +1106,20 @@ test "completion can follow one new pinned dependency across a checkpoint" {
     var repeated: MockReviewer = .{ .completion_output = dependent_result };
     const unresolved = try run(a, &repeated, plan);
     try t.expect(unresolved.report != null and !unresolved.progress.results[0].review.complete);
+
+    var full_batch: [core.max_evidence_requests]core.EvidenceRequest = undefined;
+    full_batch[0] = caller.evidence_requests[0];
+    for (full_batch[1..], 20..) |*request, line| {
+        request.* = .{ .path = "caller.zig", .start_line = @intCast(line), .end_line = @intCast(line) };
+    }
+    plan.progress.prior_completion_requests = &.{};
+    plan.progress.results = &.{.{ .engine = .codex, .review = caller }};
+    plan.progress.completion_requests = &full_batch;
+    plan.completion_evidence = .{ .source = "Pinned caller.zig source at all requested ranges", .provided = &full_batch };
+    var exhausted: MockReviewer = .{ .completion_output = dependent_result };
+    const stopped = try run(a, &exhausted, plan);
+    try t.expect(stopped.report != null and !stopped.progress.results[0].review.complete);
+    try t.expect(std.mem.indexOf(u8, exhausted.prompts[0], "This is the last evidence pass") != null);
 }
 
 test "a shorter completion prompt keeps the first pass's coverage limit" {
