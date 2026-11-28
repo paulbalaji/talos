@@ -500,7 +500,9 @@ fn runPasses(reviewer: anytype, requests: []const FullPass, responses: []anyerro
 fn completeReviews(a: io.A, reviewer: anytype, plan: Plan, progress: *core.RouteProgress, applied: routing.Decision, context: []const u8, required: usize, screened: []const core.EvidenceRequest, provided: []const core.EvidenceRequest) !bool {
     const results = try a.dupe(core.ReviewerResult, progress.results);
     progress.results = results;
-    const remaining_instructions = if (plan.prepared.dry or progress.prior_completion_requests.len != 0)
+    const round_is_final = plan.prepared.dry or progress.prior_completion_requests.len != 0 or
+        (progress.completion_requests orelse &.{}).len >= core.max_evidence_requests;
+    const remaining_instructions = if (round_is_final)
         "This is the last evidence pass. Return coverage_gaps for unresolved material questions and leave evidence_requests empty.\n\n"
     else
         "Request a further excerpt only when it is specific, material, and absent from the supplied source.\n\n";
@@ -1077,7 +1079,7 @@ test "completion can follow one new pinned dependency across a checkpoint" {
     const a = arena.allocator();
     const caller = try core.parseReview(a, requesting_result);
     const dependent_result =
-        \\{"complete":false,"summary":"Need one more file.","findings":[],"existing_open_findings":[],"non_blocking_threads":[],"evidence_requests":[{"path":"retry.zig","start_line":3,"end_line":10}]}
+        \\{"complete":true,"summary":"Need one more file.","findings":[],"existing_open_findings":[],"non_blocking_threads":[],"evidence_requests":[{"path":"retry.zig","start_line":3,"end_line":10}]}
     ;
     var plan = sample_plan;
     plan.progress.screen_waiting = false;
