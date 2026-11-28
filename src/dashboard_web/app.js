@@ -3,6 +3,7 @@
 const byId = (id) => document.getElementById(id);
 const list = (value) => Array.isArray(value) ? value : [];
 const numbers = new Intl.NumberFormat();
+const compactNumbers = new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 });
 const dates = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 const shortDays = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", timeZone: "UTC" });
 const repoPattern = /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i;
@@ -80,6 +81,17 @@ function humanize(value) {
 
 function count(value) {
   return Number.isFinite(value) ? numbers.format(value) : "—";
+}
+
+function tokenCount(value) {
+  if (!Number.isFinite(value) || value < 1000) return count(value);
+  const exact = count(value);
+  const display = element("span");
+  display.title = exact;
+  const compact = element("span", null, compactNumbers.format(value));
+  compact.setAttribute("aria-hidden", "true");
+  display.append(compact, element("span", "sr-only", exact));
+  return display;
 }
 
 function batchAmount(first, second) {
@@ -708,8 +720,14 @@ function renderFollowups() {
 
 function metric(label, value, description) {
   const group = element("dl", "panel metric");
-  group.append(element("dt", null, label), element("dd", "primary-value", count(value)));
-  if (description) group.append(element("dd", "metric-detail", description));
+  const total = element("dd", "primary-value");
+  total.append(value);
+  group.append(element("dt", null, label), total);
+  if (description) {
+    const detail = element("dd", "metric-detail");
+    detail.append(description);
+    group.append(detail);
+  }
   return group;
 }
 
@@ -742,9 +760,8 @@ function drawChart(canvas, series) {
   const totals = series.map((point) => tokenMode ? batchAmount(point.input_tokens, point.output_tokens) : point.attempts);
   const max = Math.max(1, ...totals.map((n) => Number.isFinite(n) ? n : 0));
   const ticks = [...new Set([0, Math.round(max / 2), max])];
-  const compact = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 });
   context.font = "12px ui-monospace, Menlo, monospace";
-  const labelWidth = Math.max(...ticks.map((tick) => context.measureText(compact.format(tick)).width));
+  const labelWidth = Math.max(...ticks.map((tick) => context.measureText(compactNumbers.format(tick)).width));
   const left = Math.ceil(labelWidth + 11);
   const top = axes.top;
   const bottom = height - axes.bottom;
@@ -758,7 +775,7 @@ function drawChart(canvas, series) {
     const level = y(tick);
     context.fillStyle = color("muted");
     context.textAlign = "right";
-    context.fillText(compact.format(tick), left - 7, level);
+    context.fillText(compactNumbers.format(tick), left - 7, level);
     context.strokeStyle = color("line");
     context.beginPath();
     context.moveTo(left, level + .5);
@@ -801,13 +818,15 @@ function renderMetrics() {
     const content = document.createDocumentFragment();
     const totals = element("div", "metric-grid");
     const observations = `${count(metrics.reported ?? 0)} of ${count(metrics.attempts ?? 0)} calls with token counts`;
+    const tokenSplit = document.createDocumentFragment();
+    tokenSplit.append(tokenCount(metrics.input_tokens), " input · ", tokenCount(metrics.output_tokens), " output");
     totals.append(
-      metric("Model calls", metrics.attempts, observations),
-      metric("Reported tokens", batchAmount(metrics.input_tokens, metrics.output_tokens),
-        metrics.reported > 0 ? `${count(metrics.input_tokens)} input · ${count(metrics.output_tokens)} output` : "No provider counts in this period"),
-      metric("Saved verdicts", metrics.review_count,
+      metric("Model calls", count(metrics.attempts), observations),
+      metric("Reported tokens", tokenCount(batchAmount(metrics.input_tokens, metrics.output_tokens)),
+        metrics.reported > 0 ? tokenSplit : "No provider counts in this period"),
+      metric("Saved verdicts", count(metrics.review_count),
         Number.isFinite(metrics.review_published) ? `${count(metrics.review_published)} published` : "Local and published"),
-      metric("Reviewed heads", metrics.reviewed_heads, metrics.coverage ?
+      metric("Reviewed heads", count(metrics.reviewed_heads), metrics.coverage ?
         phrase([`${count(metrics.coverage.complete)} complete`, `${count(metrics.coverage.limited)} limited`,
           metrics.coverage.unknown > 0 && `${count(metrics.coverage.unknown)} unknown`]) : "")
     );
@@ -887,7 +906,7 @@ function renderMetrics() {
       summary.dataset.reviewKey = "daily-totals-summary";
       details.append(summary);
       details.append(tableBox(renderTable(["UTC day", ["Calls", "numeric"], ["Token reports", "numeric"], ["Input tokens", "numeric"], ["Output tokens", "numeric"]],
-        series.map((point) => [chartDay(point.day), count(point.attempts), count(point.reported), count(point.input_tokens), count(point.output_tokens)]),
+        series.map((point) => [chartDay(point.day), count(point.attempts), count(point.reported), tokenCount(point.input_tokens), tokenCount(point.output_tokens)]),
         "No daily activity.")));
       daily.append(details);
     }
@@ -902,7 +921,7 @@ function renderMetrics() {
     ], list(metrics.providers).map((item) => [
       providerLabel(item.engine, item.model), count(item.attempts), count(item.failures),
       `${count(item.reported)} / ${count(item.attempts)}`,
-      count(item.input_tokens), count(item.output_tokens), item.measured > 0 ?
+      tokenCount(item.input_tokens), tokenCount(item.output_tokens), item.measured > 0 ?
         `${duration(item.p50_duration_ms)} / ${duration(item.p95_duration_ms)}` : "—",
     ]), "Provider calls will appear here as they finish.")));
     providers.append(element("p", "chart-guide", "Latency uses calls with recorded durations. Failures include rate limits, timeouts, and interrupted calls."));
@@ -916,7 +935,7 @@ function renderMetrics() {
       models.append(heading, tableBox(renderTable([
         "Provider / model", ["Calls involving model", "numeric"], ["Input tokens", "numeric"], ["Output tokens", "numeric"],
       ], modelUsage.map((model) => [
-        providerLabel(model.engine, model.model), count(model.participations), count(model.input_tokens), count(model.output_tokens),
+        providerLabel(model.engine, model.model), count(model.participations), tokenCount(model.input_tokens), tokenCount(model.output_tokens),
       ]), "No model-specific counts.")));
       models.append(element("p", "chart-guide", "A CLI call can use more than one model."));
       content.append(models);
@@ -928,7 +947,11 @@ function renderMetrics() {
       ["Reasoning output", metrics.reasoning_output_tokens],
     ].filter(([, value]) => Number.isFinite(value));
     if (ancillary.length) {
-      content.append(element("p", "chart-guide", phrase(ancillary.map(([name, value]) => `${name} ${count(value)}`))));
+      const guide = element("p", "chart-guide");
+      for (const [index, [name, value]] of ancillary.entries()) {
+        guide.append(`${index ? " · " : ""}${name} `, tokenCount(value));
+      }
+      content.append(guide);
     }
 
     const splits = [
@@ -1121,13 +1144,15 @@ function savedVerdictCard(result) {
   return card;
 }
 
-function usagePhrase(data) {
+function usageSummary(label, data) {
   const total = batchAmount(data?.input_tokens, data?.output_tokens);
-  return phrase([
-    plural(data?.attempts ?? 0, "call"),
-    total != null && `${count(total)} reported tokens`,
-    `${count(data?.reported ?? 0)} with token counts`,
-  ]);
+  const summary = element("p", "detail-meta");
+  const line = element("span");
+  line.append(`${label} · ${plural(data?.attempts ?? 0, "call")}`);
+  if (total != null) line.append(" · ", tokenCount(total), " reported tokens");
+  line.append(` · ${count(data?.reported ?? 0)} with token counts`);
+  summary.append(line);
+  return summary;
 }
 
 function renderDetail(data, target) {
@@ -1202,8 +1227,8 @@ function renderDetail(data, target) {
     const section = element("section", "detail-section");
     section.append(element("h3", null, "Reviewer usage"));
     if (data.activity_truncated) section.append(element("p", "chart-guide", "Showing the newest recorded activity."));
-    if (data.usage?.attempts > 0) section.append(element("p", "detail-meta", `All heads · ${usagePhrase(data.usage)}`));
-    if (current) section.append(element("p", "detail-meta", `Selected review · ${usagePhrase(current.totals)}`));
+    if (data.usage?.attempts > 0) section.append(usageSummary("All heads", data.usage));
+    if (current) section.append(usageSummary("Selected review", current.totals));
     if (groups.length > 1 || (!current && groups.length)) {
       const revisions = element("details", "detail-section");
       revisions.dataset.detailId = "runs";
@@ -1212,7 +1237,7 @@ function renderDetail(data, target) {
       revisions.append(summary);
       revisions.append(tableBox(renderTable(["Head / mode", ["Calls", "numeric"], ["Token reports", "numeric"], ["Reported tokens", "numeric"]], groups.map((group) => [
         phrase([group.head?.slice(0, 10), humanize(group.mode), date(group.at)]), count(group.totals?.attempts),
-        count(group.totals?.reported), count(batchAmount(group.totals?.input_tokens, group.totals?.output_tokens)),
+        count(group.totals?.reported), tokenCount(batchAmount(group.totals?.input_tokens, group.totals?.output_tokens)),
       ]), "No recorded runs.")));
       section.append(revisions);
     }
@@ -1233,12 +1258,14 @@ function renderDetail(data, target) {
         if (models.length > 1 || (models.length === 1 && models[0].model !== item.model)) {
           for (const model of models) {
             const tokens = model.tokens;
-            const usage = Number.isFinite(tokens?.input) || Number.isFinite(tokens?.output) ?
-              `${count(tokens.input)} in / ${count(tokens.output)} out` : "";
-            info.append(element("span", "phase-note", phrase([model.model, usage])));
+            const usage = element("span", "phase-note", model.model);
+            if (Number.isFinite(tokens?.input) || Number.isFinite(tokens?.output)) {
+              usage.append(" · ", tokenCount(tokens.input), " in / ", tokenCount(tokens.output), " out");
+            }
+            info.append(usage);
           }
         }
-        return [info, outcome, date(item.at), duration(item.duration_ms), count(item.tokens?.input), count(item.tokens?.output)];
+        return [info, outcome, date(item.at), duration(item.duration_ms), tokenCount(item.tokens?.input), tokenCount(item.tokens?.output)];
       }), "No model calls for this review."));
       table.classList.add("detail-section");
       section.append(table);
