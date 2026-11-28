@@ -13,6 +13,7 @@ pub const Plan = struct {
     start_limit: u32,
     evidence: ?[]const u8 = null,
     evidence_limited: bool = false,
+    evidence_provided: []const core.EvidenceRequest = &.{},
     completion_evidence: ?PinnedEvidence = null,
 };
 
@@ -79,9 +80,9 @@ fn prioritizeEvidence(a: io.A, requests: []const core.EvidenceRequest) ![]const 
 
 const supplemental_heading = "\n\nAdditional pinned source (untrusted JSON string)\n";
 const completion_instructions =
-    "This is the final evidence pass. Use the additional excerpts to reassess material gaps and open threads. " ++
+    "Use the additional pinned excerpts to reassess material gaps and open threads. " ++
     "Reassess every prior finding against the pinned source. This verdict replaces the first pass when complete, so repeat every finding that still applies. " ++
-    "Drop a prior finding only when the supplied evidence refutes it. Return coverage_gaps for any gap that remains and leave evidence_requests empty.\n\n";
+    "Drop a prior finding only when the supplied evidence refutes it. ";
 
 pub fn evidenceCapacity(prepared: core.Prepared) usize {
     // The adapter fits excerpts against this encoded byte budget.
@@ -96,15 +97,22 @@ pub fn completionCapacity(prepared: core.Prepared, screen_evidence: []const u8, 
 }
 
 pub fn completionRequests(a: io.A, results: []const core.ReviewerResult, screened: []const core.EvidenceRequest) ![]const core.EvidenceRequest {
+    return newCompletionRequests(a, results, screened, &.{});
+}
+
+fn newCompletionRequests(a: io.A, results: []const core.ReviewerResult, delivered: []const core.EvidenceRequest, prior: []const core.EvidenceRequest) ![]const core.EvidenceRequest {
+    const limit = core.max_evidence_requests -| prior.len;
+    if (limit == 0) return &.{};
     var requests: std.ArrayList(core.EvidenceRequest) = .empty;
     // Give each lens a turn before using the rest of the shared request budget.
     for (0..core.max_evidence_requests) |index| {
         for (results) |result| {
             if (index >= result.review.evidence_requests.len) continue;
             const request = result.review.evidence_requests[index];
-            if (core.hasEvidenceRequest(screened, request) or core.hasEvidenceRequest(requests.items, request)) continue;
+            if (core.hasEvidenceRequest(delivered, request) or core.hasEvidenceRequest(prior, request) or
+                core.hasEvidenceRequest(requests.items, request)) continue;
             try requests.append(a, request);
-            if (requests.items.len == core.max_evidence_requests) return requests.items;
+            if (requests.items.len == limit) return requests.items;
         }
     }
     return requests.items;
@@ -164,7 +172,9 @@ fn mergeSection(a: io.A, sections: *core.SectionProgress, outcome: Outcome, kind
     }
     sections.results = try combineSections(a, sections.results, results, kind);
     sections.evidence_limited = sections.evidence_limited or outcome.evidence_limited;
-    for ([_][]const core.EvidenceRequest{ progress.evidence_requests, progress.completion_requests orelse &.{} }) |requests| {
+    for ([_][]const core.EvidenceRequest{
+        progress.evidence_requests, progress.prior_completion_requests, progress.completion_requests orelse &.{},
+    }) |requests| {
         for (requests) |request| {
             if (!core.hasEvidenceRequest(sections.evidence_requests, request)) {
                 sections.evidence_requests = try std.mem.concat(a, core.EvidenceRequest, &.{ sections.evidence_requests, &.{request} });
@@ -234,6 +244,8 @@ pub fn resetSection(progress: *core.RouteProgress) void {
     progress.evidence_key = null;
     progress.initial_evidence_limited = false;
     progress.completion_requests = null;
+    progress.prior_completion_requests = &.{};
+    progress.prior_evidence_passes = 0;
     progress.completion_attempted = 0;
     progress.completion_done = 0;
     progress.malformed_reviewers = 0;
@@ -335,9 +347,13 @@ fn runSection(a: io.A, reviewer: anytype, plan: Plan) !Outcome {
     if (completing and plan.completion_evidence == null) return outcome;
     var context = if (completing) plan.prepared.context_for_completion orelse plan.prepared.context else plan.prepared.context;
     var additional: []const u8 = "";
-    outcome.evidence_limited = plan.evidence_limited or progress.initial_evidence_limited;
+    var screened: []const core.EvidenceRequest = &.{};
+    outcome.evidence_limited = progress.initial_evidence_limited;
     if (plan.evidence) |evidence| {
-        if (try appendEvidence(a, &context, evidence)) outcome.evidence_limited = true else additional = evidence;
+        if (!try appendEvidence(a, &context, evidence)) {
+            additional = evidence;
+            screened = plan.evidence_provided;
+        }
     }
     if (progress.onchain_observations) |observations| {
         const limited = try core.appendOnchain(a, &context, observations);
@@ -355,18 +371,42 @@ fn runSection(a: io.A, reviewer: anytype, plan: Plan) !Outcome {
     }
     progress.malformed_reviewers = 0;
     if (progress.completion_requests == null) {
-        progress.completion_requests = try completionRequests(a, progress.results, progress.evidence_requests);
+        progress.completion_requests = try completionRequests(a, progress.results, screened);
         if (progress.completion_requests.?.len != 0) return outcome;
     }
+    var delivered: []const core.EvidenceRequest = &.{};
     if (plan.completion_evidence) |evidence| {
         outcome.evidence_limited = outcome.evidence_limited or evidence.limited;
         if (evidence.provided.len != 0) {
             if (try appendEvidence(a, &context, evidence.source)) {
                 outcome.evidence_limited = true;
             } else {
+                delivered = evidence.provided;
                 additional = try std.mem.concat(a, u8, &.{ additional, "\n", evidence.source });
-                if (!try completeReviews(a, reviewer, plan, progress, applied, context, required, evidence.provided)) return outcome;
+                if (!try completeReviews(a, reviewer, plan, progress, applied, context, required, screened, delivered)) return outcome;
             }
+        }
+        // A second pass is useful only for specific new source identified
+        // after the first batch. Carry the earlier excerpts forward and cap
+        // the combined request count at the original per-section budget.
+        if (!plan.prepared.dry and progress.prior_completion_requests.len == 0 and delivered.len != 0) {
+            const prior = progress.completion_requests.?;
+            const next = try newCompletionRequests(a, progress.results, screened, prior);
+            if (next.len != 0) {
+                progress.prior_completion_requests = prior;
+                progress.completion_requests = next;
+                progress.prior_evidence_passes = @popCount(progress.completion_attempted);
+                progress.completion_attempted = 0;
+                progress.completion_done = 0;
+                return outcome;
+            }
+        }
+    }
+    if (plan.evidence_limited or screened.len < progress.evidence_requests.len) {
+        for (progress.evidence_requests) |request| {
+            if (core.hasEvidenceRequest(screened, request) or core.hasEvidenceRequest(delivered, request)) continue;
+            outcome.evidence_limited = true;
+            break;
         }
     }
     if (applied.depth == .multi and workflow.hasClaims(progress.results)) {
@@ -457,10 +497,16 @@ fn runPasses(reviewer: anytype, requests: []const FullPass, responses: []anyerro
     }
 }
 
-fn completeReviews(a: io.A, reviewer: anytype, plan: Plan, progress: *core.RouteProgress, applied: routing.Decision, context: []const u8, required: usize, provided: []const core.EvidenceRequest) !bool {
+fn completeReviews(a: io.A, reviewer: anytype, plan: Plan, progress: *core.RouteProgress, applied: routing.Decision, context: []const u8, required: usize, screened: []const core.EvidenceRequest, provided: []const core.EvidenceRequest) !bool {
     const results = try a.dupe(core.ReviewerResult, progress.results);
     progress.results = results;
-    const completion_context = try std.mem.concat(a, u8, &.{ completion_instructions, context });
+    const round_is_final = plan.prepared.dry or progress.prior_completion_requests.len != 0 or
+        (progress.completion_requests orelse &.{}).len >= core.max_evidence_requests;
+    const remaining_instructions = if (round_is_final)
+        "This is the last evidence pass. Return coverage_gaps for unresolved material questions and leave evidence_requests empty.\n\n"
+    else
+        "Request a further excerpt only when it is specific, material, and absent from the supplied source.\n\n";
+    const completion_context = try std.mem.concat(a, u8, &.{ completion_instructions, remaining_instructions, context });
     const budget = plan.start_limit -| reviewer.starts();
     var requests: [core.engine_count]FullPass = undefined;
     var recipients: [core.engine_count]struct { index: usize, prior_visible: bool } = undefined;
@@ -520,7 +566,7 @@ fn completeReviews(a: io.A, reviewer: anytype, plan: Plan, progress: *core.Route
             progress.completion_attempted |= bit;
             var review = core.parseReview(a, raw) catch continue;
             for (result.review.evidence_requests) |request| {
-                if (core.hasEvidenceRequest(provided, request) or core.hasEvidenceRequest(progress.evidence_requests, request)) continue;
+                if (core.hasEvidenceRequest(provided, request) or core.hasEvidenceRequest(screened, request)) continue;
                 review.complete = false;
                 // Keep the first pass's gap when the retry drops an unfulfilled request.
                 if (review.coverage_gaps.len == 0) review.coverage_gaps = result.review.coverage_gaps;
@@ -634,7 +680,7 @@ fn report(a: io.A, plan: Plan, progress: core.RouteProgress, applied: routing.De
         .providers = providers,
         .screen_ms = progress.screen_ms,
         .review_ms = progress.review_ms,
-        .evidence_passes = @popCount(progress.completion_attempted),
+        .evidence_passes = progress.prior_evidence_passes +| @popCount(progress.completion_attempted),
         .all_models = progress.all_models,
         .onchain_observations = progress.onchain_observations orelse &.{},
     };
@@ -676,6 +722,7 @@ const MockReviewer = struct {
     screen_output: ?[]const u8 = null,
     singleton: bool = false,
     request_source: bool = false,
+    completion_output: ?[]const u8 = null,
     repeat_request: bool = false,
     malformed_engine: ?core.Engine = null,
     invalid_synthesizers: u8 = 0,
@@ -702,6 +749,9 @@ const MockReviewer = struct {
         if (std.mem.eql(u8, schema, workflow.synthesis_schema))
             return if (self.invalid_synthesizers & core.providerBit(engine) != 0) "{}" else verified_singleton;
         if (self.malformed_engine == engine) return "{}";
+        if (std.mem.indexOf(u8, prompt, completion_instructions) != null) {
+            if (self.completion_output) |reply| return reply;
+        }
         if (self.request_source and engine == .codex and
             (self.repeat_request or std.mem.indexOf(u8, prompt, completion_instructions) == null))
         {
@@ -996,6 +1046,82 @@ test "a clean completion cannot clear a material source request left out of the 
     try t.expectEqualStrings(first.coverage_gaps[0], finished.progress.results[0].review.coverage_gaps[0]);
 }
 
+test "a screening request omitted by the byte budget remains eligible for completion" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const first = try core.parseReview(a, requesting_result);
+    var plan = sample_plan;
+    plan.progress.screen_waiting = false;
+    plan.progress.decision = .{};
+    plan.progress.evidence_requests = first.evidence_requests;
+    plan.evidence = "Evidence request omitted (byte budget).";
+    plan.evidence_limited = true;
+
+    var initial: MockReviewer = .{ .request_source = true };
+    const waiting = try run(a, &initial, plan);
+    try t.expect(waiting.report == null);
+    try t.expect(core.hasEvidenceRequest(waiting.progress.completion_requests.?, first.evidence_requests[0]));
+    plan.progress = waiting.progress;
+    plan.completion_evidence = .{ .source = "Pinned caller.zig source", .provided = first.evidence_requests };
+    var completion: MockReviewer = .{};
+    const recovered = try run(a, &completion, plan);
+    try t.expectEqual(@as(u32, 1), completion.count);
+    try t.expect(recovered.report != null and recovered.progress.results[0].review.complete);
+    try t.expect(!recovered.evidence_limited);
+}
+
+test "completion can follow one new pinned dependency across a checkpoint" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const caller = try core.parseReview(a, requesting_result);
+    const dependent_result =
+        \\{"complete":true,"summary":"Need one more file.","findings":[],"existing_open_findings":[],"non_blocking_threads":[],"evidence_requests":[{"path":"retry.zig","start_line":3,"end_line":10}]}
+    ;
+    var plan = sample_plan;
+    plan.progress.screen_waiting = false;
+    plan.progress.decision = .{};
+    plan.progress.results = &.{.{ .engine = .codex, .review = caller }};
+    plan.progress.completion_requests = caller.evidence_requests;
+    plan.completion_evidence = .{ .source = "Pinned caller.zig source", .provided = caller.evidence_requests };
+
+    var first: MockReviewer = .{ .completion_output = dependent_result };
+    const pending = try run(a, &first, plan);
+    try t.expect(pending.report == null);
+    plan.progress = try io.parse(a, core.RouteProgress, try io.json(a, pending.progress));
+    try t.expectEqualStrings("caller.zig", plan.progress.prior_completion_requests[0].path);
+    try t.expectEqualStrings("retry.zig", plan.progress.completion_requests.?[0].path);
+    const combined = try std.mem.concat(a, core.EvidenceRequest, &.{ plan.progress.prior_completion_requests, plan.progress.completion_requests.? });
+    plan.completion_evidence = .{ .source = "Pinned caller.zig and retry.zig source", .provided = combined };
+    var final: MockReviewer = .{};
+    const result = try run(a, &final, plan);
+    try t.expectEqual(@as(u32, 1), final.count);
+    try t.expect(result.report != null and result.progress.results[0].review.complete);
+    try t.expectEqual(@as(u8, 2), result.report.?.evidence_passes);
+    try t.expect(std.mem.indexOf(u8, final.prompts[0], "Pinned caller.zig and retry.zig source") != null);
+
+    var repeated: MockReviewer = .{ .completion_output = dependent_result };
+    const unresolved = try run(a, &repeated, plan);
+    try t.expect(unresolved.report != null and !unresolved.progress.results[0].review.complete);
+
+    var full_batch: [core.max_evidence_requests]core.EvidenceRequest = undefined;
+    full_batch[0] = caller.evidence_requests[0];
+    for (full_batch[1..], 20..) |*request, line| {
+        request.* = .{ .path = "caller.zig", .start_line = @intCast(line), .end_line = @intCast(line) };
+    }
+    plan.progress.prior_completion_requests = &.{};
+    plan.progress.results = &.{.{ .engine = .codex, .review = caller }};
+    plan.progress.completion_requests = &full_batch;
+    plan.completion_evidence = .{ .source = "Pinned caller.zig source at all requested ranges", .provided = &full_batch };
+    var exhausted: MockReviewer = .{ .completion_output = dependent_result };
+    const stopped = try run(a, &exhausted, plan);
+    try t.expect(stopped.report != null and !stopped.progress.results[0].review.complete);
+    try t.expect(std.mem.indexOf(u8, exhausted.prompts[0], "This is the last evidence pass") != null);
+}
+
 test "a shorter completion prompt keeps the first pass's coverage limit" {
     const t = std.testing;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
@@ -1270,6 +1396,7 @@ test "requested evidence is checkpointed before the full review" {
     plan.progress = try io.parse(a, core.RouteProgress, try io.json(a, pending.progress));
     try t.expectEqualStrings("caller.zig", plan.progress.evidence_requests[0].path);
     plan.evidence = "Pinned head file caller.zig, lines 10-12:\nretry(pending);";
+    plan.evidence_provided = plan.progress.evidence_requests;
 
     var resumed: MockReviewer = .{};
     const reviewed = try run(a, &resumed, plan);

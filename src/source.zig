@@ -47,7 +47,7 @@ pub const Supplement = struct {
     evidence: []const u8 = "",
     limited: bool = false,
     coverage_reasons: []const []const u8 = &.{},
-    excerpts: []const struct { request: core.EvidenceRequest, start_offset: usize, end_offset: usize } = &.{},
+    excerpts: []const struct { request: core.EvidenceRequest, start_offset: usize, end_offset: usize, complete: bool = true } = &.{},
     omissions: []const u8 = "",
 };
 
@@ -1008,7 +1008,12 @@ pub const Git = struct {
             const start_offset = evidence.items.len;
             if (self.appendExcerpt(cache_path, head, request, null, &evidence, &remaining)) |complete| {
                 requests_incomplete = requests_incomplete or !complete;
-                try excerpts.append(a, .{ .request = request, .start_offset = start_offset, .end_offset = evidence.items.len });
+                try excerpts.append(a, .{
+                    .request = request,
+                    .start_offset = start_offset,
+                    .end_offset = evidence.items.len,
+                    .complete = complete,
+                });
             } else |err| {
                 if (err == error.OutOfMemory) return err;
                 try omissions.writer(a).print("Evidence request {d} omitted ({s}).\n", .{ index, excerptOmission(err) });

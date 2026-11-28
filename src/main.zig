@@ -214,7 +214,9 @@ const Adapter = struct {
             }
             remaining -= encoded.len - 2;
             try excerpts.appendSlice(a, excerpt);
-            try provided.append(a, provided_excerpt.request);
+            if (provided_excerpt.complete) {
+                try provided.append(a, provided_excerpt.request);
+            } else limited = true;
         }
         if (supplement_result.omissions.len != 0) {
             const encoded = try io.json(a, supplement_result.omissions);
@@ -1703,6 +1705,7 @@ const Main = struct {
             const pinned = try live.reviewEvidence(plan.prepared.pr, progress.evidence_requests, adaptive.evidenceCapacity(section));
             plan.evidence = pinned.source;
             plan.evidence_limited = pinned.limited;
+            plan.evidence_provided = pinned.provided;
             var hash = std.crypto.hash.sha2.Sha256.init(.{});
             hash.update(pinned.source);
             hash.update(&.{@intFromBool(pinned.limited)});
@@ -1720,7 +1723,8 @@ const Main = struct {
         if (progress.completion_requests) |requests| {
             if (requests.len != 0) {
                 const capacity = try adaptive.completionCapacity(section, plan.evidence orelse "", progress.onchain_observations orelse &.{}, self.a);
-                plan.completion_evidence = try live.reviewEvidence(plan.prepared.pr, requests, capacity);
+                const combined = if (progress.prior_completion_requests.len == 0) requests else try std.mem.concat(self.a, core.EvidenceRequest, &.{ progress.prior_completion_requests, requests });
+                plan.completion_evidence = try live.reviewEvidence(plan.prepared.pr, combined, capacity);
             }
         }
         return plan;
@@ -1768,7 +1772,8 @@ const Main = struct {
                     outcome.progress.sections.evidence_requests
                 else
                     try std.mem.concat(self.a, core.EvidenceRequest, &.{
-                        outcome.progress.evidence_requests, outcome.progress.completion_requests orelse &.{},
+                        outcome.progress.evidence_requests,               outcome.progress.prior_completion_requests,
+                        outcome.progress.completion_requests orelse &.{},
                     });
                 work.prepared.onchain_observations = report.onchain_observations;
                 work.job.route_report = report;
@@ -1930,8 +1935,12 @@ const Main = struct {
             else => return err,
         };
         const saved = try io.parse(self.a, core.Result, raw);
-        if (!eq(u8, job.head, saved.commit_id) or !eq(u8, saved.followupId(), (try core.followupId(self.a, job)) orelse "")) return null;
+        // A discussion rereview can return to the reviewed input without
+        // saving a new verdict. Its new job key does not replace the last
+        // actual result for this head.
+        if (!eq(u8, job.head, saved.commit_id)) return null;
         const detail = saved.explanation orelse return null;
+        if (detail.publication != .local) return null;
         return detail.publicationReason();
     }
 
@@ -2990,6 +2999,19 @@ test "completion fits encoded excerpts and leaves room for later small requests"
     try t.expectEqualStrings(small, fitted.source);
     try t.expectEqual(@as(usize, 1), fitted.provided.len);
     try t.expectEqualStrings("small.zig", fitted.provided[0].path);
+
+    const clipped = try Adapter.fitEvidence(a, .{
+        .evidence = small,
+        .excerpts = &.{.{
+            .request = .{ .path = "small.zig", .start_line = null, .end_line = null },
+            .start_offset = 0,
+            .end_offset = small.len,
+            .complete = false,
+        }},
+    }, 100);
+    try t.expect(clipped.limited);
+    try t.expectEqualStrings(small, clipped.source);
+    try t.expectEqual(@as(usize, 0), clipped.provided.len);
 }
 
 test "an in-flight review binds to the reloaded job and discards a superseded job" {
@@ -3258,4 +3280,45 @@ test "queuing a finished head retries insufficient evidence and leaves deliberat
     try t.expect(queued.followup and queued.verdict == null);
     const second = try app.enqueuePinnedPull(&state, &entries[0], pull, null);
     try t.expectEqual(queued.followup_id, second.followup_id);
+
+    // The input reverted before the follow-up ran. It kept the earlier
+    // same-head result and never saved a verdict under the new job key.
+    jobs[0].phase = .complete;
+    jobs[0].outcome = "review inputs returned to the reviewed state";
+    var prior: core.Result = .{
+        .commit_id = head,
+        .event = .COMMENT,
+        .body = "",
+        .comments = &.{},
+        .explanation = .{
+            .at = 1,
+            .followup_id = null,
+            .base = .fromPull(pull),
+            .merge_base = "b" ** 40,
+            .route = .regular,
+            .blockers = &.{.limited_coverage},
+            .coverage = .{
+                .complete = false,
+                .snapshot_limited = false,
+                .snapshot_reasons = &.{},
+                .supplemental_limited = true,
+                .truncated_threads = 0,
+                .omitted_findings = 0,
+                .reviewers = &.{},
+            },
+            .synthesis_provider = null,
+            .synthesis_summary = null,
+            .evidence_requests = &.{},
+            .onchain_observations = &.{},
+            .publication = .local,
+            .disposition = .insufficient_evidence,
+        },
+    };
+    try db.saveResultAndState(entries[0].repo.name, pull.number, prior, &state);
+    try t.expectEqual(.pending, (try app.enqueuePinnedPull(&state, &entries[0], pull, null)).phase);
+
+    jobs[0].phase = .complete;
+    prior.commit_id = "c" ** 40;
+    try db.saveResultAndState(entries[0].repo.name, pull.number, prior, &state);
+    try t.expectEqual(.complete, (try app.enqueuePinnedPull(&state, &entries[0], pull, null)).phase);
 }
