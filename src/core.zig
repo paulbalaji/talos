@@ -614,6 +614,21 @@ pub const Entry = struct {
     errors: []const Issue = &.{},
     stacks: []stack.Stack = &.{},
     discussion_cursor: usize = 0,
+    ignored_pulls: []const u32 = &.{},
+
+    pub fn isIgnored(self: Entry, number: u32) bool {
+        return std.mem.indexOfScalar(u32, self.ignored_pulls, number) != null;
+    }
+
+    pub fn setIgnored(self: *Entry, a: A, number: u32, ignored: bool) !void {
+        if (std.mem.indexOfScalar(u32, self.ignored_pulls, number)) |index| {
+            if (!ignored) self.ignored_pulls = try std.mem.concat(a, u32, &.{
+                self.ignored_pulls[0..index], self.ignored_pulls[index + 1 ..],
+            });
+        } else if (ignored) {
+            self.ignored_pulls = try std.mem.concat(a, u32, &.{ self.ignored_pulls, &.{number} });
+        }
+    }
 
     pub fn stackBlocked(self: Entry, job: Job) bool {
         return stack.blocked(self, job);
@@ -632,6 +647,7 @@ pub const Entry = struct {
     }
 
     pub fn queueReview(self: *Entry, a: A, pr: Pull, options: ?ReviewOptions, rerun_completed: bool) !void {
+        if (self.isIgnored(pr.number)) return error.IgnoredPullRequest;
         const all_models = if (options) |requested| requested.all_models else false;
         const selects_focus = if (options) |requested| (requested.explicit_mode or requested.all_models) and requested.request == null else false;
         for (self.jobs) |*job| {
@@ -746,7 +762,7 @@ pub const Entry = struct {
         if (!baseline) {
             for (open.items) |seen| {
                 const flags = index.getPtr(seen).?;
-                if (flags.queued or (seen.is_draft and !self.drafts_baselined)) continue;
+                if (self.isIgnored(seen.number) or flags.queued or (seen.is_draft and !self.drafts_baselined)) continue;
                 if (flags.observed and (!flags.was_draft or seen.is_draft)) continue;
                 try retained.append(a, .{
                     .number = seen.number,
@@ -767,7 +783,7 @@ pub const Entry = struct {
     pub fn due(self: *Entry, now: i64) ?*Job {
         var candidate: ?*Job = null;
         for (self.jobs) |*job| {
-            if (!job.schedulable() or job.next > now or self.stackBlocked(job.*)) continue;
+            if (!job.schedulable() or self.isIgnored(job.number) or job.next > now or self.stackBlocked(job.*)) continue;
             if (candidate == null or job.next < candidate.?.next) candidate = job;
         }
         return candidate;

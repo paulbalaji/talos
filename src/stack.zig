@@ -223,7 +223,9 @@ pub fn register(entry: *core.Entry, a: io.A, name: []const u8, pins: []const Pin
             local_count += 1;
         }
     }
-    for (pins) |pin| try entry.queue(a, pin.pull(), null);
+    for (pins) |pin| {
+        if (!entry.isIgnored(pin.number)) try entry.queue(a, pin.pull(), null);
+    }
     entry.stacks = stacks.items;
 }
 
@@ -513,7 +515,7 @@ pub fn queueActiveNativeMembers(entry: *core.Entry, a: io.A) !void {
     for (entry.stacks) |item| {
         if (item.native == null) continue;
         const active = for (item.members) |member| {
-            if (!member.pin.reviewable()) continue;
+            if (!member.pin.reviewable() or entry.isIgnored(member.pin.number)) continue;
             const job = matchingJob(entry.jobs, member.pin) orelse continue;
             if (job.schedulable()) break true;
         } else false;
@@ -521,7 +523,7 @@ pub fn queueActiveNativeMembers(entry: *core.Entry, a: io.A) !void {
 
         for (item.members) |member| {
             const pin = member.pin;
-            if (!pin.reviewable() or matchingJob(entry.jobs, pin) != null) continue;
+            if (!pin.reviewable() or entry.isIgnored(pin.number) or matchingJob(entry.jobs, pin) != null) continue;
             // Discovery applies the normal eligibility filters before recording
             // these heads, including exclusions for managed followups.
             for (entry.seen) |pull| {
@@ -537,7 +539,7 @@ pub fn queueActiveNativeMembers(entry: *core.Entry, a: io.A) !void {
 pub fn queueNative(entry: *core.Entry, a: io.A, group: NativeGroup, options: ?core.ReviewOptions, rerun_completed: bool) !usize {
     var count: usize = 0;
     for (group.pins) |pin| {
-        if (pin.reviewable()) count += 1;
+        if (pin.reviewable() and !entry.isIgnored(pin.number)) count += 1;
     }
     if (count == 0) return error.NoOpenStackMembers;
     var groups: std.ArrayList(NativeGroup) = .empty;
@@ -556,7 +558,7 @@ pub fn queueNative(entry: *core.Entry, a: io.A, group: NativeGroup, options: ?co
     }
     try syncNative(entry, a, groups.items);
     for (group.pins) |pin| {
-        if (!pin.reviewable()) continue;
+        if (!pin.reviewable() or entry.isIgnored(pin.number)) continue;
         if (options == null and !rerun_completed) {
             if (matchingJob(entry.jobs, pin)) |job| {
                 if (job.phase == .complete or (job.phase == .pending and job.attempts == 0)) continue;
@@ -568,7 +570,7 @@ pub fn queueNative(entry: *core.Entry, a: io.A, group: NativeGroup, options: ?co
 }
 
 fn refreshJob(entry: *core.Entry, a: io.A, pin: Pin, automatic: bool) !void {
-    if (!pin.reviewable()) return;
+    if (!pin.reviewable() or entry.isIgnored(pin.number)) return;
     if (matchingJob(entry.jobs, pin)) |job| {
         if (job.phase == .uncertain) return;
     } else if (automatic) return;
@@ -1011,7 +1013,7 @@ pub fn blocker(entry: core.Entry, item: Stack, index: usize) ?Block {
             if (before.state != .MERGED and !linked(entry.repo.name, before, pin))
                 return .{ .number = pin.number, .reason = "base is not the previous PR head" };
         }
-        if (member_index < index) {
+        if (member_index < index and !entry.isIgnored(pin.number)) {
             const complete = if (matchingJob(entry.jobs, pin)) |job| job.phase == .complete else item.automatic;
             if (!complete) return .{ .number = pin.number, .reason = "ancestor review pending or failed" };
         }
@@ -1141,8 +1143,10 @@ pub fn statuses(a: io.A, entry: core.Entry) ![]Status {
         const members = try a.alloc(MemberStatus, item.members.len);
         for (members, item.members, 0..) |*status, member, index| {
             const pin = member.pin;
-            const blocked_by = if (pin.state == .MERGED) null else blocker(entry, item, index);
+            const ignored = entry.isIgnored(pin.number);
+            const blocked_by = if (pin.state == .MERGED or ignored) null else blocker(entry, item, index);
             const review = review: {
+                if (ignored) break :review "ignored";
                 for (entry.jobs) |job| {
                     if (job.number == pin.number and io.eq(u8, pin.headRefOid, job.head))
                         break :review @tagName(job.phase);
@@ -1162,4 +1166,32 @@ pub fn statuses(a: io.A, entry: core.Entry) ![]Status {
         output.* = .{ .name = item.name, .automatic = item.automatic, .native_number = if (item.native) |identity| identity.number else null, .members = members };
     }
     return result;
+}
+
+test "native stacks skip excluded reviews without blocking dependent PRs" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const identity: NativeRef = .{ .id = "PRS_example", .number = 23 };
+    var parent = fixture_parent;
+    var child = fixture_child;
+    parent.nativeStack = identity;
+    child.nativeStack = identity;
+    var pins = [_]Pin{ parent, child };
+    const group: NativeGroup = .{ .ref = identity, .pins = &pins };
+    const pulls = [_]core.Pull{ parent.pull(), child.pull() };
+
+    var entry: core.Entry = .{ .repo = fixture_repo, .ignored_pulls = &.{parent.number} };
+    try entry.discover(a, &pulls, true);
+    try entry.queue(a, child.pull(), null);
+    try syncNative(&entry, a, &.{group});
+    try queueActiveNativeMembers(&entry, a);
+    try t.expectEqual(@as(usize, 1), entry.jobs.len);
+    try t.expectEqual(@as(usize, 1), try queueNative(&entry, a, group, .{ .all_models = true }, true));
+    try t.expectEqual(child.number, entry.jobs[0].number);
+    try t.expect(!blocked(entry, entry.jobs[0]));
+    const summary = try statuses(a, entry);
+    try t.expectEqualStrings("ignored", summary[0].members[0].review);
+    try t.expect(summary[0].members[1].blocked_by == null);
 }

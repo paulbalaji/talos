@@ -20,6 +20,7 @@ const labelNames = {
   evidence: "Evidence pass",
   failed: "Failed",
   focused: "Focused",
+  ignored: "Ignored",
   kimi: "Kimi",
   local: "Local only",
   multi: "Multi-model",
@@ -330,6 +331,7 @@ function chooseStage(job, now) {
   const active = list(job.active_providers);
   const stage = humanize(job.stage);
   const verdict = job.verdict;
+  if (job.phase === "ignored") return { title: "Ignored" };
   if (job.phase === "baseline") return { title: "Baselined" };
   if (job.phase === "complete") {
     const status = publicationStatus({ ...verdict, complete: verdict?.coverage_complete });
@@ -556,7 +558,7 @@ function renderQueue() {
       memberships.set(keyOf(stack.repo, member.number), { label, accent, position: index + 1, total: members.length });
     }
   }
-  const active = jobs.filter((job) => !["baseline", "complete"].includes(job.phase));
+  const active = jobs.filter((job) => !["baseline", "complete", "ignored"].includes(job.phase));
   const running = active.filter((job) => list(job.active_providers).length > 0);
   const attention = active.filter((job) => job.phase === "failed" || ["receipt_exhausted", "more_providers"].includes(job.wait)).length;
   const pending = active.length - running.length - attention;

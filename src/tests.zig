@@ -1636,3 +1636,43 @@ test "a clean lightweight result stays local under an approval policy" {
     try t.expectEqual(.local, result.explanation.?.publication);
     try t.expect(fake.posted_result == null);
 }
+
+test "ignored PRs stay out of the review queue across restarts and head changes" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try io.temp(a);
+    defer std.fs.deleteTreeAbsolute(path) catch {};
+    var db = try store.Store.open(a, path);
+    defer db.dir.close();
+    var state = try db.load();
+    var entry: core.Entry = .{ .repo = repo };
+    try entry.queue(a, fixture_pull, null);
+    try entry.setIgnored(a, fixture_pull.number, true);
+    try entry.setIgnored(a, fixture_pull.number, true);
+    try state.add(a, entry);
+    try db.save(&state);
+
+    var reloaded = try db.load();
+    const tracked = reloaded.find(repo.name).?;
+    try t.expectEqualSlices(u32, &.{fixture_pull.number}, tracked.ignored_pulls);
+    try t.expect(tracked.due(100) == null);
+    try t.expect(reloaded.queue_budget.nextEligible(tracked.*, 100, .{}) == null);
+    try t.expectError(error.IgnoredPullRequest, tracked.queueReview(a, fixture_pull, .{ .all_models = true }, true));
+
+    var updated = fixture_pull;
+    updated.headRefOid = changed;
+    updated.isDraft = true;
+    var sibling = fixture_pull;
+    sibling.number += 1;
+    try tracked.discover(a, &.{ updated, sibling }, false);
+    updated.isDraft = false;
+    try tracked.discover(a, &.{ updated, sibling }, false);
+    try t.expectEqual(@as(usize, 2), tracked.seen.len);
+    try t.expectEqual(@as(usize, 1), tracked.jobs.len);
+    try t.expectEqual(sibling.number, tracked.jobs[0].number);
+
+    try tracked.setIgnored(a, fixture_pull.number, false);
+    try tracked.queue(a, updated, null);
+    try t.expectEqual(@as(usize, 2), tracked.jobs.len);
+}

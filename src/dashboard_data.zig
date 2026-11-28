@@ -231,6 +231,7 @@ fn jobRow(a: A, entry: core.Entry, number: u32, attempts: []const Attempt, avail
 fn buildJobRow(a: A, entry: core.Entry, job: ?core.Job, seen_: ?core.Seen, attempts: []const Attempt, availability: Availability) !JobRow {
     const now = availability.now;
     const seen = seen_ orelse core.Seen{ .number = job.?.number, .head = job.?.head };
+    const ignored = entry.isIgnored(seen.number);
     const head = if (job) |current| current.head else seen.head;
     const review_key = if (job) |current| try core.followupId(a, current) else null;
     const progress = if (job) |current| current.route_progress else null;
@@ -273,7 +274,7 @@ fn buildJobRow(a: A, entry: core.Entry, job: ?core.Job, seen_: ?core.Seen, attem
                 };
                 continue;
             }
-            if (job.?.phase != .pending or !io.eq(u8, attempt.outcome, "running")) continue;
+            if (ignored or job.?.phase != .pending or !io.eq(u8, attempt.outcome, "running")) continue;
             if (total == null) total = attempt.section_count;
             try active.append(a, .{ .engine = attempt.engine, .model = attempt.model, .stage = attempt.stage, .section = attempt.section, .at = attempt.at });
         }
@@ -285,7 +286,7 @@ fn buildJobRow(a: A, entry: core.Entry, job: ?core.Job, seen_: ?core.Seen, attem
         if (item.native) |native| stack_number = native.number;
         if (stack.blocker(entry, item, position.member_index)) |block| publication_blocked = block.number;
     }
-    const stack_wait = if (job) |current| current.phase == .pending and stack.analysisBlocked(entry, current) else false;
+    const stack_wait = if (job) |current| !ignored and current.phase == .pending and stack.analysisBlocked(entry, current) else false;
     const blocked = if (stack_wait) publication_blocked else null;
     var last_error: ?[]const u8 = null;
     var last_error_at: ?i64 = null;
@@ -297,12 +298,13 @@ fn buildJobRow(a: A, entry: core.Entry, job: ?core.Job, seen_: ?core.Seen, attem
             break;
         }
     }
-    const phase = if (job) |current| @tagName(current.phase) else "baseline";
+    const phase = if (ignored) "ignored" else if (job) |current| @tagName(current.phase) else "baseline";
     const eligible_at: ?i64 = if (job) |current|
         if (!availability.paused and active.items.len == 0) availability.budget.eligibleAt(entry, current, now, 0, availability.usage) else null
     else
         null;
     const wait: ?JobWait = wait: {
+        if (ignored) break :wait null;
         const current = job orelse break :wait null;
         if (active.items.len != 0 or (current.phase != .pending and current.phase != .uncertain)) break :wait null;
         if (current.phase == .uncertain and !current.schedulable()) break :wait .receipt_exhausted;
@@ -319,6 +321,7 @@ fn buildJobRow(a: A, entry: core.Entry, job: ?core.Job, seen_: ?core.Seen, attem
         break :wait .provider_cooldown;
     };
     const stage = stage: {
+        if (ignored) break :stage "ignored";
         const current = job orelse break :stage "baseline";
         switch (current.phase) {
             .complete => break :stage "complete",
@@ -367,7 +370,7 @@ fn buildJobRow(a: A, entry: core.Entry, job: ?core.Job, seen_: ?core.Seen, attem
         .review_key = review_key,
         .route = if (report) |completed| completed.applied.depth else if (progress) |p| if (p.decision) |d| d.depth else null else null,
         .blocked_by = blocked,
-        .publication_blocked_by = if (job != null and job.?.phase == .pending) publication_blocked else null,
+        .publication_blocked_by = if (!ignored and job != null and job.?.phase == .pending) publication_blocked else null,
         .stack = stack_number,
         .all_models = if (job) |current| current.options.all_models or (progress != null and progress.?.all_models) else false,
     };
@@ -579,6 +582,12 @@ pub fn stateJson(a: A, db: store.Store, include_history: bool, now: i64) ![]cons
                 }
             }
             try jobs.append(a, try buildJobRow(a, entry, job, seen, attempts, availability));
+        }
+        for (entry.seen) |pull| {
+            if (!entry.isIgnored(pull.number)) continue;
+            for (entry.jobs) |job| {
+                if (job.number == pull.number and io.eq(u8, job.head, pull.head)) break;
+            } else try jobs.append(a, try buildJobRow(a, entry, null, pull, attempts, availability));
         }
         for (try stack.statuses(a, entry)) |item| {
             const members = try a.alloc(StackMemberRow, item.members.len);
